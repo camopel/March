@@ -38,7 +38,7 @@ March is a **framework**, not a product. Like FastAPI gave you a clean way to bu
 pip install march && march init && march chat
 ```
 
-**Plugin pipeline with lifecycle hooks.** Every step in the agent loop — LLM calls, tool execution, memory operations, sub-agent spawns — has `before_` and `after_` hooks. Write a plugin in 10 lines. No monkey-patching, no forks.
+**Plugin pipeline with lifecycle hooks.** Every step in the agent loop — LLM calls, tool execution, sessions, sub-agent spawns — has `before_` and `after_` hooks. Write a plugin in 10 lines. No monkey-patching, no forks.
 
 ```python
 @app.plugin(name="my-guard", priority=1)
@@ -172,7 +172,7 @@ The dashboard is a local web UI showing sessions, cost tracking, provider health
 │  Session routing │ Sub-agent orchestration │ Task queue       │
 │                          │                                   │
 │  PLUGIN PIPELINE                                             │
-│  before/after hooks: LLM, tools, memory, sessions, errors    │
+│  before/after hooks: LLM, tools, sessions, response, errors   │
 │                          │                                   │
 │  ┌────────┬────────┬─────┴────┬──────────┬────────────────┐ │
 │  │  LLM   │ Tools  │ Memory   │ Config   │ Logging        │ │
