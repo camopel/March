@@ -185,7 +185,7 @@ class MatrixChannelConfig(BaseModel):
     access_token: str = ""
     auto_setup: bool = True
     rooms: list[str] = Field(default_factory=list)
-    e2ee: bool = False
+    e2ee: bool = True
 
 
 class ChannelsConfig(BaseModel):
