@@ -39,7 +39,7 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.30"]
 bedrock = ["boto3>=1.34"]
-matrix = ["matrix-nio>=0.24"]
+matrix = ["matrix-nio[e2e]>=0.24"]
 fast = ["uvloop>=0.19"]
 browser = ["playwright>=1.40"]
 voice = ["faster-whisper>=1.0"]

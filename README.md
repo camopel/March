@@ -150,6 +150,22 @@ ACP supports:
 - `agent/terminal` — run commands via IDE terminal
 - `shutdown` — clean disconnect
 
+### Matrix
+
+March can join Matrix rooms as a bot — one room per session. Install with `pip install march[matrix]`, then configure in `config.yaml`:
+
+```yaml
+channels:
+  matrix:
+    enabled: true
+    homeserver: "https://matrix.example.com"
+    user: "@march:example.com"
+    password: "${MARCH_MATRIX_PASSWORD}"
+    e2ee: false          # optional end-to-end encryption
+```
+
+Features: auto-join on invite, room-based session isolation, streaming responses, credential persistence, and optional E2EE.
+
 ### Dashboard
 
 ```bash
@@ -299,6 +315,14 @@ channels:
   terminal:
     enabled: true
     streaming: true
+
+  # Matrix (requires: pip install march[matrix])
+  # matrix:
+  #   enabled: true
+  #   homeserver: "${MARCH_MATRIX_HOMESERVER}"
+  #   user: "${MARCH_MATRIX_USER}"
+  #   password: "${MARCH_MATRIX_PASSWORD}"
+  #   e2ee: false
 ```
 
 All environment-specific values (API URLs, tokens, model names) support `${VAR:default}` interpolation. Sensitive config goes in `.march/` — which is gitignored by default.
@@ -351,7 +375,7 @@ march version                Show version
 pip install march              # Core (OpenAI, Ollama, OpenRouter, LiteLLM)
 pip install march[anthropic]   # + Anthropic Claude
 pip install march[bedrock]     # + AWS Bedrock
-pip install march[matrix]      # + Matrix channel
+pip install march[matrix]      # + Matrix channel (with E2EE support)
 pip install march[browser]     # + Playwright browser tools
 pip install march[voice]       # + Speech-to-text (faster-whisper)
 pip install march[fast]        # + uvloop async performance

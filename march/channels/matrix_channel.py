@@ -41,6 +41,7 @@ class MatrixChannel(Channel):
         homeserver: str = "auto",
         user_id: str = "",
         password: str = "",
+        access_token: str = "",
         rooms: list[str] | None = None,
         e2ee: bool = False,
         auto_setup: bool = True,
@@ -49,6 +50,7 @@ class MatrixChannel(Channel):
         self.homeserver = homeserver
         self.user_id = user_id
         self.password = password
+        self.access_token = access_token
         self.rooms = rooms or []
         self.e2ee = e2ee
         self.auto_setup = auto_setup
@@ -65,7 +67,7 @@ class MatrixChannel(Channel):
         self._running = True
 
         try:
-            from nio import AsyncClient, RoomMessageText, InviteMemberEvent
+            from nio import AsyncClient, RoomMessageText, InviteMemberEvent, MegolmEvent
         except ImportError:
             logger.error("matrix-nio not installed. Install with: pip install matrix-nio")
             return
@@ -87,22 +89,55 @@ class MatrixChannel(Channel):
         Path(store_path).mkdir(parents=True, exist_ok=True)
 
         if self.e2ee:
+            import nio as nio
             from nio import AsyncClient
+            from nio.store import SqliteStore
             self._client = AsyncClient(
                 homeserver,
                 creds["user_id"],
                 store_path=store_path,
+                config=nio.AsyncClientConfig(
+                    store=SqliteStore,
+                    store_name="march_crypto",
+                    encryption_enabled=True,
+                ),
             )
         else:
             self._client = AsyncClient(homeserver, creds["user_id"])
 
-        # Login
-        response = await self._client.login(creds["password"])
-        if hasattr(response, "access_token"):
-            logger.info("matrix: logged in as %s", creds["user_id"])
+        # Login — prefer access_token if provided, otherwise password
+        if self.access_token or creds.get("access_token"):
+            token = self.access_token or creds["access_token"]
+            # Fetch device_id via whoami before setting up client state
+            device_id = creds.get("device_id", "")
+            if not device_id:
+                try:
+                    import httpx
+                    async with httpx.AsyncClient() as http:
+                        r = await http.get(
+                            f"{homeserver}/_matrix/client/v3/account/whoami",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        if r.status_code == 200:
+                            device_id = r.json().get("device_id", "")
+                except Exception:
+                    pass
+            # Use restore_login — sets user_id, device_id, access_token
+            # AND loads the olm store for E2EE in one correct step
+            self._client.restore_login(
+                user_id=creds["user_id"],
+                device_id=device_id or self._client.device_id,
+                access_token=token,
+            )
+            logger.info("matrix: authenticated via access token as %s (device=%s)",
+                        creds["user_id"], device_id or "unknown")
         else:
-            logger.error("matrix: login failed: %s", response)
-            return
+            response = await self._client.login(creds["password"])
+            if hasattr(response, "access_token"):
+                logger.info("matrix: logged in as %s", creds["user_id"])
+            else:
+                logger.error("matrix: login failed: %s", response)
+                return
 
         # Set display name
         try:
@@ -125,6 +160,42 @@ class MatrixChannel(Channel):
         self._client.add_event_callback(
             self._on_invite, InviteMemberEvent
         )
+
+        # E2EE: trust all devices and handle undecryptable events
+        logger.info("matrix: e2ee=%s, olm=%s", self.e2ee, self._client.olm is not None)
+        if self.e2ee:
+            self._client.add_event_callback(
+                self._on_megolm, MegolmEvent
+            )
+            from nio import SyncResponse as _SyncResponse
+            # After each sync: upload keys if needed, then trust all devices
+            async def _post_sync_e2ee_setup(_resp):
+                logger.info("matrix: post-sync e2ee check (olm=%s, upload=%s, claim=%s, query=%s)",
+                            self._client.olm is not None,
+                            self._client.should_upload_keys,
+                            self._client.should_claim_keys,
+                            self._client.should_query_keys)
+                try:
+                    if self._client.should_upload_keys:
+                        await self._client.keys_upload()
+                        logger.info("matrix: uploaded device keys")
+                    if self._client.should_claim_keys:
+                        users = self._client.get_users_for_key_claiming()
+                        if users:
+                            await self._client.keys_claim(users)
+                            logger.info("matrix: claimed keys for %d users", len(users))
+                    if self._client.should_query_keys:
+                        await self._client.keys_query()
+                        logger.info("matrix: queried device keys")
+                    if hasattr(self._client, 'olm') and self._client.olm:
+                        for uid, devices in self._client.device_store.items():
+                            for did, olm_device in devices.items():
+                                if not self._client.olm.is_device_verified(olm_device):
+                                    self._client.verify_device(olm_device)
+                                    logger.info("matrix: verified device %s/%s", uid, did)
+                except Exception as e:
+                    logger.warning("matrix: e2ee post-sync error: %s", e)
+            self._client.add_response_callback(_post_sync_e2ee_setup, _SyncResponse)
 
         # Sync loop
         try:
@@ -183,7 +254,12 @@ class MatrixChannel(Channel):
     # ── Event Callbacks ──────────────────────────────────────────────────
 
     async def _on_message(self, room: Any, event: Any) -> None:
-        """Handle incoming messages from Matrix rooms."""
+        """Handle incoming messages from Matrix rooms.
+
+        Sends read receipt + typing indicator immediately, then spawns
+        the LLM processing as a background task so the sync loop isn't
+        blocked and the ack is visible to the sender right away.
+        """
         if not self._agent or not self._running:
             return
 
@@ -198,10 +274,33 @@ class MatrixChannel(Channel):
         room_id = room.room_id
         logger.info("matrix: message in %s from %s: %s", room_id, event.sender, text[:80])
 
-        # Get or create session for this room
+        # ── Immediate acknowledgment ─────────────────────────────────
+        # Send read receipt + typing indicator BEFORE processing so the
+        # sender knows the message was received instantly.
+        try:
+            await self._client.room_read_markers(
+                room_id,
+                fully_read_event=event.event_id,
+                read_event=event.event_id,
+            )
+        except Exception as e:
+            logger.debug("matrix: failed to send read receipt: %s", e)
+
+        try:
+            await self._client.room_typing(room_id, typing_state=True, timeout=30000)
+        except Exception as e:
+            logger.debug("matrix: failed to send typing indicator: %s", e)
+
+        # ── Spawn LLM processing as background task ──────────────────
+        # This returns control to the sync loop immediately so the read
+        # receipt and typing indicator actually get flushed to the server
+        # without waiting for the full LLM response.
+        asyncio.create_task(self._process_message(room_id, text, event))
+
+    async def _process_message(self, room_id: str, text: str, event: Any) -> None:
+        """Process a message with the LLM in the background."""
         session = self._get_or_create_session(room_id)
 
-        # Process the message
         try:
             from march.core.agent import AgentResponse
             collected = ""
@@ -216,6 +315,12 @@ class MatrixChannel(Channel):
         except Exception as e:
             logger.error("matrix: error processing message in %s: %s", room_id, e)
             await self.send(f"Error: {e}", room_id=room_id)
+        finally:
+            # ── Clear typing indicator ───────────────────────────────
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
 
     async def _on_invite(self, room: Any, event: Any) -> None:
         """Handle room invites — auto-join."""
@@ -227,6 +332,14 @@ class MatrixChannel(Channel):
             logger.info("matrix: auto-joined room %s", room_id)
         except Exception as e:
             logger.warning("matrix: failed to join invited room: %s", e)
+
+    async def _on_megolm(self, room: Any, event: Any) -> None:
+        """Handle undecryptable Megolm events — request keys."""
+        if not self._client:
+            return
+        logger.warning("matrix: could not decrypt event %s in %s (session_id=%s)",
+                        event.event_id, room.room_id,
+                        getattr(event, "session_id", "?"))
 
     # ── Session Management ───────────────────────────────────────────────
 
@@ -277,20 +390,26 @@ class MatrixChannel(Channel):
         if creds_file.exists():
             try:
                 creds = json.loads(creds_file.read_text())
-                if creds.get("user_id") and creds.get("password"):
+                if creds.get("user_id") and (creds.get("password") or creds.get("access_token")):
                     self.user_id = creds["user_id"]
-                    self.password = creds["password"]
+                    if creds.get("password"):
+                        self.password = creds["password"]
+                    if creds.get("access_token"):
+                        self.access_token = creds["access_token"]
                     return creds
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        # Use configured credentials if available
-        if self.user_id and self.password and self.password != "auto":
+        # Use configured credentials if available (access_token or password)
+        if self.user_id and (self.access_token or (self.password and self.password != "auto")):
             creds = {
                 "user_id": self.user_id,
-                "password": self.password,
                 "homeserver": homeserver,
             }
+            if self.access_token:
+                creds["access_token"] = self.access_token
+            if self.password:
+                creds["password"] = self.password
             self._save_credentials(creds)
             return creds
 

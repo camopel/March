@@ -181,10 +181,11 @@ class MatrixChannelConfig(BaseModel):
     enabled: bool = False
     homeserver: str = "auto"
     user: str = "@march:localhost"
-    password: str = "auto"
+    password: str = ""
+    access_token: str = ""
     auto_setup: bool = True
-    rooms: list[str] = Field(default_factory=lambda: ["#agents:localhost"])
-    e2ee: bool = True
+    rooms: list[str] = Field(default_factory=list)
+    e2ee: bool = False
 
 
 class ChannelsConfig(BaseModel):
@@ -371,4 +372,4 @@ class MarchConfig(BaseModel):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     i18n: I18nConfig = Field(default_factory=I18nConfig)
 
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}

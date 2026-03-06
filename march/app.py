@@ -425,6 +425,7 @@ class MarchApp:
                 homeserver=matrix_config.homeserver,
                 user_id=matrix_config.user,
                 password=matrix_config.password,
+                access_token=matrix_config.access_token,
                 rooms=list(matrix_config.rooms),
                 e2ee=matrix_config.e2ee,
                 auto_setup=matrix_config.auto_setup,

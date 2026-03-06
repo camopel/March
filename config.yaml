@@ -102,11 +102,12 @@ channels:
     streaming: true
 
   # Uncomment to enable additional channels:
-  # matrix:
-  #   enabled: true
-  #   homeserver: "${MARCH_MATRIX_HOMESERVER}"
-  #   user: "${MARCH_MATRIX_USER}"
-  #   password: "${MARCH_MATRIX_PASSWORD}"
+  matrix:
+    enabled: true
+    homeserver: "http://localhost:8090"
+    user: "@march:localhost"
+    access_token: "${MARCH_MATRIX_TOKEN}"
+    e2ee: true
 
 # ─── Plugins ───
 plugins:
