@@ -54,10 +54,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/march/march"
-Documentation = "https://github.com/march/march#readme"
-Repository = "https://github.com/march/march"
-Issues = "https://github.com/march/march/issues"
+Homepage = "https://github.com/camopel/March"
+Documentation = "https://github.com/camopel/March#readme"
+Repository = "https://github.com/camopel/March"
+Issues = "https://github.com/camopel/March/issues"
 
 [project.scripts]
 march = "march.cli.main:cli"

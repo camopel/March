@@ -378,7 +378,7 @@ Optionally, create `plugins/` and `skills/` directories in your working director
 ## Development
 
 ```bash
-git clone https://github.com/march/march.git
+git clone https://github.com/camopel/March.git
 cd march
 make dev         # Install with dev dependencies
 make test        # Run tests
