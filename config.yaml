@@ -8,7 +8,7 @@
 
 # ─── Agent Identity ───
 agent:
-  name: "my-agent"
+  name: "march"
   version: "0.1.0"
 
 # ─── LLM Providers ───
