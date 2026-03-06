@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "march"
+version = "0.1.0"
+description = "A framework-first agent runtime. Like FastAPI for web — March for agents."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    {name = "camopel", email = "camopel@gmail.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "pydantic>=2.0",
+    "click>=8.0",
+    "rich>=13.0",
+    "textual>=0.50",
+    "openai>=1.30",
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+    "websockets>=12.0",
+    "structlog>=24.0",
+    "pyyaml>=6.0",
+    "ddgs>=9.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.30"]
+bedrock = ["boto3>=1.34"]
+matrix = ["matrix-nio>=0.24"]
+fast = ["uvloop>=0.19"]
+browser = ["playwright>=1.40"]
+voice = ["faster-whisper>=1.0"]
+all = ["march[anthropic,bedrock,matrix,fast,browser,voice]"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/march/march"
+Documentation = "https://github.com/march/march#readme"
+Repository = "https://github.com/march/march"
+Issues = "https://github.com/march/march/issues"
+
+[project.scripts]
+march = "march.cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["march*"]
+
+[tool.setuptools.package-data]
+march = ["templates/*.md"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "A", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

@@ -1,0 +1,144 @@
+# March Agent Framework — Example Configuration
+#
+# Copy this to your project directory and customize.
+# Environment variable interpolation: ${VAR} or ${VAR:default}
+# Pydantic-validated at startup — bad config fails fast with clear errors.
+#
+# All runtime data (sessions, memory, logs) is stored in .march/
+
+# ─── Agent Identity ───
+agent:
+  name: "my-agent"
+  version: "0.1.0"
+
+# ─── LLM Providers ───
+llm:
+  default: "openai"
+  fallback_chain:
+    - "openai"
+
+  providers:
+    openai:
+      model: "${MARCH_MODEL:gpt-4o}"
+      url: "${MARCH_LLM_URL:https://api.openai.com/v1}"
+      api_key: "${OPENAI_API_KEY:}"
+      max_tokens: 16384
+      context_window: 128000
+      temperature: 0.7
+      timeout: 300
+      reasoning: false
+
+    # Uncomment to add Anthropic:
+    # anthropic:
+    #   model: "claude-sonnet-4-20250514"
+    #   api_key: "${ANTHROPIC_API_KEY:}"
+
+    # Uncomment to add OpenRouter (access 100+ models with one API key):
+    # openrouter:
+    #   model: "anthropic/claude-sonnet-4-20250514"
+    #   api_key: "${OPENROUTER_API_KEY:}"
+
+    # Uncomment to add LiteLLM proxy (unified API for all providers):
+    # litellm:
+    #   model: "claude-sonnet-4-20250514"
+    #   url: "http://localhost:4000"
+
+    # Uncomment to add Ollama (local models):
+    # ollama:
+    #   model: "llama3.1"
+    #   url: "http://localhost:11434"
+
+    # Uncomment to add AWS Bedrock:
+    # bedrock:
+    #   model: "anthropic.claude-sonnet-4-20250514-v1:0"
+    #   region: "us-west-2"
+    #   profile: "default"
+
+# ─── Tools ───
+tools:
+  builtin:
+    - read
+    - write
+    - edit
+    - apply_patch
+    - exec
+    - process
+    - web_search
+    - web_fetch
+    - pdf
+    - glob
+    - diff
+    - sessions_list
+    - sessions_history
+    - sessions_send
+    - sessions_spawn
+    - subagents
+    - session_status
+
+  # Tools to explicitly disable:
+  deny: []
+
+  exec:
+    sandbox: true
+    timeout: 30
+
+  web_search:
+    engine: "ddgs"
+    max_results: 10
+
+# ─── Memory ───
+memory:
+  system_rules: "SYSTEM.md"
+  agent_profile: "AGENT.md"
+  tool_rules: "TOOLS.md"
+
+  session:
+    auto_save: true
+
+# ─── Channels ───
+channels:
+  terminal:
+    enabled: true
+    streaming: true
+
+  # Uncomment to enable additional channels:
+  # matrix:
+  #   enabled: true
+  #   homeserver: "${MARCH_MATRIX_HOMESERVER}"
+  #   user: "${MARCH_MATRIX_USER}"
+  #   password: "${MARCH_MATRIX_PASSWORD}"
+
+# ─── Plugins ───
+plugins:
+  enabled:
+    - "safety"
+    - "cost"
+    - "logger"
+  directory: "plugins"
+
+  cost:
+    budget_per_session: 5.00
+    budget_per_day: 20.00
+    alert_threshold: 0.8
+
+# ─── Sub-Agents ───
+agents:
+  max_concurrent: 4
+  subagents:
+    max_concurrent: 8
+    max_spawn_depth: 1
+
+# ─── Guardian ───
+guardian:
+  enabled: true
+
+# ─── Logging ───
+logging:
+  level: "INFO"
+  file: ".march/logs/session.log"
+  retention: 7
+
+# ─── Dashboard ───
+dashboard:
+  enabled: true
+  port: "auto"

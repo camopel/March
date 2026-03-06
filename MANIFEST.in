@@ -1,0 +1,4 @@
+# Include non-Python files in the package
+include LICENSE
+include README.md
+recursive-include march/templates *.md
