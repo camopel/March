@@ -959,12 +959,14 @@ class Agent:
         agent_profile = await self.memory.load_agent_profile()
         tool_inventory = await self.memory.load_tool_rules()
         long_term = await self.memory.load_long_term()
+        session_memory = await self.memory.load_session_memory(session.id)
 
         return Context(
             system_rules=system_rules,
             agent_profile=agent_profile,
             tool_inventory=tool_inventory,
             long_term_memory=long_term,
+            session_memory=session_memory,
             session_context=session.metadata,
         )
 

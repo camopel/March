@@ -102,6 +102,35 @@ class MemoryStore:
         """Load MEMORY.md — curated long-term memory."""
         return self.files.load_long_term()
 
+    async def load_session_memory(self, session_id: str) -> str:
+        """Load all files recursively from ~/.march/memory/{session_id}/.
+
+        Returns concatenated content of all .md/.txt files found,
+        with filenames as headers. Returns empty string if directory
+        doesn't exist or has no files.
+        """
+        memory_dir = Path.home() / ".march" / "memory" / session_id
+        if not memory_dir.is_dir():
+            return ""
+
+        parts: list[str] = []
+        for path in sorted(memory_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            # Only read text files
+            if path.suffix.lower() not in (".md", ".txt", ".yaml", ".yml", ".json"):
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace").strip()
+                if content:
+                    # Use relative path from memory dir as header
+                    rel = path.relative_to(memory_dir)
+                    parts.append(f"### {rel}\n\n{content}")
+            except Exception:
+                continue
+
+        return "\n\n".join(parts)
+
     async def load_today(self) -> str:
         """Load today's daily memory file."""
         return self.files.load_today()
