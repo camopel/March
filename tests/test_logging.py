@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import structlog
 
-from march.config.schema import LoggingConfig
 from march.logging.audit import AuditTrail
 from march.logging.formatters import format_for_audit, get_console_processor, get_json_processor
 from march.logging.handlers import SQLiteAuditHandler, get_file_handler
@@ -259,32 +258,17 @@ class TestConfigureLogging:
     """Test structlog configuration."""
 
     def test_configure_json(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG",
-            format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = get_logger("test")
         assert logger is not None
 
     def test_configure_console(self, log_dir: Path):
-        config = LoggingConfig(
-            level="INFO",
-            format="console",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = get_logger("test")
         assert logger is not None
 
     def test_configure_both(self, log_dir: Path):
-        config = LoggingConfig(
-            level="INFO",
-            format="both",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = get_logger("test")
         assert logger is not None
 
@@ -302,12 +286,7 @@ class TestMarchLogger:
         assert bound is not logger
 
     def test_llm_call_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG",
-            format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         # Should not raise
         logger.llm_call(
@@ -320,29 +299,17 @@ class TestMarchLogger:
         )
 
     def test_llm_error_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.llm_error(provider="openai", error="rate limit", will_retry=True)
 
     def test_llm_fallback_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.llm_fallback(from_provider="openai", to_provider="bedrock")
 
     def test_tool_call_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.tool_call(
             tool="exec",
@@ -352,75 +319,45 @@ class TestMarchLogger:
         )
 
     def test_tool_error_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.tool_error(tool="exec", args={"command": "bad"}, error="permission denied")
 
     def test_plugin_hook_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.plugin_hook(
             plugin="safety", hook="before_tool", action="allowed", duration_ms=1.0,
         )
 
     def test_subagent_events_do_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.subagent_spawn(agent_id="child-1", task="fix bug", model="claude")
         logger.subagent_complete(agent_id="child-1", result="done", duration_ms=5000.0)
         logger.subagent_error(agent_id="child-1", error="timeout")
 
     def test_security_blocked_does_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.security_blocked(
             action="rm -rf /", reason="dangerous command", plugin="safety",
         )
 
     def test_session_events_do_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
         logger.session_start(session_id="s1", channel="terminal")
         logger.session_end(session_id="s1", channel="terminal")
 
     def test_memory_events_do_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
-        logger.memory_search(query="deployment", results_count=5)
         logger.memory_write(key="MEMORY.md", size_bytes=1024)
 
     def test_config_events_do_not_raise(self, log_dir: Path):
-        config = LoggingConfig(
-            level="DEBUG", format="json",
-            file=str(log_dir / "test.log"),
-        )
-        configure_logging(config)
+        configure_logging()
         logger = MarchLogger(session_id="test")
-        logger.config_change(key="llm.default", old_value="bedrock", new_value="openai")
         logger.config_loaded(path="/home/user/.march/config.yaml")
 
 

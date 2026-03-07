@@ -10,24 +10,22 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from march.config.defaults import DEFAULT_CONFIG_YAML
 from march.config.interpolation import interpolate_config, interpolate_value
 from march.config.loader import (
     ensure_config_exists,
     load_config,
     load_raw_yaml,
     reset_cache,
+    ConfigNotFoundError,
 )
 from march.config.schema import (
     AgentIdentityConfig,
     AgentsConfig,
     ChannelsConfig,
     DashboardConfig,
-    GuardianConfig,
     I18nConfig,
     LLMConfig,
     LLMProviderConfig,
-    LoggingConfig,
     MarchConfig,
     MemoryConfig,
     PluginsConfig,
@@ -49,9 +47,17 @@ def _clean_cache():
 
 @pytest.fixture
 def tmp_config(tmp_path: Path) -> Path:
-    """Create a temporary config file with defaults."""
+    """Create a temporary config file with minimal valid config."""
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(DEFAULT_CONFIG_YAML, encoding="utf-8")
+    config_path.write_text(
+        "llm:\n"
+        '  default: "openai"\n'
+        "  providers:\n"
+        "    openai:\n"
+        '      model: "gpt-4o"\n'
+        '      api_key: "test"\n',
+        encoding="utf-8",
+    )
     return config_path
 
 
@@ -81,22 +87,19 @@ class TestSchemaDefaults:
         """MarchConfig with no input should produce valid defaults."""
         config = MarchConfig()
         assert config.agent.name == "march"
-        assert config.agent.emoji == "𝗠𝗔𝗥"
         assert config.llm.default == ""
-        assert config.logging.level == "INFO"
-        assert config.logging.format == "json"
         assert config.i18n.locale == "auto"
 
     def test_llm_config_defaults(self):
         config = LLMConfig()
         assert config.default == ""
-        assert config.fallback_chain == [""]
+        assert config.fallback_chain == []
         assert config.providers == {}
 
     def test_llm_provider_config(self):
         provider = LLMProviderConfig(model="gpt-4o", name="GPT-4o")
         assert provider.model == "gpt-4o"
-        assert provider.temperature == 0.7
+        assert provider.temperature == 0.3
         assert provider.cost.input == 0.0
 
     def test_tools_config_defaults(self):
@@ -114,24 +117,16 @@ class TestSchemaDefaults:
         assert config.system_rules == "SYSTEM.md"
         assert config.agent_profile == "AGENT.md"
         assert config.tool_rules == "TOOLS.md"
-        assert config.vector_store.backend == "faiss"
-        assert config.vector_store.dimension == 1024
-        assert config.embeddings.model == "qwen3-embedding:0.6b"
 
     def test_channels_config_defaults(self):
         config = ChannelsConfig()
         assert config.terminal.enabled is True
-        assert config.terminal.streaming is True
-        assert config.homehub.enabled is False
         assert config.matrix.enabled is False
         assert config.matrix.e2ee is True
 
     def test_plugins_config_defaults(self):
         config = PluginsConfig()
-        assert "safety" in config.enabled
-        assert "cost" in config.enabled
-        assert config.cost.budget_per_session == 5.00
-        assert config.cost.alert_threshold == 0.8
+        assert config.enabled == []
 
     def test_agents_config_defaults(self):
         config = AgentsConfig()
@@ -139,19 +134,6 @@ class TestSchemaDefaults:
         assert config.subagents.max_concurrent == 8
         assert config.subagents.max_spawn_depth == 1
         assert config.subagents.max_children_per_agent == 5
-
-    def test_guardian_config_defaults(self):
-        config = GuardianConfig()
-        assert config.enabled is True
-        assert config.log_stale_threshold == 300
-        assert config.config_backup_count == 5
-        assert config.notification.type == "stdout"
-
-    def test_logging_config_defaults(self):
-        config = LoggingConfig()
-        assert config.level == "INFO"
-        assert config.retention == 7
-        assert config.audit_trail is True
 
     def test_dashboard_config_defaults(self):
         config = DashboardConfig()
@@ -167,42 +149,29 @@ class TestSchemaDefaults:
 class TestSchemaValidation:
     """Test schema validation catches bad input."""
 
-    def test_invalid_log_level(self):
-        with pytest.raises(ValidationError):
-            LoggingConfig(level="VERBOSE")  # type: ignore[arg-type]
-
-    def test_invalid_log_format(self):
-        with pytest.raises(ValidationError):
-            LoggingConfig(format="xml")  # type: ignore[arg-type]
-
-    def test_invalid_search_strategy(self):
-        from march.config.schema import MemorySearchConfig
-
-        with pytest.raises(ValidationError):
-            MemorySearchConfig(strategy="neural")  # type: ignore[arg-type]
-
     def test_invalid_terminal_theme(self):
         from march.config.schema import TerminalChannelConfig
 
         with pytest.raises(ValidationError):
             TerminalChannelConfig(theme="blue")  # type: ignore[arg-type]
 
-    def test_invalid_guardian_notification_type(self):
-        from march.config.schema import GuardianNotificationConfig
-
-        with pytest.raises(ValidationError):
-            GuardianNotificationConfig(type="sms")  # type: ignore[arg-type]
-
-    def test_extra_fields_forbidden(self):
-        """MarchConfig forbids extra fields at root."""
-        with pytest.raises(ValidationError):
-            MarchConfig(unknown_field="value")  # type: ignore[call-arg]
+    def test_extra_fields_ignored(self):
+        """MarchConfig ignores extra fields at root."""
+        config = MarchConfig(unknown_field="value")  # type: ignore[call-arg]
+        assert config.agent.name == "march"
 
     def test_full_config_from_yaml(self):
-        """Parse the full default YAML and validate."""
-        raw = yaml.safe_load(DEFAULT_CONFIG_YAML)
+        """Parse a full YAML config and validate."""
+        raw = yaml.safe_load(
+            "llm:\n"
+            '  default: "openai"\n'
+            "  providers:\n"
+            "    openai:\n"
+            '      model: "gpt-4o"\n'
+            '      api_key: "test"\n'
+        )
         config = MarchConfig.model_validate(raw)
-        assert config.agent.name == "march"
+        assert config.llm.default == "openai"
         assert len(config.tools.builtin) > 20
 
 
@@ -272,26 +241,23 @@ class TestInterpolation:
 class TestLoader:
     """Test config loading."""
 
-    def test_ensure_config_creates_file(self, tmp_path: Path):
+    def test_ensure_config_raises_if_missing(self, tmp_path: Path):
         config_path = tmp_path / "subdir" / "config.yaml"
         assert not config_path.exists()
-        result = ensure_config_exists(config_path)
-        assert result == config_path
-        assert config_path.exists()
-        content = config_path.read_text()
-        assert "march" in content
+        with pytest.raises(ConfigNotFoundError, match="march init"):
+            ensure_config_exists(config_path)
 
     def test_ensure_config_doesnt_overwrite(self, tmp_path: Path):
         config_path = tmp_path / "config.yaml"
         config_path.write_text("custom: true\n")
-        ensure_config_exists(config_path)
+        result = ensure_config_exists(config_path)
+        assert result == config_path
         assert config_path.read_text() == "custom: true\n"
 
     def test_load_raw_yaml(self, tmp_config: Path):
         data = load_raw_yaml(tmp_config)
         assert isinstance(data, dict)
-        assert "agent" in data
-        assert data["agent"]["name"] == "march"
+        assert "llm" in data
 
     def test_load_raw_yaml_empty_file(self, tmp_path: Path):
         empty = tmp_path / "empty.yaml"
@@ -307,7 +273,7 @@ class TestLoader:
         config = load_config(tmp_config, use_cache=False)
         assert isinstance(config, MarchConfig)
         assert config.agent.name == "march"
-        assert config.llm.default == ""
+        assert config.llm.default == "openai"
         assert config.channels.terminal.enabled is True
 
     def test_load_config_minimal(self, minimal_config: Path):
@@ -315,7 +281,6 @@ class TestLoader:
         assert config.agent.name == "test-agent"
         assert config.llm.default == ""
         # Everything else should be defaults
-        assert config.logging.level == "INFO"
 
     def test_load_config_caching(self, tmp_config: Path):
         config1 = load_config(tmp_config, use_cache=True)
@@ -372,8 +337,9 @@ class TestLoader:
         bad = tmp_path / "bad.yaml"
         bad.write_text(
             textwrap.dedent("""\
-                logging:
-                  level: "VERBOSE"
+                channels:
+                  terminal:
+                    theme: "neon"
             """),
             encoding="utf-8",
         )
@@ -385,9 +351,8 @@ class TestConfigRoundTrip:
     """Test that default YAML parses correctly and produces valid config."""
 
     def test_default_yaml_is_valid(self):
-        """The DEFAULT_CONFIG_YAML should always parse and validate."""
-        raw = yaml.safe_load(DEFAULT_CONFIG_YAML)
-        config = MarchConfig.model_validate(raw)
+        """An empty config should produce valid MarchConfig via defaults."""
+        config = MarchConfig()
         assert config.agent.name == "march"
 
     def test_config_serialization_roundtrip(self):
@@ -397,10 +362,9 @@ class TestConfigRoundTrip:
         restored = MarchConfig.model_validate(dumped)
         assert restored.agent.name == config.agent.name
         assert restored.llm.default == config.llm.default
-        assert restored.logging.level == config.logging.level
 
     def test_all_tool_names_present(self):
         """Verify all expected tools are in the default builtin list."""
         config = ToolsConfig()
-        expected = {"read", "write", "edit", "exec", "web_search", "memory_search"}
+        expected = {"read", "write", "edit", "exec", "web_search", "web_fetch", "browser"}
         assert expected.issubset(set(config.builtin))

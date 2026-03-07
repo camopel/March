@@ -37,11 +37,10 @@ DEFAULT_BLOCKLIST: list[str] = [
 
 
 class SafetyPlugin(Plugin):
-    """Block dangerous commands in exec and require confirmation for specified tools.
+    """Block dangerous commands in exec.
 
     Attributes:
         blocklist: List of regex patterns for dangerous commands.
-        require_confirmation: List of tool names that need user confirmation.
     """
 
     name = "safety"
@@ -51,25 +50,17 @@ class SafetyPlugin(Plugin):
     def __init__(
         self,
         blocklist: list[str] | None = None,
-        require_confirmation: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.blocklist = [re.compile(p, re.IGNORECASE) for p in (blocklist or DEFAULT_BLOCKLIST)]
-        self.require_confirmation = require_confirmation or []
         self._security_events: list[dict[str, Any]] = []
 
     async def on_start(self, app: Any) -> None:
-        """Load config from app.config.plugins.safety if available."""
-        cfg = getattr(getattr(app, "config", None), "plugins", None)
-        if cfg:
-            safety_cfg = getattr(cfg, "safety", None)
-            if safety_cfg:
-                confirm = getattr(safety_cfg, "require_confirmation", None)
-                if confirm is not None:
-                    self.require_confirmation = list(confirm)
+        """Load config from app if available."""
+        pass
 
     async def before_tool(self, tool_call: "ToolCall") -> "ToolCall | None":
-        """Block dangerous exec commands and flag tools needing confirmation.
+        """Block dangerous exec commands.
 
         Returns None to block, or the (possibly modified) tool_call to proceed.
         """
@@ -92,19 +83,6 @@ class SafetyPlugin(Plugin):
                     command[:200],
                 )
                 return None
-
-        # Check if tool requires confirmation
-        if tool_call.name in self.require_confirmation:
-            event = {
-                "type": "requires_confirmation",
-                "tool": tool_call.name,
-            }
-            self._security_events.append(event)
-            logger.info(
-                "safety.confirmation_required tool=%s", tool_call.name
-            )
-            # In a real implementation, this would prompt the user.
-            # For now, we allow it but log it.
 
         return tool_call
 

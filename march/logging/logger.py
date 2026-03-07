@@ -20,19 +20,26 @@ from typing import Any
 
 import structlog
 
-from march.config.schema import LoggingConfig
+# Fixed logging configuration — always JSON, always ~/.march/logs/march.log
+LOG_DIR = Path.home() / ".march" / "logs"
+LOG_FILE = LOG_DIR / "march.log"
+LOG_LEVEL = logging.INFO
+LOG_RETENTION_DAYS = 7
 
 # Sentinel for whether we've already configured structlog
 _configured = False
 
 
-def configure_logging(config: LoggingConfig) -> None:
+def configure_logging(level: str = "INFO") -> None:
     """Configure structlog with subsystem-tagged output.
 
     Sets up:
       - Rotating file handler → JSONL with {time, level, subsystem, message, ...}
       - stderr handler → human-readable: TIMESTAMP [subsystem] message key=value
       - structlog processors for both outputs
+
+    Args:
+        level: Log level override (default: INFO).
 
     Safe to call multiple times — only configures on first call.
     """
@@ -43,19 +50,18 @@ def configure_logging(config: LoggingConfig) -> None:
     from march.logging.formatters import SubsystemConsoleRenderer, SubsystemJSONRenderer
     from march.logging.handlers import get_file_handler
 
-    log_level = getattr(logging, config.level.upper(), logging.INFO)
+    log_level = getattr(logging, level.upper(), logging.INFO)
 
     # ── stdlib logging setup (file rotation + stderr) ──────────────────
 
-    log_path = Path(config.file).expanduser()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     root_logger.handlers.clear()
 
     # Rotating file handler (daily, 7-day retention)
-    file_handler = get_file_handler(log_path, retention_days=config.retention)
+    file_handler = get_file_handler(LOG_FILE, retention_days=LOG_RETENTION_DAYS)
     file_handler.setLevel(log_level)
     root_logger.addHandler(file_handler)
 

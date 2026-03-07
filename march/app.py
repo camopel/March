@@ -107,7 +107,7 @@ class MarchApp:
 
         # Configure logging first
         from march.logging.logger import configure_logging
-        configure_logging(self.config.logging)
+        configure_logging()
 
         # Create LLM providers from config
         self._create_providers()
@@ -166,12 +166,15 @@ class MarchApp:
     def _load_builtin_plugins(self) -> None:
         """Load plugins from the march/plugins/ package directory.
 
-        All plugins are equal — discovered by scanning the plugins directory
-        for Python files containing Plugin subclasses. Only plugins listed
-        in config.plugins.enabled are loaded.
+        The logger plugin is always loaded (core infrastructure).
+        Other plugins are loaded only if listed in config.plugins.enabled.
         """
         plugins_pkg_dir = Path(__file__).parent / "plugins"
-        enabled = self.config.plugins.enabled or None
+        enabled = list(self.config.plugins.enabled or [])
+
+        # Logger is always enabled — ensure it's in the list
+        if "logger" not in enabled:
+            enabled.append("logger")
         count = self.plugin_manager.load_directory(plugins_pkg_dir, enabled=enabled)
         logger.info("Loaded %d plugins from %s", count, plugins_pkg_dir)
 
@@ -411,8 +414,12 @@ class MarchApp:
         """Create a channel instance by name."""
         if name == "terminal":
             terminal_config = self.config.channels.terminal
+            # Streaming is now a per-provider LLM property
+            default_provider = self.config.llm.default
+            provider_cfg = self.config.llm.providers.get(default_provider)
+            streaming = provider_cfg.streaming if provider_cfg else True
             return TerminalChannel(
-                streaming=terminal_config.streaming,
+                streaming=streaming,
                 theme=terminal_config.theme,
             )
         elif name == "acp":

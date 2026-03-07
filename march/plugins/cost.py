@@ -1,7 +1,6 @@
 """CostPlugin — Track token usage and cost per session/day.
 
-Monitors LLM calls, tracks cumulative costs, and alerts when approaching
-budget limits.
+Monitors LLM calls and tracks cumulative costs with budget limits.
 """
 
 from __future__ import annotations
@@ -40,7 +39,6 @@ class CostPlugin(Plugin):
     Attributes:
         budget_per_session: Max cost (USD) per session. 0 = unlimited.
         budget_per_day: Max cost (USD) per day. 0 = unlimited.
-        alert_threshold: Fraction (0-1) at which to alert (default 0.8 = 80%).
     """
 
     name = "cost"
@@ -51,12 +49,10 @@ class CostPlugin(Plugin):
         self,
         budget_per_session: float = 5.00,
         budget_per_day: float = 20.00,
-        alert_threshold: float = 0.8,
     ) -> None:
         super().__init__()
         self.budget_per_session = budget_per_session
         self.budget_per_day = budget_per_day
-        self.alert_threshold = alert_threshold
 
         # Tracking state
         self._session_records: list[CostRecord] = []
@@ -70,7 +66,6 @@ class CostPlugin(Plugin):
             if cost_cfg:
                 self.budget_per_session = getattr(cost_cfg, "budget_per_session", self.budget_per_session)
                 self.budget_per_day = getattr(cost_cfg, "budget_per_day", self.budget_per_day)
-                self.alert_threshold = getattr(cost_cfg, "alert_threshold", self.alert_threshold)
 
     async def after_llm(self, context: "Context", response: "LLMResponse") -> "LLMResponse":
         """Track token usage and cost after each LLM call."""
@@ -107,7 +102,7 @@ class CostPlugin(Plugin):
         return response
 
     async def on_response(self, response: Any) -> Any:
-        """Add cost warning footer if over threshold."""
+        """Add cost warning footer if budget exceeded."""
         if not isinstance(response, str):
             return response
 
@@ -115,27 +110,17 @@ class CostPlugin(Plugin):
 
         # Check session budget
         if self.budget_per_session > 0:
-            ratio = self.session_cost / self.budget_per_session
-            if ratio >= 1.0:
+            if self.session_cost >= self.budget_per_session:
                 warnings.append(
                     f"⚠️ Session budget exceeded: ${self.session_cost:.4f} / ${self.budget_per_session:.2f}"
-                )
-            elif ratio >= self.alert_threshold:
-                warnings.append(
-                    f"💰 Session cost: ${self.session_cost:.4f} / ${self.budget_per_session:.2f} ({ratio:.0%})"
                 )
 
         # Check daily budget
         if self.budget_per_day > 0:
             daily = self.daily_cost
-            ratio = daily / self.budget_per_day
-            if ratio >= 1.0:
+            if daily >= self.budget_per_day:
                 warnings.append(
                     f"⚠️ Daily budget exceeded: ${daily:.4f} / ${self.budget_per_day:.2f}"
-                )
-            elif ratio >= self.alert_threshold:
-                warnings.append(
-                    f"💰 Daily cost: ${daily:.4f} / ${self.budget_per_day:.2f} ({ratio:.0%})"
                 )
 
         if warnings:

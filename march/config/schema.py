@@ -38,9 +38,10 @@ class LLMProviderConfig(BaseModel):
     organization: str = ""     # OpenAI organization
     max_tokens: int = 16384
     context_window: int = 128000
-    temperature: float = 0.7
+    temperature: float = 0.3
     timeout: int = 300
     reasoning: bool = False
+    streaming: bool = True
     input_types: list[str] = Field(default_factory=lambda: ["text"])
     cost: LLMCostConfig = Field(default_factory=LLMCostConfig)
 
@@ -157,13 +158,12 @@ class TerminalChannelConfig(BaseModel):
 
     enabled: bool = True
     theme: Literal["dark", "light"] = "dark"
-    streaming: bool = True
 
 
 class ACPChannelConfig(BaseModel):
     """ACP (Agent Client Protocol) channel configuration."""
 
-    enabled: bool = False
+    enabled: bool = True
     auto_register: bool = True
 
 
@@ -200,36 +200,6 @@ class ChannelsConfig(BaseModel):
 # ─── Plugin Configs ───
 
 
-class SafetyPluginConfig(BaseModel):
-    """Safety plugin configuration."""
-
-    require_confirmation: list[str] = Field(default_factory=lambda: ["exec"])
-
-
-class CostPluginConfig(BaseModel):
-    """Cost tracking plugin configuration."""
-
-    budget_per_session: float = 5.00
-    budget_per_day: float = 20.00
-    alert_threshold: float = 0.8
-
-
-class LoggerPluginConfig(BaseModel):
-    """Logger plugin configuration."""
-
-    log_tool_results: bool = True
-    log_llm_calls: bool = True
-
-
-class GitContextPluginConfig(BaseModel):
-    """Git context plugin configuration."""
-
-    auto_detect: bool = True
-    inject_branch: bool = True
-    inject_status: bool = True
-    inject_diff: bool = False
-
-
 class WSProxyPluginConfig(BaseModel):
     """WS Proxy plugin configuration.
 
@@ -253,14 +223,8 @@ class WSProxyPluginConfig(BaseModel):
 class PluginsConfig(BaseModel):
     """Plugin system configuration."""
 
-    enabled: list[str] = Field(
-        default_factory=lambda: ["safety", "cost", "logger", "git_context"]
-    )
+    enabled: list[str] = Field(default_factory=list)
     directory: str = "plugins"
-    safety: SafetyPluginConfig = Field(default_factory=SafetyPluginConfig)
-    cost: CostPluginConfig = Field(default_factory=CostPluginConfig)
-    logger: LoggerPluginConfig = Field(default_factory=LoggerPluginConfig)
-    git_context: GitContextPluginConfig = Field(default_factory=GitContextPluginConfig)
     ws_proxy: WSProxyPluginConfig = Field(default_factory=WSProxyPluginConfig)
 
 
@@ -282,7 +246,6 @@ class AgentIdentityConfig(BaseModel):
     """Agent identity configuration."""
 
     name: str = "march"
-    emoji: str = ""
     version: str = "0.1.0"
 
 
@@ -292,42 +255,6 @@ class AgentsConfig(BaseModel):
     identity: AgentIdentityConfig = Field(default_factory=AgentIdentityConfig)
     max_concurrent: int = 4
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
-
-
-# ─── Guardian Config ───
-
-
-class GuardianNotificationConfig(BaseModel):
-    """Guardian notification configuration."""
-
-    type: Literal["matrix", "webhook", "stdout"] = "stdout"
-    url: str = ""
-    room: str = ""
-
-
-class GuardianConfig(BaseModel):
-    """Guardian process configuration."""
-
-    enabled: bool = True
-    log_stale_threshold: int = 300
-    config_backup_count: int = 5
-    default_channel: str = "matrix"
-    notification: GuardianNotificationConfig = Field(
-        default_factory=GuardianNotificationConfig
-    )
-
-
-# ─── Logging Config ───
-
-
-class LoggingConfig(BaseModel):
-    """Logging system configuration."""
-
-    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    format: Literal["json", "console", "both"] = "json"
-    file: str = ".march/logs/session.log"
-    retention: int = 7
-    audit_trail: bool = True
 
 
 # ─── Dashboard Config ───
@@ -367,8 +294,6 @@ class MarchConfig(BaseModel):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
-    guardian: GuardianConfig = Field(default_factory=GuardianConfig)
-    logging: LoggingConfig = Field(default_factory=LoggingConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     i18n: I18nConfig = Field(default_factory=I18nConfig)
 

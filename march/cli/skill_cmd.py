@@ -15,6 +15,7 @@ def skill() -> None:
 def skill_list() -> None:
     """List installed skills."""
     from pathlib import Path
+    import re
 
     skills_dirs = [
         Path.cwd() / "skills",
@@ -28,10 +29,7 @@ def skill_list() -> None:
         for child in sorted(skills_dir.iterdir()):
             skill_md = child / "SKILL.md"
             if child.is_dir() and skill_md.exists():
-                # Parse basic info
                 content = skill_md.read_text(encoding="utf-8")
-                import re
-
                 name = child.name
                 version = "?"
                 desc = ""
@@ -50,98 +48,42 @@ def skill_list() -> None:
 
     if not found:
         click.echo("No skills installed.")
-        click.echo("  Install with: march skill install <path|url>")
+        click.echo("  Install with: march skill install <path>")
 
 
 @skill.command("install")
 @click.argument("source")
 def skill_install(source: str) -> None:
-    """Install a skill from a path or URL."""
-    from pathlib import Path
+    """Install a skill from a local path."""
     import shutil
+    from pathlib import Path
 
-    source_path = Path(source)
-    if source_path.is_dir():
-        # Install from local directory
-        target = Path.cwd() / "skills" / source_path.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            click.echo(f"Skill already exists at {target}. Remove first to reinstall.")
-            raise SystemExit(1)
-        shutil.copytree(source_path, target)
-        click.echo(f"✅ Installed skill: {source_path.name} → {target}")
-    else:
-        click.echo(f"URL-based skill install not yet supported: {source}")
+    source_path = Path(source).resolve()
+    if not source_path.is_dir():
+        click.echo(f"Not a directory: {source}", err=True)
         raise SystemExit(1)
 
+    if not (source_path / "SKILL.md").exists():
+        click.echo(f"No SKILL.md found in {source}", err=True)
+        raise SystemExit(1)
 
-@skill.command("create")
+    target = Path.home() / ".march" / "skills" / source_path.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        click.echo(f"Skill already exists: {target}")
+        click.echo("  Remove it first to reinstall.")
+        raise SystemExit(1)
+
+    shutil.copytree(source_path, target)
+    click.echo(f"✅ Installed: {source_path.name} → {target}")
+
+
+@skill.command("show")
 @click.argument("name")
-def skill_create(name: str) -> None:
-    """Scaffold a new skill directory."""
-    from pathlib import Path
-
-    skill_dir = Path.cwd() / "skills" / name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    # SKILL.md
-    skill_md = f"""# {name}
-
-**Name**: {name}
-**Version**: 0.1.0
-**Description**: A custom March skill
-**Triggers**: ["{name}"]
-**Author**: March user
-
-## Tools
-- `{name}_tool` — Description of what it does
-
-## Dependencies
-- Python: (none)
-
-## Config
-- (none)
-"""
-    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
-
-    # tools.py
-    tools_py = f'''"""Tools for the {name} skill."""
-
-from march.tools.base import tool
-
-
-@tool(description="Example tool for {name}")
-async def {name}_tool(query: str) -> str:
-    """Example tool function.
-
-    Args:
-        query: The input query.
-    """
-    return f"Result for: {{query}}"
-'''
-    (skill_dir / "tools.py").write_text(tools_py, encoding="utf-8")
-
-    # config.yaml
-    (skill_dir / "config.yaml").write_text(f"# Config for {name}\n", encoding="utf-8")
-
-    # README.md
-    (skill_dir / "README.md").write_text(
-        f"# {name}\n\nA custom March skill.\n", encoding="utf-8"
-    )
-
-    click.echo(f"✅ Created skill scaffold: {skill_dir}")
-    click.echo(f"  Files: SKILL.md, tools.py, config.yaml, README.md")
-
-
-@skill.command("info")
-@click.argument("name")
-def skill_info(name: str) -> None:
+def skill_show(name: str) -> None:
     """Show detailed skill information."""
     from pathlib import Path
 
-    from march.tools.skills.loader import SkillLoader
-
-    # Search for the skill
     skill_dirs = [
         Path.cwd() / "skills" / name,
         Path.home() / ".march" / "skills" / name,
@@ -149,25 +91,47 @@ def skill_info(name: str) -> None:
 
     for skill_dir in skill_dirs:
         if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
-            loader = SkillLoader()
-            try:
-                s = loader.load(skill_dir)
-                click.echo(f"Name:        {s.name}")
-                click.echo(f"Version:     {s.version}")
-                click.echo(f"Description: {s.description}")
-                click.echo(f"Author:      {s.author}")
-                click.echo(f"Triggers:    {', '.join(s.triggers)}")
-                click.echo(f"Tools:       {', '.join(s.tool_names)}")
-                click.echo(f"Path:        {s.path}")
-
-                # Check dependencies
-                missing = loader.validate_dependencies(s)
-                if missing:
-                    click.echo(f"⚠️  Missing deps: {', '.join(missing)}")
-                return
-            except Exception as e:
-                click.echo(f"Error loading skill: {e}", err=True)
-                raise SystemExit(1)
+            _show_skill(skill_dir, name)
+            return
 
     click.echo(f"Skill not found: {name}", err=True)
     raise SystemExit(1)
+
+
+def _show_skill(skill_dir, name: str) -> None:
+    """Display skill details."""
+    import re
+    from pathlib import Path
+
+    skill_md = skill_dir / "SKILL.md"
+    content = skill_md.read_text(encoding="utf-8")
+
+    # Parse metadata
+    fields = {}
+    for key in ("Name", "Version", "Description", "Author", "Triggers"):
+        match = re.search(rf"\*\*{key}\*\*\s*:\s*(.+)", content)
+        if match:
+            fields[key] = match.group(1).strip()
+
+    click.echo(f"Skill: {fields.get('Name', name)}")
+    click.echo("═" * 50)
+    click.echo(f"  Version:     {fields.get('Version', '?')}")
+    click.echo(f"  Description: {fields.get('Description', '—')}")
+    click.echo(f"  Author:      {fields.get('Author', '—')}")
+    click.echo(f"  Triggers:    {fields.get('Triggers', '—')}")
+    click.echo(f"  Path:        {skill_dir}")
+
+    # List files
+    click.echo("\n  Files:")
+    for f in sorted(skill_dir.rglob("*")):
+        if f.is_file() and "__pycache__" not in str(f):
+            rel = f.relative_to(skill_dir)
+            click.echo(f"    {rel}")
+
+    # Show tools if tools.py exists
+    tools_py = skill_dir / "tools.py"
+    if tools_py.exists():
+        tool_content = tools_py.read_text(encoding="utf-8")
+        tool_names = re.findall(r"@tool.*\ndef\s+(\w+)", tool_content)
+        if tool_names:
+            click.echo(f"\n  Tools: {', '.join(tool_names)}")

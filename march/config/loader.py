@@ -1,15 +1,15 @@
 """Config loader — loads, interpolates, validates, and caches March configuration.
 
-Loads from ~/.march/config.yaml. Creates the file with defaults if it doesn't exist.
+Loads from ~/.march/config.yaml. Fails fast if not initialized.
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import yaml
 
-from march.config.defaults import DEFAULT_CONFIG_YAML
 from march.config.interpolation import interpolate_config
 from march.config.schema import MarchConfig
 
@@ -20,19 +20,29 @@ DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.yaml"
 _cached_config: MarchConfig | None = None
 
 
+class ConfigNotFoundError(Exception):
+    """Raised when config.yaml doesn't exist."""
+    pass
+
+
 def ensure_config_exists(config_path: Path | None = None) -> Path:
-    """Ensure the config file exists, creating it with defaults if needed.
+    """Ensure the config file exists, or fail with init instructions.
 
     Args:
         config_path: Path to the config file. Defaults to ~/.march/config.yaml.
 
     Returns:
         The resolved path to the config file.
+
+    Raises:
+        ConfigNotFoundError: If the config file doesn't exist.
     """
     path = config_path or DEFAULT_CONFIG_PATH
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(DEFAULT_CONFIG_YAML, encoding="utf-8")
+        raise ConfigNotFoundError(
+            f"Config not found: {path}\n"
+            f"Run 'march init' to set up March."
+        )
     return path
 
 

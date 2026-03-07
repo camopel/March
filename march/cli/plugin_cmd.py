@@ -11,57 +11,53 @@ def plugin() -> None:
     pass
 
 
+def _load_raw_config() -> dict:
+    """Load config.yaml as raw dict (no env var expansion)."""
+    import yaml
+    from pathlib import Path
+
+    config_path = Path.home() / ".march" / "config.yaml"
+    if not config_path.exists():
+        return {}
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _save_raw_config(data: dict) -> None:
+    """Save raw dict back to config.yaml."""
+    import yaml
+    from pathlib import Path
+
+    config_path = Path.home() / ".march" / "config.yaml"
+    with open(config_path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+
 @plugin.command("list")
 def plugin_list() -> None:
     """List plugins with enabled/disabled status."""
-    try:
-        from march.config.loader import load_config
+    data = _load_raw_config()
+    enabled = set(data.get("plugins", {}).get("enabled", []))
 
-        config = load_config(use_cache=False)
-        enabled = set(config.plugins.enabled)
+    builtins = ["safety", "cost", "logger", "rate_limiter", "git_context"]
+    click.echo("Built-in Plugins:")
+    for name in builtins:
+        status = "✅ enabled" if name in enabled else "⬚ disabled"
+        click.echo(f"  {name:20s} {status}")
 
-        # List builtin plugins
-        builtins = ["safety", "cost", "logger", "rate_limiter", "git_context"]
-        click.echo("Built-in Plugins:")
-        for name in builtins:
-            status = "✅ enabled" if name in enabled else "⬚ disabled"
-            click.echo(f"  {name:20s} {status}")
-
-        # List plugins from directory
-        from pathlib import Path
-
-        plugin_dir = Path.cwd() / config.plugins.directory
-        if plugin_dir.is_dir():
-            custom = []
-            for f in sorted(plugin_dir.glob("*.py")):
-                if not f.name.startswith("_"):
-                    custom.append(f.stem)
-
-            if custom:
-                click.echo("\nCustom Plugins:")
-                for name in custom:
-                    status = "✅ enabled" if name in enabled else "⬚ disabled"
-                    click.echo(f"  {name:20s} {status}")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        raise SystemExit(1)
+    # Show any custom plugins in enabled list
+    custom = [p for p in enabled if p not in builtins]
+    if custom:
+        click.echo("\nCustom Plugins:")
+        for name in sorted(custom):
+            click.echo(f"  {name:20s} ✅ enabled")
 
 
 @plugin.command("enable")
 @click.argument("name")
 def plugin_enable(name: str) -> None:
     """Enable a plugin by name."""
-    import yaml
-    from pathlib import Path
-
-    config_path = Path.home() / ".march" / "config.yaml"
-    if not config_path.exists():
-        click.echo("Config file not found. Run 'march init' first.", err=True)
-        raise SystemExit(1)
-
-    with open(config_path, "r") as f:
-        data = yaml.safe_load(f) or {}
-
+    data = _load_raw_config()
     plugins = data.setdefault("plugins", {})
     enabled = plugins.setdefault("enabled", [])
 
@@ -70,10 +66,7 @@ def plugin_enable(name: str) -> None:
         return
 
     enabled.append(name)
-
-    with open(config_path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False)
-
+    _save_raw_config(data)
     click.echo(f"✅ Enabled plugin: {name}")
 
 
@@ -81,17 +74,7 @@ def plugin_enable(name: str) -> None:
 @click.argument("name")
 def plugin_disable(name: str) -> None:
     """Disable a plugin by name."""
-    import yaml
-    from pathlib import Path
-
-    config_path = Path.home() / ".march" / "config.yaml"
-    if not config_path.exists():
-        click.echo("Config file not found. Run 'march init' first.", err=True)
-        raise SystemExit(1)
-
-    with open(config_path, "r") as f:
-        data = yaml.safe_load(f) or {}
-
+    data = _load_raw_config()
     plugins = data.get("plugins", {})
     enabled = plugins.get("enabled", [])
 
@@ -101,50 +84,5 @@ def plugin_disable(name: str) -> None:
 
     enabled.remove(name)
     plugins["enabled"] = enabled
-
-    with open(config_path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False)
-
+    _save_raw_config(data)
     click.echo(f"⬚ Disabled plugin: {name}")
-
-
-@plugin.command("create")
-@click.argument("name")
-def plugin_create(name: str) -> None:
-    """Scaffold a new plugin."""
-    from pathlib import Path
-
-    plugin_dir = Path.cwd() / "plugins"
-    plugin_dir.mkdir(exist_ok=True)
-
-    plugin_file = plugin_dir / f"{name}.py"
-    if plugin_file.exists():
-        click.echo(f"Plugin file already exists: {plugin_file}")
-        raise SystemExit(1)
-
-    plugin_code = f'''"""Custom plugin: {name}."""
-
-from march.plugins._base import Plugin
-
-
-class {name.title().replace("_", "").replace("-", "")}Plugin(Plugin):
-    """Custom plugin — {name}."""
-
-    name = "{name}"
-    version = "0.1.0"
-    priority = 100
-
-    async def before_llm(self, context, message):
-        """Called before the LLM is invoked."""
-        return context, message
-
-    async def after_llm(self, context, response):
-        """Called after the LLM responds."""
-        return response
-
-    async def before_tool(self, tool_call):
-        """Called before a tool is executed. Return None to block."""
-        return tool_call
-'''
-    plugin_file.write_text(plugin_code, encoding="utf-8")
-    click.echo(f"✅ Created plugin: {plugin_file}")

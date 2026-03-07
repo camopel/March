@@ -7,143 +7,185 @@ Subcommands are organized into focused modules and registered here.
 from __future__ import annotations
 
 import click
-from pathlib import Path
 
 from march import __version__
 
 # Import subcommand modules
 from march.cli.chat import chat
-from march.cli.serve import serve
 from march.cli.config_cmd import config
 from march.cli.agent_cmd import agent
 from march.cli.skill_cmd import skill
 from march.cli.plugin_cmd import plugin
-from march.cli.memory_cmd import memory
 from march.cli.log_cmd import log_group
-from march.cli.init_cmd import init, init_templates
+from march.cli.guardian_cmd import guardian
+from march.cli.start import start, stop, restart, enable, disable
 
 
-@click.group(invoke_without_command=True)
-@click.version_option(version=__version__, prog_name="march")
-@click.option("--status", is_flag=True, help="Quick health check (exit 0=healthy, 1=unhealthy).")
+class MarchGroup(click.Group):
+    """Custom group that shows curated help instead of Click's default."""
+
+    def format_help(self, ctx, formatter):
+        _print_help()
+
+
+@click.group(cls=MarchGroup, invoke_without_command=True, context_settings=dict(help_option_names=["-h", "--help"]))
 @click.pass_context
-def cli(ctx: click.Context, status: bool) -> None:
-    """March — A framework-first agent runtime.
-
-    Like FastAPI for web → March for agents.
-    """
-    if status:
-        _quick_status()
-        return
+def cli(ctx: click.Context) -> None:
+    """March — A framework-first agent runtime."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
-
-
-def _quick_status() -> None:
-    """Quick health check — exit 0 if healthy, exit 1 with details if not."""
-    try:
-        from march.config.loader import load_config
-
-        config = load_config(use_cache=False)
-        click.echo(f"march {__version__} — healthy")
-        click.echo(f"  default LLM: {config.llm.default}")
-        click.echo(
-            f"  channels: terminal={config.channels.terminal.enabled}, "
-            f"matrix={config.channels.matrix.enabled}"
-        )
-        click.echo(f"  plugins: {', '.join(config.plugins.enabled)}")
-        raise SystemExit(0)
-    except Exception as e:
-        click.echo(f"march {__version__} — unhealthy: {e}", err=True)
-        raise SystemExit(1)
 
 
 # ─── Register subcommands ───
 
 cli.add_command(chat)
-cli.add_command(serve)
 cli.add_command(config)
 cli.add_command(agent)
 cli.add_command(skill)
 cli.add_command(plugin)
-cli.add_command(memory)
 cli.add_command(log_group, name="log")
-cli.add_command(init)
-cli.add_command(init_templates, name="init-templates")
+cli.add_command(start)
+cli.add_command(stop)
+cli.add_command(restart)
+cli.add_command(enable)
+cli.add_command(disable)
+cli.add_command(guardian)
 
 
-# ─── Additional top-level commands ───
+# ─── Help & Status ───
 
 
-@cli.command()
-def acp() -> None:
-    """ACP mode — launched by IDEs (IntelliJ, Zed, VS Code)."""
-    click.echo("march acp — not yet implemented (Phase 3)")
+def _print_help() -> None:
+    """Print the curated help text."""
+    click.echo(f"""march {__version__} — A framework-first agent runtime.
+
+USAGE
+  march <command> [options]
+
+LIFECYCLE
+  march start                  Init (if needed) + start agent + guardian + dashboard
+  march start --channel matrix Start with Matrix channel
+  march start --all            Start all enabled channels
+  march start --headless       Plugins only (e.g. ws_proxy)
+  march stop                   Stop March and all services
+  march restart                Stop + start
+  march enable                 Install as systemd service (auto-start on boot)
+  march disable                Remove systemd service
+
+INTERACTIVE
+  march chat                   Interactive terminal session
+  march chat "prompt"          One-shot mode
+
+CONFIGURATION
+  march config show            Show config file path
+  march status                 Health, version, model, plugins, skills
+
+AGENTS
+  march agent list             List active sub-agents
+  march agent show             Show agent details (db, logs, memory, files)
+
+SKILLS & PLUGINS
+  march skill list             List installed skills
+  march skill install PATH     Install a skill from path
+  march skill show NAME        Show skill details
+  march plugin list            List active plugins
+  march plugin enable NAME     Enable a plugin
+  march plugin disable NAME    Disable a plugin
+
+LOGS
+  march log                    Follow log stream (default)
+  march log -n 100             Last 100 lines + follow
+  march log --no-follow        Print and exit
+
+GUARDIAN
+  march guardian start         Start guardian (background)
+  march guardian stop          Stop the guardian
+  march guardian status        Show watched entries
+
+Run 'march <command> -h' for detailed help.""")
 
 
 @cli.command()
 def status() -> None:
-    """Full status: health, model, tools, plugins, cost, memory."""
-    _quick_status()
+    """Health, version, model, plugins, skills, channels."""
+    import yaml
+    from pathlib import Path
 
+    config_path = Path.home() / ".march" / "config.yaml"
+    click.echo(f"March v{__version__}")
+    click.echo("═" * 40)
 
-@cli.command("dashboard")
-@click.option("--port", default=8200, help="Dashboard port.")
-@click.option("--no-open", is_flag=True, help="Don't open browser.")
-def dashboard(port: int, no_open: bool) -> None:
-    """Open the dashboard in a browser."""
-    from march.dashboard.server import DashboardServer
-
-    server = DashboardServer(port=port)
-    server.start(open_browser=not no_open)
-    click.echo(f"Dashboard running at {server.url}")
-    click.echo("Press Ctrl+C to stop.")
+    # Health + config validation
+    config_errors = []
     try:
-        import time
+        from march.config.loader import load_config
+        cfg = load_config(use_cache=False)
+        click.echo("  Status:    ✅ healthy")
+    except Exception as e:
+        cfg = None
+        config_errors.append(str(e))
+        click.echo("  Status:    ❌ unhealthy")
 
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        server.stop()
-        click.echo("\nDashboard stopped.")
+    # Raw config for fields that don't need env expansion
+    raw = {}
+    if config_path.exists():
+        raw = yaml.safe_load(config_path.read_text()) or {}
+    elif not config_errors:
+        config_errors.append("config.yaml not found")
 
+    # Model
+    llm = raw.get("llm", {})
+    click.echo(f"  Model:     {llm.get('default', '?')}")
 
-@cli.command("version")
-def version() -> None:
-    """Show version information."""
-    click.echo(f"march {__version__}")
+    # Channels
+    channels = raw.get("channels", {})
+    enabled_ch = [ch for ch, v in channels.items() if isinstance(v, dict) and v.get("enabled")]
+    click.echo(f"  Channels:  {', '.join(enabled_ch) if enabled_ch else 'none'}")
 
+    # Plugins
+    plugins = raw.get("plugins", {}).get("enabled", [])
+    click.echo(f"  Plugins:   {', '.join(plugins) if plugins else 'none'}")
 
-@cli.command("logs")
-@click.option("--follow", "-f", is_flag=True, help="Follow log output")
-@click.option("--lines", "-n", default=50, help="Number of lines to show")
-def logs(follow: bool, lines: int) -> None:
-    """Tail the March log file."""
-    import subprocess
+    # Skills
+    skills_dirs = [Path.cwd() / "skills", Path.home() / ".march" / "skills"]
+    skill_names = []
+    for sd in skills_dirs:
+        if sd.is_dir():
+            for child in sd.iterdir():
+                if child.is_dir() and (child / "SKILL.md").exists():
+                    skill_names.append(child.name)
+    click.echo(f"  Skills:    {', '.join(skill_names) if skill_names else 'none'}")
 
-    log_path = Path.home() / ".march" / "logs" / "march.log"
-    # Also check session.log (the default config name)
-    if not log_path.exists():
-        log_path = Path.home() / ".march" / "logs" / "session.log"
-    if not log_path.exists():
-        # Try to find any .log file in the logs directory
-        log_dir = Path.home() / ".march" / "logs"
-        if log_dir.is_dir():
-            log_files = sorted(log_dir.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if log_files:
-                log_path = log_files[0]
+    # Process check
+    from march.cli.start import _find_march_pids
+    pids = _find_march_pids()
+    if pids:
+        labels = []
+        dashboard_url = None
+        for _, cmd in pids:
+            if "guardian" in cmd:
+                labels.append("guardian")
+            elif "dashboard" in cmd:
+                labels.append("dashboard")
+                # Extract port from cmdline if present
+                import re
+                port_match = re.search(r"--port\s+(\d+)", cmd)
+                port = port_match.group(1) if port_match else "8200"
+                dashboard_url = f"http://localhost:{port}"
             else:
-                click.echo(f"No log files found in {log_dir}")
-                return
-        else:
-            click.echo(f"Log directory not found: {log_dir}")
-            return
+                labels.append("agent")
+        click.echo(f"  Running:   {', '.join(labels)} ({len(pids)} processes)")
+        if dashboard_url:
+            click.echo(f"  Dashboard: {dashboard_url}")
+    else:
+        click.echo("  Running:   not running")
 
-    cmd = ["tail"]
-    if follow:
-        cmd.append("-f")
-    cmd.extend(["-n", str(lines), str(log_path)])
-    subprocess.run(cmd)
+    # Config errors
+    if config_errors:
+        click.echo("")
+        click.echo("  Errors:")
+        for err in config_errors:
+            click.echo(f"    ❌ {err}")
 
 
 if __name__ == "__main__":

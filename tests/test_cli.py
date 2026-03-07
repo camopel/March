@@ -19,7 +19,7 @@ def runner() -> CliRunner:
 
 @pytest.fixture
 def init_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Create a temp dir and cd into it for init tests."""
+    """Create a temp dir and cd into it for tests."""
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
@@ -34,55 +34,50 @@ class TestCLITopLevel:
         assert result.exit_code == 0
         assert "March" in result.output
 
-    def test_version_command(self, runner: CliRunner) -> None:
-        """march version shows version."""
-        result = runner.invoke(cli, ["version"])
+    def test_help_flag(self, runner: CliRunner) -> None:
+        """march --help shows curated help."""
+        result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
-        assert __version__ in result.output
+        assert "march start" in result.output
 
-    def test_version_flag(self, runner: CliRunner) -> None:
-        """march --version shows version."""
-        result = runner.invoke(cli, ["--version"])
+    def test_help_short_flag(self, runner: CliRunner) -> None:
+        """march -h shows curated help."""
+        result = runner.invoke(cli, ["-h"])
         assert result.exit_code == 0
-        assert __version__ in result.output
+        assert "LIFECYCLE" in result.output
 
 
-# ─── Init Command ───
+# ─── Start/Stop/Restart Commands ───
 
 
-class TestInitCommand:
-    def test_init_creates_files(self, runner: CliRunner, init_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """march init creates all expected files."""
-        # Redirect ~/.march/ to temp dir so we don't pollute real home
-        fake_march_dir = init_dir / ".march"
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: init_dir))
-
-        result = runner.invoke(cli, ["init"])
+class TestLifecycleCommands:
+    def test_start_help(self, runner: CliRunner) -> None:
+        """march start --help works."""
+        result = runner.invoke(cli, ["start", "--help"])
         assert result.exit_code == 0
-        assert "✅" in result.output
+        assert "Initialize" in result.output
 
-        # MEMORY.md goes to ~/.march/
-        assert (fake_march_dir / "MEMORY.md").exists()
-        # config.yaml goes to ~/.march/
-        assert (fake_march_dir / "config.yaml").exists()
-        # Directories in cwd
-        assert (init_dir / "plugins").is_dir()
-        assert (init_dir / "skills").is_dir()
-        # SYSTEM.md, AGENT.md, TOOLS.md are NOT created — they come from templates
-        # (unless user runs march init-templates)
-
-    def test_init_idempotent(self, runner: CliRunner, init_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Running init twice doesn't overwrite existing files."""
-        monkeypatch.setattr(Path, "home", classmethod(lambda cls: init_dir))
-        runner.invoke(cli, ["init"])
-        # Modify MEMORY.md
-        fake_march_dir = init_dir / ".march"
-        (fake_march_dir / "MEMORY.md").write_text("custom content")
-        result = runner.invoke(cli, ["init"])
+    def test_stop_help(self, runner: CliRunner) -> None:
+        """march stop -h works."""
+        result = runner.invoke(cli, ["stop", "-h"])
         assert result.exit_code == 0
-        assert "Exists" in result.output
-        # File should not be overwritten
-        assert (fake_march_dir / "MEMORY.md").read_text() == "custom content"
+        assert "Stop" in result.output
+
+    def test_restart_help(self, runner: CliRunner) -> None:
+        """march restart --help works."""
+        result = runner.invoke(cli, ["restart", "--help"])
+        assert result.exit_code == 0
+
+    def test_enable_help(self, runner: CliRunner) -> None:
+        """march enable --help works."""
+        result = runner.invoke(cli, ["enable", "--help"])
+        assert result.exit_code == 0
+        assert "systemd" in result.output
+
+    def test_disable_help(self, runner: CliRunner) -> None:
+        """march disable -h works."""
+        result = runner.invoke(cli, ["disable", "-h"])
+        assert result.exit_code == 0
 
 
 # ─── Config Commands ───
@@ -90,16 +85,10 @@ class TestInitCommand:
 
 class TestConfigCommands:
     def test_config_show(self, runner: CliRunner) -> None:
-        """march config show outputs JSON."""
+        """march config show prints path."""
         result = runner.invoke(cli, ["config", "show"])
-        # Should succeed or fail gracefully
-        # (may fail if no config file exists, which is fine)
-        assert result.exit_code in (0, 1)
-
-    def test_config_validate(self, runner: CliRunner) -> None:
-        """march config validate works."""
-        result = runner.invoke(cli, ["config", "validate"])
-        assert result.exit_code in (0, 1)
+        assert result.exit_code == 0
+        assert "config.yaml" in result.output
 
 
 # ─── Agent Commands ───
@@ -111,16 +100,11 @@ class TestAgentCommands:
         result = runner.invoke(cli, ["agent", "list"])
         assert result.exit_code == 0
 
-    def test_agent_kill(self, runner: CliRunner) -> None:
-        """march agent kill runs."""
-        result = runner.invoke(cli, ["agent", "kill", "test-id"])
+    def test_agent_show(self, runner: CliRunner) -> None:
+        """march agent show displays details."""
+        result = runner.invoke(cli, ["agent", "show"])
         assert result.exit_code == 0
-        assert "test-id" in result.output
-
-    def test_agent_send(self, runner: CliRunner) -> None:
-        """march agent send runs."""
-        result = runner.invoke(cli, ["agent", "send", "test-id", "hello"])
-        assert result.exit_code == 0
+        assert "March Agent" in result.output
 
 
 # ─── Skill Commands ───
@@ -132,21 +116,14 @@ class TestSkillCommands:
         result = runner.invoke(cli, ["skill", "list"])
         assert result.exit_code == 0
 
-    def test_skill_create(self, runner: CliRunner, init_dir: Path) -> None:
-        """march skill create scaffolds a skill."""
-        result = runner.invoke(cli, ["skill", "create", "my-test-skill"])
-        assert result.exit_code == 0
-        assert "✅" in result.output
+    def test_skill_show_not_found(self, runner: CliRunner) -> None:
+        """march skill show for missing skill fails."""
+        result = runner.invoke(cli, ["skill", "show", "nonexistent"])
+        assert result.exit_code == 1
 
-        skill_dir = init_dir / "skills" / "my-test-skill"
-        assert skill_dir.is_dir()
-        assert (skill_dir / "SKILL.md").exists()
-        assert (skill_dir / "tools.py").exists()
-        assert (skill_dir / "config.yaml").exists()
-
-    def test_skill_info_not_found(self, runner: CliRunner) -> None:
-        """march skill info for missing skill fails."""
-        result = runner.invoke(cli, ["skill", "info", "nonexistent"])
+    def test_skill_install_not_found(self, runner: CliRunner) -> None:
+        """march skill install with bad path fails."""
+        result = runner.invoke(cli, ["skill", "install", "/tmp/nonexistent-skill"])
         assert result.exit_code == 1
 
 
@@ -157,49 +134,23 @@ class TestPluginCommands:
     def test_plugin_list(self, runner: CliRunner) -> None:
         """march plugin list runs."""
         result = runner.invoke(cli, ["plugin", "list"])
-        # May fail if no config, that's okay
         assert result.exit_code in (0, 1)
 
-    def test_plugin_create(self, runner: CliRunner, init_dir: Path) -> None:
-        """march plugin create scaffolds a plugin."""
-        result = runner.invoke(cli, ["plugin", "create", "my_plugin"])
-        assert result.exit_code == 0
-        assert "✅" in result.output
-        assert (init_dir / "plugins" / "my_plugin.py").exists()
-
-
-# ─── Memory Commands ───
-
-
-class TestMemoryCommands:
-    def test_memory_show(self, runner: CliRunner, init_dir: Path) -> None:
-        """march memory show runs."""
-        result = runner.invoke(cli, ["memory", "show"])
-        assert result.exit_code == 0
-        assert "Memory Statistics" in result.output
+    def test_plugin_enable_disable(self, runner: CliRunner) -> None:
+        """march plugin enable/disable modifies config."""
+        # These may fail if no config, that's okay
+        result = runner.invoke(cli, ["plugin", "enable", "test_plugin"])
+        assert result.exit_code in (0, 1)
+        result = runner.invoke(cli, ["plugin", "disable", "test_plugin"])
+        assert result.exit_code in (0, 1)
 
 
 # ─── Log Commands ───
 
 
 class TestLogCommands:
-    def test_log_default(self, runner: CliRunner) -> None:
-        """march log runs (may have no logs)."""
-        result = runner.invoke(cli, ["log"])
+    def test_log_help(self, runner: CliRunner) -> None:
+        """march log -h works."""
+        result = runner.invoke(cli, ["log", "-h"])
         assert result.exit_code == 0
-
-    def test_log_cost(self, runner: CliRunner) -> None:
-        """march log cost runs."""
-        result = runner.invoke(cli, ["log", "cost"])
-        assert result.exit_code == 0
-
-
-# ─── Dashboard Command ───
-
-
-class TestDashboardCommand:
-    def test_dashboard_help(self, runner: CliRunner) -> None:
-        """march dashboard --help works."""
-        result = runner.invoke(cli, ["dashboard", "--help"])
-        assert result.exit_code == 0
-        assert "dashboard" in result.output.lower()
+        assert "follow" in result.output.lower() or "Follow" in result.output
