@@ -371,14 +371,17 @@ class ChatDB:
 
     async def create_session(self, name: str, description: str = "") -> dict:
         session = await self._store.create_session(
-            source_type="ws", source_id=name,
+            source_type="ws", source_id="",
             name=name, metadata={"description": description},
         )
+        # Re-fetch to get the DB-formatted created_at (ISO string)
+        stored = await self._store.get_session(session.id)
+        created_at = stored.created_at if stored else _now()
         return {
             "id": session.id,
             "name": name,
             "description": description,
-            "created_at": session.created_at,
+            "created_at": created_at,
         }
 
     async def delete_session(self, session_id: str) -> bool:
