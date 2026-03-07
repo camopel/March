@@ -1,0 +1,23 @@
+#!/bin/bash
+# March ACP — launched by IDEs as a subprocess
+# Reads JSON-RPC from stdin, writes to stdout, logs to stderr
+export MARCH_MATRIX_TOKEN="${MARCH_MATRIX_TOKEN:-}"
+source ~/.bashrc 2>/dev/null
+
+exec /home/ubuntu/Workspace/.venv/bin/python -c "
+import asyncio, sys
+from pathlib import Path
+
+async def main():
+    from march.app import MarchApp
+    from march.channels.acp import ACPChannel
+
+    config_path = Path.home() / '.march' / 'config.yaml'
+    app = MarchApp(config=config_path)
+    await app.initialize()
+
+    ch = ACPChannel()
+    await ch.start(app.agent)
+
+asyncio.run(main())
+" "$@"

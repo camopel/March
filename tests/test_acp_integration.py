@@ -8,7 +8,12 @@ import time
 import select
 
 AGENT_CODE = '''
-import asyncio, dataclasses
+import asyncio, dataclasses, sys, logging
+
+# Redirect any logging to stderr before importing march
+for h in logging.getLogger().handlers[:]:
+    if isinstance(h, logging.StreamHandler) and h.stream is sys.stdout:
+        h.stream = sys.stderr
 
 @dataclasses.dataclass
 class FakeResponse:
@@ -49,7 +54,12 @@ def main():
             if ready:
                 line = proc.stdout.readline().strip()
                 if line:
-                    lines.append(json.loads(line))
+                    try:
+                        parsed = json.loads(line)
+                        if isinstance(parsed, dict) and 'jsonrpc' in parsed:
+                            lines.append(parsed)
+                    except json.JSONDecodeError:
+                        pass  # Skip non-JSON (log output)
             elif lines:
                 break
         return lines

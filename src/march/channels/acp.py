@@ -353,12 +353,3 @@ def _redirect_logging_to_stderr() -> None:
             if isinstance(handler, logging.StreamHandler):
                 if handler.stream is sys.stdout:
                     handler.stream = sys.stderr
-
-    # Reconfigure structlog to use stderr
-    try:
-        import structlog
-        structlog.configure(
-            logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-        )
-    except Exception:
-        pass
