@@ -432,7 +432,7 @@ async def compact_messages(
         return recent, previous_summary or ""
 
     # Fold session memory (facts + plans) into the summary with budget limits
-    # Facts: max 20% of context window, Plans: max 5% (plans never compressed)
+    # Facts: max 15% of context window, Plans: max 5% (plans never compressed)
     if session_id:
         facts, plan = _load_session_memory(session_id)
 
