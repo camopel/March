@@ -156,9 +156,15 @@ class Agent:
         """Handle /reset: clear session data, keep global memory."""
         result = await self.memory.reset_session(session.id)
         session.clear()
-        return AgentResponse(
-            content=f"✓ Session reset. Removed {result.get('sqlite_entries', 0)} database entries."
-        )
+
+        # Delete session memory files (facts.md, plan.md, etc.)
+        from march.core.compaction import delete_session_memory
+        deleted_memory = delete_session_memory(session.id)
+
+        msg = f"✓ Session reset. Removed {result.get('sqlite_entries', 0)} database entries."
+        if deleted_memory:
+            msg += " Session memory cleared."
+        return AgentResponse(content=msg)
 
     async def run(self, user_message: str | list, session: Session) -> AgentResponse:
         """The main agent loop. Called once per user message.
@@ -985,19 +991,11 @@ class Agent:
         tool_inventory = await self.memory.load_tool_rules()
         long_term = await self.memory.load_long_term()
 
-        # Session memory is only loaded AFTER compaction has happened.
-        # Before compaction, the facts/plans are already in the message history
-        # so loading them would be redundant and waste tokens.
-        session_memory = ""
-        if session.compaction_summary:
-            session_memory = await self.memory.load_session_memory(session.id)
-
         return Context(
             system_rules=system_rules,
             agent_profile=agent_profile,
             tool_inventory=tool_inventory,
             long_term_memory=long_term,
-            session_memory=session_memory,
             session_context=session.metadata,
         )
 

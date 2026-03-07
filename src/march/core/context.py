@@ -53,7 +53,6 @@ class Context:
     agent_profile: str = ""
     tool_inventory: str = ""
     long_term_memory: str = ""
-    session_memory: str = ""  # Per-session memory from ~/.march/memory/{session_id}/
     session_context: dict[str, Any] = field(default_factory=dict)
     extra_context: list[str] = field(default_factory=list)
 
@@ -86,8 +85,6 @@ class Context:
             sections.append(("Available Tools", self.tool_inventory, 3))
         if self.long_term_memory:
             sections.append(("Long-Term Memory", self.long_term_memory, 4))
-        if self.session_memory:
-            sections.append(("Session Memory", self.session_memory, 4))
         for i, extra in enumerate(self.extra_context):
             sections.append((f"Context {i + 1}", extra, 5))
         if self.session_context:

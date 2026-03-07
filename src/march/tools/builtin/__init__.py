@@ -46,6 +46,7 @@ def register_all_builtin_tools(registry: "ToolRegistry") -> None:
         subagents_tool,
         session_status,
     )
+    from march.tools.builtin.session_memory_tool import session_memory_tool
 
     tools = [
         # Files (fs)
@@ -82,6 +83,7 @@ def register_all_builtin_tools(registry: "ToolRegistry") -> None:
         sessions_spawn,
         subagents_tool,
         session_status,
+        session_memory_tool,
     ]
 
     for tool_fn in tools:

@@ -186,6 +186,60 @@ Rules:
 - Preserve identifiers verbatim in backticks"""
 
 
+def _load_and_clear_session_memory(session_id: str) -> str:
+    """Load all session memory files, return content, then clear the files.
+
+    After folding into the compaction summary, the files are cleared
+    so they don't accumulate across multiple compactions.
+    """
+    from pathlib import Path
+
+    memory_dir = Path.home() / ".march" / "memory" / session_id
+    if not memory_dir.is_dir():
+        return ""
+
+    parts: list[str] = []
+    files_to_clear: list[Path] = []
+
+    for path in sorted(memory_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in (".md", ".txt"):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace").strip()
+            if content:
+                rel = path.relative_to(memory_dir)
+                parts.append(f"**{rel}:**\n{content}")
+                files_to_clear.append(path)
+        except Exception:
+            continue
+
+    # Clear files after reading (content is now in the summary)
+    for f in files_to_clear:
+        try:
+            f.write_text("")
+        except Exception:
+            pass
+
+    return "\n\n".join(parts)
+
+
+def delete_session_memory(session_id: str) -> bool:
+    """Delete all session memory files for a session (used by /reset).
+
+    Returns True if directory existed and was deleted.
+    """
+    import shutil
+    from pathlib import Path
+
+    memory_dir = Path.home() / ".march" / "memory" / session_id
+    if memory_dir.is_dir():
+        shutil.rmtree(memory_dir, ignore_errors=True)
+        return True
+    return False
+
+
 async def extract_session_memory(
     messages: list[dict[str, Any]],
     session_id: str,
@@ -328,6 +382,13 @@ async def compact_messages(
         logger.error("Compaction summarization failed: %s — falling back to truncation", e)
         # Fallback: just drop old messages without summary
         return recent, previous_summary or ""
+
+    # Fold session memory (facts + plans) into the summary, then clear files
+    # This way they're included once in the compacted context, not loaded every turn
+    if session_id:
+        session_mem = _load_and_clear_session_memory(session_id)
+        if session_mem:
+            summary = summary + "\n\n---\n\n**Preserved Session Memory:**\n" + session_mem
 
     # Build the compacted message list
     summary_msg = {
