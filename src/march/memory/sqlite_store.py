@@ -1,8 +1,7 @@
 """SQLite structured store for the March memory system (Tier 2).
 
-Minimal store — most persistence is owned by the ws_proxy plugin.
+Minimal store — session/message persistence is owned by SessionStore (core/session.py).
 This module provides the SQLiteStore interface for MemoryStore compatibility.
-Tables are NOT created here (ws_proxy owns the schema).
 """
 
 from __future__ import annotations
@@ -19,8 +18,8 @@ DEFAULT_DB_PATH = Path.home() / ".march" / "march.db"
 class SQLiteStore:
     """Minimal SQLite store stub.
 
-    The ws_proxy plugin owns all persistence (sessions, messages, etc.).
-    This class exists for MemoryStore interface compatibility.
+    Session and message persistence is handled by the unified SessionStore
+    in core/session.py. This class exists for MemoryStore interface compatibility.
     Methods are no-ops or return safe defaults.
     """
 
@@ -32,7 +31,7 @@ class SQLiteStore:
         return False
 
     async def initialize(self) -> None:
-        """No-op — ws_proxy owns the database."""
+        """No-op — SessionStore owns the database."""
         pass
 
     async def close(self) -> None:
@@ -40,7 +39,7 @@ class SQLiteStore:
         pass
 
     async def delete_by_session(self, session_id: str) -> int:
-        """No-op — ws_proxy handles session cleanup via its own ChatDB."""
+        """No-op — session cleanup is handled by SessionStore."""
         return 0
 
     async def record_usage(

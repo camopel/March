@@ -328,6 +328,19 @@ class ACPChannel(Channel):
 
             # Send final response
             if final_response:
+                # Persist messages to DB
+                if self._session_store:
+                    try:
+                        from march.core.message import Message
+                        await self._session_store.add_message(
+                            session_id, Message.user(text)
+                        )
+                        await self._session_store.add_message(
+                            session_id, Message.assistant(final_response.content)
+                        )
+                    except Exception as e:
+                        logger.error("acp persist failed: %s", e)
+
                 self._send_response(request_id, {
                     "stopReason": "endTurn",
                     "_meta": {

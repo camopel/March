@@ -4,7 +4,7 @@
 
 Most agent frameworks dump everything into the LLM context — tool results, sub-agent outputs, stale memory — and you pay for every token. Sub-agents pollute shared memory. Crashes lose running tasks with no recovery. Config changes break things silently at 3 AM.
 
-March fixes this. Plugin hooks at every step so you control what enters context. Isolated 2-tier memory so sub-agents can't corrupt the parent. A guardian process that survives crashes, rolls back bad configs, and revives dead tasks. Structured cost tracking on every LLM call. Multi-channel (terminal, Matrix, WebSocket, ACP) from a single `march start`.
+March fixes this. Plugin hooks at every step so you control what enters context. Isolated 2-tier memory so sub-agents can't corrupt the parent. A guardian process that survives crashes, rolls back bad configs, and revives dead tasks. Structured cost tracking on every LLM call. Multi-channel (terminal, Matrix, WebSocket, ACP) from a single `march start`. One unified session store — conversations persist across restarts and channels share the same DB.
 
 ---
 
@@ -27,6 +27,8 @@ march enable                 # Install as systemd service (auto-start on boot)
 - **2-tier memory** — session memory stays isolated. Sub-agents can't pollute the parent.
 - **Guardian process** — crash recovery, config rollback, restart protection.
 - **Cost tracking** — token counting on every LLM call, structured logging.
+- **Unified storage** — one SQLite DB for all channels. Sessions resume on reconnect.
+- **IDE integration** — ACP protocol for VS Code, IntelliJ, Zed. Real-time streaming.
 - **Modular** — only install what you need. Core is lightweight.
 - **Pure Python** — no Node.js, no Electron. Python 3.12+ and you're done.
 
@@ -102,7 +104,8 @@ pip install march[all]         # Everything
 ```
 ~/.march/
 ├── config.yaml              # Configuration
-├── march.db                 # SQLite (sessions, messages)
+├── march.db                 # SQLite (sessions + messages, all channels)
+├── attachments/             # Saved images, PDFs, audio (by date)
 ├── MEMORY.md                # Long-term memory
 ├── SYSTEM.md                # System rules
 ├── AGENT.md                 # Agent profile

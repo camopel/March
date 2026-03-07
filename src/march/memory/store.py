@@ -70,7 +70,7 @@ class MemoryStore:
         self.files.load_long_term()
         self.files.load_today()
 
-        # NOTE: SQLite store disabled — ws_proxy plugin owns all persistence.
+        # NOTE: SQLite store disabled — SessionStore (core/session.py) owns all persistence.
         # File-based memory (above) is sufficient for agent context.
 
         # Start file watching

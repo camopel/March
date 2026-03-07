@@ -22,7 +22,6 @@ import asyncio
 import base64
 import io
 import json
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
