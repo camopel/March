@@ -58,10 +58,18 @@ class TerminalChannel(Channel):
         Handles Ctrl+C gracefully.
         """
         self._agent = agent
-        self._session = kwargs.get("session") or Session(
-            source_type="terminal",
-            source_id="terminal-interactive",
-        )
+        session_store = kwargs.get("session_store")
+
+        # Use session store for persistence if available
+        if session_store:
+            self._session = await session_store.get_or_create_session(
+                "terminal", "terminal-interactive", name="Terminal"
+            )
+        else:
+            self._session = kwargs.get("session") or Session(
+                source_type="terminal",
+                source_id="terminal-interactive",
+            )
         self._running = True
 
         # Display welcome banner

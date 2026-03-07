@@ -17,7 +17,7 @@ from march.channels.terminal import TerminalChannel
 from march.config.schema import MarchConfig
 from march.config.loader import load_config
 from march.core.agent import Agent
-from march.core.session import Session
+from march.core.session import Session, SessionStore
 from march.llm.base import LLMProvider
 from march.llm.router import LLMRouter, RouterConfig
 from march.logging import get_logger
@@ -82,7 +82,8 @@ class MarchApp:
             agent_profile_path=self.config.memory.agent_profile,
             tool_rules_path=self.config.memory.tool_rules,
         )
-        # NOTE: ws_proxy plugin owns all persistence (sessions/messages in march.db)
+        # NOTE: SessionStore is the single persistence layer for ALL channels
+        self.session_store: SessionStore | None = None
 
         # Build agent
         self.agent = Agent(
@@ -114,6 +115,12 @@ class MarchApp:
 
         # Initialize memory (file-based: SYSTEM.md, AGENT.md, TOOLS.md, MEMORY.md)
         await self.memory_store.initialize()
+
+        # Initialize unified session store (used by ALL channels)
+        db_path = Path.home() / ".march" / "march.db"
+        self.session_store = SessionStore(db_path=db_path)
+        await self.session_store.initialize()
+        self.agent.session_store = self.session_store
 
         # Load built-in plugins
         self._load_builtin_plugins()
@@ -149,13 +156,12 @@ class MarchApp:
         self.agent_manager = AgentManager(
             config=agent_mgr_config,
             task_queue=self.task_queue,
-            session_store=None,
+            session_store=self.session_store,
         )
         await self.agent_manager.initialize()
 
         # Expose agent manager to the agent for sub-agent spawning
         self.agent.agent_manager = self.agent_manager
-        self.agent.session_store = None
 
         # Fire on_start hook
         await self.plugin_manager.dispatch_simple("on_start", self)
@@ -182,6 +188,8 @@ class MarchApp:
         """Clean shutdown of all components."""
         await self.plugin_manager.dispatch_simple("on_shutdown", self)
         await self.memory_store.close()
+        if self.session_store:
+            await self.session_store.close()
         self._initialized = False
 
     def _create_providers(self) -> None:
@@ -387,7 +395,7 @@ class MarchApp:
                 if channel:
                     self._channels[name] = channel
                     task = asyncio.create_task(
-                        channel.start(self.agent, session=session, session_store=None)
+                        channel.start(self.agent, session=session, session_store=self.session_store)
                     )
                     tasks.append(task)
                 else:

@@ -137,9 +137,14 @@ The agent already calls `session_store.save_session()` after exchanges. Update t
 
 Consistent across all channels:
 - Images/files → `AttachmentManager.save()` → disk file → `AttachmentRef` dict
-- `AttachmentRef` stored in `messages.attachments` as JSON array
-- When building LLM messages, load image bytes from disk path for multimodal content
-- `strip_attachments_from_messages()` in `attachments.py` already handles removing image data from older messages — keep this for LLM calls
+- `AttachmentRef` stored in `messages.attachments` as JSON array (paths, NOT base64)
+- **In-memory**: current turn keeps full base64 in Message.content (multimodal list)
+- **In DB**: only AttachmentRef paths stored, never base64 blobs
+- **On reload from DB**: rehydrate recent messages' images from disk (load bytes → base64)
+- **Older messages**: get text placeholder `[Image: filename.jpg (saved to /path)]` — same as current strip behavior
+- `strip_attachments_from_messages()` in `attachments.py` already handles this pattern
+- New: `rehydrate_attachments(messages, keep_recent=2)` loads disk images for last N messages
+- This ensures LLM can see recent images but context doesn't explode with old ones
 
 ### 9. Migration
 

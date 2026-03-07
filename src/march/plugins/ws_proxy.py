@@ -339,144 +339,104 @@ async def _chunked_summarize(
 # ── Database Layer ────────────────────────────────────────────────────────────
 
 class ChatDB:
-    """Async SQLite wrapper using aiosqlite."""
+    """Adapter that wraps the unified SessionStore for ws_proxy compatibility.
 
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self._db: Any = None
+    Provides the same API that ws_proxy expects, but delegates to SessionStore.
+    This allows ws_proxy to share the same DB/tables as all other channels.
+    """
+
+    def __init__(self, store: Any = None, db_path: Path | None = None) -> None:
+        self._store = store  # SessionStore instance
+        self.db_path = db_path or Path("~/.march/march.db")
+
+    @classmethod
+    async def from_session_store(cls, store: Any) -> "ChatDB":
+        """Create a ChatDB adapter from an existing SessionStore."""
+        adapter = cls(store=store)
+        return adapter
 
     async def initialize(self) -> None:
-        import aiosqlite
-
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(self.db_path))
-        self._db.row_factory = sqlite3.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA foreign_keys=ON")
-        await self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                rolling_summary TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                last_active TEXT NOT NULL,
-                is_active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-                content TEXT NOT NULL DEFAULT '',
-                tool_calls TEXT DEFAULT '[]',
-                image_data TEXT DEFAULT NULL,
-                summary TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_session
-                ON messages(session_id, created_at);
-        """)
-        # Migration: add rolling_summary column if missing
-        try:
-            await self._db.execute("SELECT rolling_summary FROM sessions LIMIT 0")
-        except Exception:
-            await self._db.execute(
-                "ALTER TABLE sessions ADD COLUMN rolling_summary TEXT DEFAULT ''"
-            )
-        await self._db.commit()
-        logger.info("database initialized", path=str(self.db_path))
+        """Initialize — if no store provided, create our own SessionStore."""
+        if self._store is None:
+            from march.core.session import SessionStore
+            self._store = SessionStore(db_path=self.db_path)
+            await self._store.initialize()
+        logger.info("database initialized", path=str(self._store.db_path))
 
     async def close(self) -> None:
-        if self._db:
-            await self._db.close()
-            self._db = None
+        """Close — only if we own the store (not shared)."""
+        pass  # Shared store is closed by MarchApp
 
     async def list_sessions(self) -> list[dict]:
-        cursor = await self._db.execute(
-            "SELECT * FROM sessions WHERE is_active=1 ORDER BY last_active DESC"
-        )
-        rows = await cursor.fetchall()
-        sessions = []
-        for r in rows:
-            s = dict(r)
-            s["is_active"] = bool(s["is_active"])
-            cur2 = await self._db.execute(
-                "SELECT content, role FROM messages "
-                "WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
-                (r["id"],),
-            )
-            msg = await cur2.fetchone()
-            s["last_message"] = msg["content"][:100] if msg else None
-            s["last_message_role"] = msg["role"] if msg else None
-            cur3 = await self._db.execute(
-                "SELECT COUNT(*) as c FROM messages WHERE session_id=?",
-                (r["id"],),
-            )
-            cnt = await cur3.fetchone()
-            s["message_count"] = cnt["c"]
-            sessions.append(s)
-        return sessions
+        return await self._store.list_sessions()
 
     async def create_session(self, name: str, description: str = "") -> dict:
-        sid = str(uuid.uuid4())
-        now = _now()
-        await self._db.execute(
-            "INSERT INTO sessions (id, name, description, created_at, last_active) "
-            "VALUES (?,?,?,?,?)",
-            (sid, name, description, now, now),
+        session = await self._store.create_session(
+            source_type="ws", source_id=name,
+            name=name, metadata={"description": description},
         )
-        await self._db.commit()
-        return {"id": sid, "name": name, "description": description, "created_at": now}
+        return {
+            "id": session.id,
+            "name": name,
+            "description": description,
+            "created_at": session.created_at,
+        }
 
     async def delete_session(self, session_id: str) -> bool:
-        cursor = await self._db.execute(
-            "UPDATE sessions SET is_active=0 WHERE id=? AND is_active=1",
-            (session_id,),
-        )
-        await self._db.commit()
-        return cursor.rowcount > 0
+        try:
+            await self._store.delete_session(session_id)
+            return True
+        except Exception:
+            return False
 
     async def rename_session(self, session_id: str, name: str) -> bool:
-        cursor = await self._db.execute(
-            "UPDATE sessions SET name=? WHERE id=? AND is_active=1",
-            (name, session_id),
-        )
-        await self._db.commit()
-        return cursor.rowcount > 0
+        session = await self._store.get_session(session_id)
+        if not session:
+            return False
+        session.name = name
+        await self._store.update_session(session)
+        return True
 
     async def get_history(self, session_id: str) -> dict | None:
-        cur = await self._db.execute(
-            "SELECT * FROM sessions WHERE id=? AND is_active=1", (session_id,)
-        )
-        sess = await cur.fetchone()
-        if not sess:
+        session = await self._store.get_session(session_id)
+        if not session:
             return None
-        cur2 = await self._db.execute(
-            "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC",
-            (session_id,),
-        )
-        rows = await cur2.fetchall()
-        messages = []
-        for r in rows:
-            m = dict(r)
-            try:
-                m["tool_calls"] = json.loads(m["tool_calls"]) if m["tool_calls"] else []
-            except (json.JSONDecodeError, TypeError):
-                m["tool_calls"] = []
-            # Include image_data if present
-            m["image_data"] = m.get("image_data") or None
-            messages.append(m)
+        messages = await self._store.get_messages_raw(session_id)
+        # Adapt to ws_proxy's expected format
+        for m in messages:
+            # Ensure tool_calls is parsed
+            tc = m.get("tool_calls", "[]")
+            if isinstance(tc, str):
+                try:
+                    m["tool_calls"] = json.loads(tc)
+                except (json.JSONDecodeError, TypeError):
+                    m["tool_calls"] = []
+            # Map attachments to image_data for dashboard compatibility
+            m["image_data"] = None
+            att = m.get("attachments", "[]")
+            if isinstance(att, str):
+                try:
+                    att_list = json.loads(att)
+                    if att_list:
+                        m["image_data"] = att_list  # Dashboard can handle refs
+                except (json.JSONDecodeError, TypeError):
+                    pass
         return {
-            "session": {**dict(sess), "is_active": bool(sess["is_active"])},
+            "session": {
+                "id": session.id,
+                "name": session.name,
+                "description": session.metadata.get("description", ""),
+                "rolling_summary": session.rolling_summary,
+                "created_at": session.created_at,
+                "last_active": session.last_active,
+                "is_active": True,
+            },
             "messages": messages,
         }
 
     async def session_exists(self, session_id: str) -> bool:
-        cur = await self._db.execute(
-            "SELECT id FROM sessions WHERE id=? AND is_active=1", (session_id,)
-        )
-        return (await cur.fetchone()) is not None
+        session = await self._store.get_session(session_id)
+        return session is not None
 
     async def save_message(
         self,
@@ -487,90 +447,59 @@ class ChatDB:
         image_data: str | None = None,
         summary: str = "",
     ) -> str:
-        mid = str(uuid.uuid4())
-        now = _now()
-        await self._db.execute(
-            "INSERT INTO messages (id, session_id, role, content, tool_calls, image_data, summary, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (mid, session_id, role, content, json.dumps(tool_calls or []), image_data, summary or "", now),
-        )
-        await self._db.execute(
-            "UPDATE sessions SET last_active=? WHERE id=?", (now, session_id)
-        )
-        await self._db.commit()
-        return mid
+        from march.core.message import Message
+        msg = Message(role=role, content=content)
+        if tool_calls:
+            from march.core.message import ToolCall
+            msg.tool_calls = [
+                ToolCall.from_dict(tc) if isinstance(tc, dict) else tc
+                for tc in tool_calls
+            ]
+        # Store image_data as attachment ref if provided
+        attachments = []
+        if image_data:
+            attachments = [{"type": "image_data", "data": image_data}]
+        msg.metadata = {"summary": summary} if summary else {}
+        return await self._store.add_message(session_id, msg, attachments=attachments)
 
     async def save_draft(self, session_id: str, draft_id: str, content: str) -> None:
-        """Save or update a draft (in-progress streaming) message."""
-        now = _now()
-        await self._db.execute(
-            "INSERT INTO messages (id, session_id, role, content, tool_calls, summary, created_at) "
-            "VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET content=excluded.content",
-            (draft_id, session_id, "assistant", content, "[]", "[streaming]", now),
-        )
-        await self._db.commit()
+        await self._store.save_draft(session_id, draft_id, content)
 
     async def finalize_draft(self, draft_id: str, content: str,
                               tool_calls: list | None = None, summary: str = "") -> None:
-        """Finalize a draft message (streaming complete)."""
-        await self._db.execute(
-            "UPDATE messages SET content=?, tool_calls=?, summary=? WHERE id=?",
-            (content, json.dumps(tool_calls or []), summary or "", draft_id),
+        await self._store.finalize_draft(
+            draft_id, content, tool_calls,
+            metadata={"summary": summary} if summary else None,
         )
-        await self._db.commit()
 
     async def clear_session_messages(self, session_id: str) -> None:
-        await self._db.execute(
-            "DELETE FROM messages WHERE session_id=?", (session_id,)
-        )
-        await self._db.execute(
-            "UPDATE sessions SET rolling_summary='' WHERE id=?", (session_id,)
-        )
-        await self._db.commit()
+        await self._store.clear_session(session_id)
 
     async def get_rolling_summary(self, session_id: str) -> str:
-        """Get the rolling summary for a session."""
-        cur = await self._db.execute(
-            "SELECT rolling_summary FROM sessions WHERE id=?", (session_id,)
-        )
-        row = await cur.fetchone()
-        return (row["rolling_summary"] or "") if row else ""
+        return await self._store.get_rolling_summary(session_id)
 
     async def update_rolling_summary(self, session_id: str, summary: str) -> None:
-        """Update the rolling summary for a session."""
-        await self._db.execute(
-            "UPDATE sessions SET rolling_summary=? WHERE id=?", (summary, session_id)
-        )
-        await self._db.commit()
+        await self._store.update_rolling_summary(session_id, summary)
 
     async def get_message_count(self, session_id: str) -> int:
-        """Get total message count for a session."""
-        cur = await self._db.execute(
-            "SELECT COUNT(*) as c FROM messages WHERE session_id=?", (session_id,)
-        )
-        row = await cur.fetchone()
-        return row["c"] if row else 0
+        return await self._store.get_message_count(session_id)
 
     async def get_recent_messages(self, session_id: str, limit: int = 20) -> list[dict]:
         """Get the N most recent messages for LLM context."""
-        cur = await self._db.execute(
-            "SELECT role, content, summary FROM messages "
-            "WHERE session_id=? ORDER BY created_at DESC LIMIT ?",
-            (session_id, limit),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in reversed(rows)]  # Reverse to chronological order
+        messages = await self._store.get_messages_raw(session_id, limit=limit)
+        # get_messages_raw returns chronological; we need most recent N
+        # So get all and take last N
+        return messages[-limit:] if len(messages) > limit else messages
 
     async def get_messages_before(self, session_id: str, offset: int, limit: int) -> list[dict]:
         """Get messages older than the recent N (for summarization)."""
-        cur = await self._db.execute(
-            "SELECT role, content, summary FROM messages "
-            "WHERE session_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (session_id, limit, offset),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in reversed(rows)]
+        all_msgs = await self._store.get_messages_raw(session_id)
+        # Skip the most recent `offset` messages, take `limit` before that
+        if offset >= len(all_msgs):
+            return []
+        end = len(all_msgs) - offset
+        start = max(0, end - limit)
+        return all_msgs[start:end]
 
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
@@ -667,9 +596,13 @@ class WSProxyPlugin(Plugin):
         # Load config
         self._load_config(app)
 
-        # Initialize DB
-        self._db = ChatDB(self._db_path)
-        await self._db.initialize()
+        # Use the app's shared SessionStore via ChatDB adapter
+        if app.session_store:
+            self._db = ChatDB(store=app.session_store)
+        else:
+            # Fallback: create our own store
+            self._db = ChatDB(db_path=self._db_path)
+            await self._db.initialize()
 
         # Build aiohttp app
         webapp = web.Application()

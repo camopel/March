@@ -46,6 +46,7 @@ class ACPChannel(Channel):
 
     def __init__(self) -> None:
         self._agent: Agent | None = None
+        self._session_store: Any = None
         self._sessions: dict[str, Session] = {}
         self._running = False
         self._initialized = False
@@ -55,6 +56,7 @@ class ACPChannel(Channel):
     async def start(self, agent: "Agent", **kwargs: Any) -> None:
         """Start the ACP channel, reading newline-delimited JSON from stdin."""
         self._agent = agent
+        self._session_store = kwargs.get("session_store")
         self._running = True
 
         # ACP uses stdout for JSON-RPC — redirect all logging to stderr
@@ -248,16 +250,20 @@ class ACPChannel(Channel):
             self._send_error(request_id, -32002, "Not initialized")
             return
 
-        session_id = str(uuid.uuid4())
         workspace = params.get("workspacePath", "")
 
-        self._sessions[session_id] = Session(
-            source_type="acp",
-            source_id=session_id,
-        )
+        # Use session store for persistence if available
+        if self._session_store and workspace:
+            session = await self._session_store.get_or_create_session(
+                "acp", workspace, name=f"ACP: {workspace}"
+            )
+        else:
+            session = Session(source_type="acp", source_id=workspace)
 
-        logger.info("acp session created: %s workspace=%s", session_id, workspace)
-        self._send_response(request_id, {"sessionId": session_id})
+        self._sessions[session.id] = session
+
+        logger.info("acp session created: %s workspace=%s", session.id, workspace)
+        self._send_response(request_id, {"sessionId": session.id})
 
     async def _handle_session_load(self, request_id: Any, params: dict[str, Any]) -> None:
         """Load an existing session (not supported yet)."""
@@ -295,26 +301,43 @@ class ACPChannel(Channel):
 
         logger.info("acp prompt: session=%s len=%d", session_id[:8], len(text))
 
-        # Run agent
+        # Run agent with streaming
         try:
-            response = await self._agent.run(text, session)
+            final_response = None
+            async for item in self._agent.run_stream(text, session):
+                if hasattr(item, "content") and hasattr(item, "total_tokens"):
+                    # This is the final AgentResponse
+                    final_response = item
+                    break
 
-            # Send the full response as a message chunk
-            if response.content:
-                await self._send_update(session_id, {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": response.content},
+                # StreamChunk — send delta as session/update
+                if hasattr(item, "delta") and item.delta:
+                    await self._send_update(session_id, {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": item.delta},
+                    })
+
+                # Tool call notifications
+                if hasattr(item, "tool_call_delta") and item.tool_call_delta:
+                    tool_info = item.tool_call_delta
+                    await self._send_update(session_id, {
+                        "sessionUpdate": "tool_call",
+                        "toolName": tool_info.get("name", ""),
+                        "status": tool_info.get("status", ""),
+                    })
+
+            # Send final response
+            if final_response:
+                self._send_response(request_id, {
+                    "stopReason": "endTurn",
+                    "_meta": {
+                        "totalTokens": final_response.total_tokens,
+                        "totalCost": final_response.total_cost,
+                        "toolCallsMade": final_response.tool_calls_made,
+                    },
                 })
-
-            # Respond with stop reason
-            self._send_response(request_id, {
-                "stopReason": "endTurn",
-                "_meta": {
-                    "totalTokens": response.total_tokens,
-                    "totalCost": response.total_cost,
-                    "toolCallsMade": response.tool_calls_made,
-                },
-            })
+            else:
+                self._send_response(request_id, {"stopReason": "endTurn"})
 
         except asyncio.CancelledError:
             self._send_response(request_id, {"stopReason": "cancelled"})
@@ -346,10 +369,25 @@ def _redirect_logging_to_stderr() -> None:
     """Ensure ALL output goes to stderr (ACP uses stdout exclusively for JSON-RPC)."""
     import logging
 
-    # Redirect all logging handlers from stdout to stderr
+    # Redirect all stdlib logging handlers from stdout to stderr
     for name in list(logging.Logger.manager.loggerDict) + ['']:
         lgr = logging.getLogger(name)
         for handler in getattr(lgr, 'handlers', []):
             if isinstance(handler, logging.StreamHandler):
                 if handler.stream is sys.stdout:
                     handler.stream = sys.stderr
+
+    # If structlog is using stdlib integration (LoggerFactory), the above
+    # handler redirect is sufficient. If it's using PrintLogger/WriteLogger
+    # directly, reconfigure to use stderr.
+    try:
+        import structlog
+        cfg = structlog.get_config()
+        factory = cfg.get("logger_factory")
+        # Only reconfigure if NOT using stdlib (stdlib is already redirected above)
+        if factory and not isinstance(factory, structlog.stdlib.LoggerFactory):
+            structlog.configure(
+                logger_factory=structlog.WriteLoggerFactory(file=sys.stderr),
+            )
+    except Exception:
+        pass

@@ -22,9 +22,21 @@ class FakeResponse:
     total_cost: float = 0.001
     tool_calls_made: int = 0
 
+@dataclasses.dataclass
+class FakeStreamChunk:
+    delta: str = ""
+    tool_call_delta: dict = dataclasses.field(default_factory=dict)
+
 class FakeAgent:
     async def run(self, msg, session):
         return FakeResponse(content=f"You said: {msg}")
+
+    async def run_stream(self, msg, session):
+        text = f"You said: {msg}"
+        # Yield chunks then final response
+        for word in text.split():
+            yield FakeStreamChunk(delta=word + " ")
+        yield FakeResponse(content=text)
 
 async def main():
     from march.channels.acp import ACPChannel

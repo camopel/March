@@ -1056,10 +1056,15 @@ class Agent:
         # handles removing image data from older messages at LLM call time.
         session.add_exchange(user_message, content)
 
-        # Persist session to SQLite if session_store is available
+        # Persist messages incrementally to SQLite if session_store is available
         if self.session_store is not None:
             try:
-                await self.session_store.save_session(session)
+                await self.session_store.add_message(
+                    session.id, Message.user(user_message)
+                )
+                await self.session_store.add_message(
+                    session.id, Message.assistant(content)
+                )
             except Exception as e:
                 logger.error("session persist failed",
                              session_id=session.id, error=str(e))
