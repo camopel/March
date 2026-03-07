@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "march"
 version = "0.1.0"
-description = "A framework-first agent runtime. Like FastAPI for web — March for agents."
+description = "A framework-first agent runtime."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
@@ -63,10 +63,11 @@ Issues = "https://github.com/camopel/March/issues"
 march = "march.cli.main:cli"
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["march*"]
 
 [tool.setuptools.package-data]
-march = ["templates/*.md"]
+march = ["templates/*.md", "templates/*.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

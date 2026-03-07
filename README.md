@@ -115,7 +115,8 @@ pip install march[all]         # Everything
 ```bash
 git clone https://github.com/camopel/March.git
 cd March
-make dev && make test
+pip install -e ".[dev]"
+pytest
 ```
 
 ## License
