@@ -418,12 +418,6 @@ class MatrixChannel(Channel):
                         except Exception as e:
                             logger.warning("matrix: image decryption failed: %s", e)
 
-            # Save to disk
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
-            attach_dir.mkdir(parents=True, exist_ok=True)
-            file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
-            file_path.write_bytes(raw_bytes)
-
             # Resize for LLM (max 512px, JPEG)
             max_dim = 512
             quality = 85
@@ -449,6 +443,12 @@ class MatrixChannel(Channel):
             except Exception as e:
                 logger.warning("matrix: image resize failed: %s", e)
 
+            # Save resized version to disk (not the original)
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
+            file_path.write_bytes(resized_bytes)
+
             # Build multimodal content for the agent
             b64_str = base64.b64encode(resized_bytes).decode("ascii")
             content: list[dict[str, Any]] = [
@@ -462,7 +462,7 @@ class MatrixChannel(Channel):
                 },
                 {
                     "type": "text",
-                    "text": f"[User sent image: {filename} (saved to {file_path})]",
+                    "text": f"[User sent image: {filename}]",
                 },
             ]
 
