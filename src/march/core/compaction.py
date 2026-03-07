@@ -24,8 +24,8 @@ COMPACTION_THRESHOLD = 0.90
 SUMMARY_BUDGET_RATIO = 0.15
 
 # Budget for session memory within the compaction summary
-# Facts: max 20% of context window, Plans: max 5%
-FACTS_BUDGET_RATIO = 0.20
+# Facts: max 15% of context window, Plans: max 5%
+FACTS_BUDGET_RATIO = 0.15
 PLAN_BUDGET_RATIO = 0.05
 
 # Safety margin for token estimation inaccuracy
