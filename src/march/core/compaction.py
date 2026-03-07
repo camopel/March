@@ -239,31 +239,38 @@ def _load_session_memory(session_id: str) -> tuple[str, str]:
     return facts.strip(), plan.strip()
 
 
-async def _compress_facts(facts: str, max_tokens: int, summarize_fn) -> str:
-    """Compress facts to fit within token budget.
+async def _compress_facts(facts: str, max_tokens: int, summarize_fn, facts_path: str = "") -> str:
+    """Create a compressed index of facts that fits within token budget.
 
-    Asks the LLM to deduplicate and compress, keeping latest decisions
-    (by timestamp) and dropping superseded facts.
+    Does NOT modify the original facts file. Instead, creates a concise
+    summary with a reference to the full file so the LLM can read details
+    on demand.
     """
     prompt = (
-        "Compress these accumulated facts into a concise version. Rules:\n"
-        "- Keep only the LATEST version of each fact (use timestamps to determine)\n"
-        "- Remove duplicates and superseded entries\n"
+        "Create a concise INDEX of these facts. Rules:\n"
+        "- One bullet per fact (merge duplicates, keep latest by timestamp)\n"
+        "- Each bullet: brief summary of the fact\n"
         "- Preserve all identifiers, paths, URLs verbatim in backticks\n"
-        "- Use bullet points, no prose\n"
-        f"- Target: under {max_tokens} tokens (~{max_tokens * 4} chars)\n"
-        "- Drop [UPDATE] prefixes after merging — just keep the final value\n\n"
-        f"Facts to compress:\n{facts}"
+        "- Drop [UPDATE] prefixes — just keep the final value\n"
+        f"- Target: under {max_tokens} tokens (~{max_tokens * 4} chars)\n\n"
+        f"Facts to index:\n{facts}"
     )
     try:
         compressed = await summarize_fn(prompt)
-        return compressed.strip() if compressed else facts
+        index = compressed.strip() if compressed else facts
     except Exception:
         # If compression fails, truncate to fit
         max_chars = max_tokens * 4
         if len(facts) > max_chars:
-            return facts[-max_chars:] + "\n... (older facts truncated)"
-        return facts
+            index = facts[-max_chars:] + "\n... (older facts truncated)"
+        else:
+            index = facts
+
+    # Add reference to full file
+    if facts_path:
+        index += f"\n\n_Full details: `{facts_path}` (use read tool to access)_"
+
+    return index
 
 
 def delete_session_memory(session_id: str) -> bool:
@@ -433,19 +440,16 @@ async def compact_messages(
             facts_budget = int(context_window * FACTS_BUDGET_RATIO)
             plan_budget = int(context_window * PLAN_BUDGET_RATIO)
 
-            # Compress facts if they exceed budget
+            # Compress facts if they exceed budget — creates an index, keeps original file
             facts_tokens = estimate_tokens(facts) if facts else 0
             if facts and facts_tokens > facts_budget:
                 logger.info(
-                    "Session facts exceed budget (%d > %d tokens), compressing",
+                    "Session facts exceed budget (%d > %d tokens), creating index",
                     facts_tokens, facts_budget,
                 )
-                facts = await _compress_facts(facts, facts_budget, summarize_fn)
-                # Write compressed facts back to disk
                 from pathlib import Path
-                facts_path = Path.home() / ".march" / "memory" / session_id / "facts.md"
-                if facts_path.exists():
-                    facts_path.write_text(facts + "\n")
+                facts_path = str(Path.home() / ".march" / "memory" / session_id / "facts.md")
+                facts = await _compress_facts(facts, facts_budget, summarize_fn, facts_path)
 
             # Truncate plan if it exceeds budget (no compression — just keep latest)
             if plan and estimate_tokens(plan) > plan_budget:
