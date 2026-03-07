@@ -278,6 +278,91 @@ def strip_attachments_from_messages(
     return result
 
 
+def rehydrate_attachments(
+    messages: list[dict[str, Any]],
+    attachment_refs: dict[str, list[dict[str, Any]]] | None = None,
+    keep_recent: int = 2,
+    store: AttachmentStore | None = None,
+) -> list[dict[str, Any]]:
+    """Rehydrate image attachments from disk for recent messages.
+
+    When sessions are loaded from DB, messages only have text content
+    (images were stripped). This function loads image bytes from disk
+    for the most recent N user messages that had attachments.
+
+    Args:
+        messages: List of LLM-format messages.
+        attachment_refs: Map of message index → list of AttachmentRef dicts.
+                        If None, scans messages for [image attachment] markers.
+        keep_recent: Number of recent messages to rehydrate images for.
+        store: AttachmentStore to load bytes from. Uses default if None.
+
+    Returns:
+        Messages with recent image attachments rehydrated as multimodal content.
+    """
+    if not messages:
+        return messages
+
+    if store is None:
+        store = AttachmentStore()
+
+    result = list(messages)
+
+    # Find messages with attachment refs (walking backwards from most recent)
+    rehydrated = 0
+    for i in range(len(result) - 1, -1, -1):
+        if rehydrated >= keep_recent:
+            break
+
+        msg = result[i]
+        if msg.get("role") != "user":
+            continue
+
+        # Check if this message has attachment refs in the metadata
+        refs = None
+        if attachment_refs and str(i) in attachment_refs:
+            refs = attachment_refs[str(i)]
+        elif isinstance(msg.get("_attachment_refs"), list):
+            refs = msg["_attachment_refs"]
+
+        if not refs:
+            continue
+
+        # Rehydrate: load image bytes and build multimodal content
+        content_blocks: list[dict[str, Any]] = []
+        text_content = msg.get("content", "")
+        if isinstance(text_content, str) and text_content:
+            # Remove the [image attachment] placeholder text
+            clean_text = text_content.replace("[image attachment]", "").strip()
+            if clean_text:
+                content_blocks.append({"type": "text", "text": clean_text})
+
+        for ref_dict in refs:
+            try:
+                ref = AttachmentRef.from_dict(ref_dict)
+                if ref.category == "image" and ref.exists():
+                    b64 = store.load_as_base64(ref)
+                    if b64:
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": ref.media_type,
+                                "data": b64,
+                            },
+                        })
+                        content_blocks.append({
+                            "type": "text",
+                            "text": f"[Image: {ref.filename} ({_format_size(ref.size_bytes)})]",
+                        })
+                        rehydrated += 1
+            except Exception as e:
+                logger.warning("Failed to rehydrate attachment: %s", e)
+
+        if content_blocks:
+            result[i] = {**msg, "content": content_blocks}
+
+
 def content_to_history_text(content: str | list) -> str:
     """Convert multimodal content to a plain text string for session history.
 
