@@ -17,7 +17,7 @@ async def main():
     await app.initialize()
 
     ch = ACPChannel()
-    await ch.start(app.agent)
+    await ch.start(app.agent, session_store=app.session_store)
 
 asyncio.run(main())
 " "$@"
