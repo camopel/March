@@ -188,11 +188,12 @@ Rules:
 - For conflicting/evolved facts, keep only the latest decision"""
 
 
-def _load_and_clear_session_memory(session_id: str) -> str:
-    """Load all session memory files, return content, then clear the files.
+def _load_session_memory(session_id: str) -> str:
+    """Load all session memory files and return content.
 
-    After folding into the compaction summary, the files are cleared
-    so they don't accumulate across multiple compactions.
+    Files are NOT cleared — they accumulate across compactions so every
+    compaction sees the full facts and plans. This prevents important
+    details from being lost across multiple compressions.
     """
     from pathlib import Path
 
@@ -201,7 +202,6 @@ def _load_and_clear_session_memory(session_id: str) -> str:
         return ""
 
     parts: list[str] = []
-    files_to_clear: list[Path] = []
 
     for path in sorted(memory_dir.rglob("*")):
         if not path.is_file():
@@ -213,16 +213,8 @@ def _load_and_clear_session_memory(session_id: str) -> str:
             if content:
                 rel = path.relative_to(memory_dir)
                 parts.append(f"**{rel}:**\n{content}")
-                files_to_clear.append(path)
         except Exception:
             continue
-
-    # Clear files after reading (content is now in the summary)
-    for f in files_to_clear:
-        try:
-            f.write_text("")
-        except Exception:
-            pass
 
     return "\n\n".join(parts)
 
@@ -385,10 +377,10 @@ async def compact_messages(
         # Fallback: just drop old messages without summary
         return recent, previous_summary or ""
 
-    # Fold session memory (facts + plans) into the summary, then clear files
-    # This way they're included once in the compacted context, not loaded every turn
+    # Fold session memory (facts + plans) into the summary
+    # Files are NOT cleared — they accumulate so every future compaction sees full details
     if session_id:
-        session_mem = _load_and_clear_session_memory(session_id)
+        session_mem = _load_session_memory(session_id)
         if session_mem:
             summary = summary + "\n\n---\n\n**Preserved Session Memory:**\n" + session_mem
 
