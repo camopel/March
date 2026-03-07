@@ -258,13 +258,28 @@ class Agent:
 
         # 5. Compact or truncate messages if they exceed the context window
         from march.core.compaction import needs_compaction, split_for_compaction, \
-            build_summary_prompt, MIN_RECENT_KEEP
+            build_summary_prompt, MIN_RECENT_KEEP, extract_session_memory
         context_window = self._get_context_window()
         system_tokens = context.estimated_tokens
 
         if needs_compaction(messages, context_window, system_tokens):
             old, recent = split_for_compaction(messages, context_window, system_tokens)
             if old:
+                # Extract facts/plans BEFORE compaction so nothing is lost
+                async def _summarize_sync(prompt: str) -> str:
+                    r = await provider.converse(
+                        messages=[{"role": "user", "content": prompt}],
+                        system="You are a helpful assistant.",
+                        max_tokens=500,
+                    )
+                    return r.content.strip() if r and r.content else ""
+
+                try:
+                    await extract_session_memory(old, session.id, _summarize_sync)
+                except Exception as e:
+                    logger.warning("session memory extraction failed (non-fatal)",
+                                   session_id=session.id, error=str(e))
+
                 prompt = build_summary_prompt(old, session.compaction_summary)
                 try:
                     result = await provider.converse(
@@ -680,7 +695,8 @@ class Agent:
         # Unlike re-compacting every call, this permanently moves old messages
         # to backup and replaces them with a summary in the session history.
         from march.core.compaction import needs_compaction, compact_messages, \
-            split_for_compaction, build_summary_prompt, MIN_RECENT_KEEP
+            split_for_compaction, build_summary_prompt, MIN_RECENT_KEEP, \
+            extract_session_memory
         context_window = self._get_context_window()
         system_tokens = context.estimated_tokens
 
@@ -699,6 +715,15 @@ class Agent:
 
             old, recent = split_for_compaction(messages, context_window, system_tokens)
             if old:
+                # Extract facts/plans BEFORE compaction so nothing is lost
+                try:
+                    await extract_session_memory(old, session.id, _summarize)
+                except Exception as e:
+                    get_logger("march.compaction", subsystem="compaction").warning(
+                        "session memory extraction failed (non-fatal)",
+                        session_id=session.id, error=str(e),
+                    )
+
                 prompt = build_summary_prompt(old, session.compaction_summary)
                 try:
                     summary = await _summarize(prompt)
@@ -959,7 +984,13 @@ class Agent:
         agent_profile = await self.memory.load_agent_profile()
         tool_inventory = await self.memory.load_tool_rules()
         long_term = await self.memory.load_long_term()
-        session_memory = await self.memory.load_session_memory(session.id)
+
+        # Session memory is only loaded AFTER compaction has happened.
+        # Before compaction, the facts/plans are already in the message history
+        # so loading them would be redundant and waste tokens.
+        session_memory = ""
+        if session.compaction_summary:
+            session_memory = await self.memory.load_session_memory(session.id)
 
         return Context(
             system_rules=system_rules,
