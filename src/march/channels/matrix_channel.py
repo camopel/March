@@ -70,7 +70,7 @@ class MatrixChannel(Channel):
         self._running = True
 
         try:
-            from nio import AsyncClient, RoomMessageText, RoomMessageImage, InviteMemberEvent, MegolmEvent
+            from nio import AsyncClient, RoomMessageText, RoomMessageImage, RoomEncryptedImage, InviteMemberEvent, MegolmEvent
         except ImportError:
             logger.error("matrix-nio not installed. Install with: pip install matrix-nio")
             return
@@ -162,6 +162,9 @@ class MatrixChannel(Channel):
         )
         self._client.add_event_callback(
             self._on_image, RoomMessageImage
+        )
+        self._client.add_event_callback(
+            self._on_image, RoomEncryptedImage
         )
         self._client.add_event_callback(
             self._on_invite, InviteMemberEvent
@@ -381,22 +384,39 @@ class MatrixChannel(Channel):
             mime_type = response.content_type or "image/jpeg"
             filename = getattr(event, "body", "image.jpg") or "image.jpg"
 
-            # Decrypt if E2EE (encrypted images have file encryption info in source)
-            source = getattr(event, "source", {})
-            file_info = source.get("content", {}).get("file")
-            if file_info and isinstance(file_info, dict):
-                key_info = file_info.get("key", {})
-                iv = file_info.get("iv", "")
-                hashes = file_info.get("hashes", {})
-                sha256_hash = hashes.get("sha256", "")
-                k = key_info.get("k", "")
-                if k and iv and sha256_hash:
+            # Decrypt if E2EE — RoomEncryptedImage has key/hashes/iv directly,
+            # RoomMessageImage from non-E2EE rooms does not.
+            enc_key = getattr(event, "key", None)
+            enc_hashes = getattr(event, "hashes", None)
+            enc_iv = getattr(event, "iv", None)
+            if enc_key and enc_hashes and enc_iv:
+                k = enc_key.get("k", "") if isinstance(enc_key, dict) else ""
+                sha256_hash = enc_hashes.get("sha256", "") if isinstance(enc_hashes, dict) else ""
+                if k and sha256_hash and enc_iv:
                     try:
                         from nio.crypto import decrypt_attachment
-                        raw_bytes = decrypt_attachment(raw_bytes, k, sha256_hash, iv)
-                        logger.info("matrix: decrypted image attachment")
+                        raw_bytes = decrypt_attachment(raw_bytes, k, sha256_hash, enc_iv)
+                        mime_type = getattr(event, "mimetype", mime_type) or mime_type
+                        logger.info("matrix: decrypted image attachment (%dKB)", len(raw_bytes) // 1024)
                     except Exception as e:
                         logger.warning("matrix: image decryption failed: %s", e)
+            else:
+                # Fallback: check source dict for file encryption info (older events)
+                source = getattr(event, "source", {})
+                file_info = source.get("content", {}).get("file")
+                if file_info and isinstance(file_info, dict):
+                    key_info = file_info.get("key", {})
+                    iv = file_info.get("iv", "")
+                    hashes = file_info.get("hashes", {})
+                    sha256_hash = hashes.get("sha256", "")
+                    k = key_info.get("k", "")
+                    if k and iv and sha256_hash:
+                        try:
+                            from nio.crypto import decrypt_attachment
+                            raw_bytes = decrypt_attachment(raw_bytes, k, sha256_hash, iv)
+                            logger.info("matrix: decrypted image attachment (fallback)")
+                        except Exception as e:
+                            logger.warning("matrix: image decryption failed: %s", e)
 
             # Save to disk
             attach_dir = Path.home() / ".march" / "attachments" / "matrix"
