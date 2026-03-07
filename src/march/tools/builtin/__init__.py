@@ -29,6 +29,8 @@ def register_all_builtin_tools(registry: "ToolRegistry") -> None:
     from march.tools.builtin.web_search import web_search
     from march.tools.builtin.web_fetch import web_fetch
     from march.tools.builtin.browser_tool import browser_tool
+    from march.tools.builtin.github_tool import github_tool
+    from march.tools.builtin.huggingface_tool import huggingface_tool
     from march.tools.builtin.pdf_tool import pdf_tool
     from march.tools.builtin.voice_to_text import voice_to_text
     from march.tools.builtin.tts_tool import tts_tool
@@ -60,6 +62,9 @@ def register_all_builtin_tools(registry: "ToolRegistry") -> None:
         web_search,
         web_fetch,
         browser_tool,
+        # Developer
+        github_tool,
+        huggingface_tool,
         # Media
         pdf_tool,
         voice_to_text,
