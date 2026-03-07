@@ -445,14 +445,21 @@ class SessionStore:
             async for row in cur:
                 s = dict(row)
                 s["is_active"] = bool(s["is_active"])
-                # Get last message preview
+                # Get last message preview + count
                 async with self._db.execute(
                     "SELECT content, role FROM messages WHERE session_id = ? "
                     "ORDER BY created_at DESC LIMIT 1",
                     (row["id"],),
                 ) as msg_cur:
                     msg = await msg_cur.fetchone()
-                    s["last_message"] = dict(msg) if msg else None
+                    s["last_message"] = msg["content"][:100] if msg else None
+                    s["last_message_role"] = msg["role"] if msg else None
+                async with self._db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                    (row["id"],),
+                ) as cnt_cur:
+                    cnt = await cnt_cur.fetchone()
+                    s["message_count"] = cnt[0] if cnt else 0
                 results.append(s)
         return results
 

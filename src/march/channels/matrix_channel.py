@@ -10,7 +10,10 @@ E2EE support is optional and config-driven.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
+import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, TYPE_CHECKING
 
@@ -67,7 +70,7 @@ class MatrixChannel(Channel):
         self._running = True
 
         try:
-            from nio import AsyncClient, RoomMessageText, InviteMemberEvent, MegolmEvent
+            from nio import AsyncClient, RoomMessageText, RoomMessageImage, InviteMemberEvent, MegolmEvent
         except ImportError:
             logger.error("matrix-nio not installed. Install with: pip install matrix-nio")
             return
@@ -156,6 +159,9 @@ class MatrixChannel(Channel):
         # Set up callbacks
         self._client.add_event_callback(
             self._on_message, RoomMessageText
+        )
+        self._client.add_event_callback(
+            self._on_image, RoomMessageImage
         )
         self._client.add_event_callback(
             self._on_invite, InviteMemberEvent
@@ -317,6 +323,149 @@ class MatrixChannel(Channel):
             await self.send(f"Error: {e}", room_id=room_id)
         finally:
             # ── Clear typing indicator ───────────────────────────────
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
+
+    async def _on_image(self, room: Any, event: Any) -> None:
+        """Handle incoming image messages from Matrix rooms.
+
+        Downloads the image, resizes for LLM, and sends as multimodal content.
+        """
+        if not self._agent or not self._running:
+            return
+
+        # Ignore our own messages
+        if self._client and event.sender == self._client.user_id:
+            return
+
+        room_id = room.room_id
+        logger.info("matrix: image in %s from %s: %s", room_id, event.sender, getattr(event, "body", "image"))
+
+        # Immediate acknowledgment
+        try:
+            await self._client.room_read_markers(
+                room_id,
+                fully_read_event=event.event_id,
+                read_event=event.event_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            await self._client.room_typing(room_id, typing_state=True, timeout=30000)
+        except Exception:
+            pass
+
+        asyncio.create_task(self._process_image(room_id, event))
+
+    async def _process_image(self, room_id: str, event: Any) -> None:
+        """Download and process an image message with the LLM."""
+        session = self._get_or_create_session(room_id)
+
+        try:
+            # Download the image from Matrix
+            mxc_url = event.url
+            if not mxc_url:
+                logger.warning("matrix: image event has no URL")
+                return
+
+            from nio import DownloadError
+            response = await self._client.download(mxc_url)
+            if isinstance(response, DownloadError):
+                logger.warning("matrix: failed to download image: %s", response)
+                return
+
+            raw_bytes = response.body
+            mime_type = response.content_type or "image/jpeg"
+            filename = getattr(event, "body", "image.jpg") or "image.jpg"
+
+            # Decrypt if E2EE (encrypted images have file encryption info in source)
+            source = getattr(event, "source", {})
+            file_info = source.get("content", {}).get("file")
+            if file_info and isinstance(file_info, dict):
+                key_info = file_info.get("key", {})
+                iv = file_info.get("iv", "")
+                hashes = file_info.get("hashes", {})
+                sha256_hash = hashes.get("sha256", "")
+                k = key_info.get("k", "")
+                if k and iv and sha256_hash:
+                    try:
+                        from nio.crypto import decrypt_attachment
+                        raw_bytes = decrypt_attachment(raw_bytes, k, sha256_hash, iv)
+                        logger.info("matrix: decrypted image attachment")
+                    except Exception as e:
+                        logger.warning("matrix: image decryption failed: %s", e)
+
+            # Save to disk
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
+            file_path.write_bytes(raw_bytes)
+
+            # Resize for LLM (max 512px, JPEG)
+            max_dim = 512
+            quality = 85
+            resized_bytes = raw_bytes
+            out_mime = mime_type
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(raw_bytes))
+                w, h = img.size
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                if max(w, h) > max_dim:
+                    ratio = max_dim / max(w, h)
+                    img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                resized_bytes = buf.getvalue()
+                out_mime = "image/jpeg"
+                logger.info("matrix: image resized %dx%d → %dx%d (%dKB)",
+                            w, h, img.width, img.height, len(resized_bytes) // 1024)
+            except ImportError:
+                logger.warning("matrix: Pillow not installed, sending raw image")
+            except Exception as e:
+                logger.warning("matrix: image resize failed: %s", e)
+
+            # Build multimodal content for the agent
+            b64_str = base64.b64encode(resized_bytes).decode("ascii")
+            content: list[dict[str, Any]] = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": out_mime,
+                        "data": b64_str,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": f"[User sent image: {filename} (saved to {file_path})]",
+                },
+            ]
+
+            # Check if there's a caption/body text beyond the filename
+            body_text = getattr(event, "body", "")
+            if body_text and body_text != filename:
+                content.append({"type": "text", "text": body_text})
+
+            from march.core.agent import AgentResponse
+            collected = ""
+            async for item in self._agent.run_stream(content, session):
+                if isinstance(item, AgentResponse):
+                    break
+                if hasattr(item, "delta") and item.delta:
+                    collected += item.delta
+
+            if collected:
+                await self.send(collected, room_id=room_id)
+
+        except Exception as e:
+            logger.error("matrix: error processing image in %s: %s", room_id, e)
+            await self.send(f"Error processing image: {e}", room_id=room_id)
+        finally:
             try:
                 await self._client.room_typing(room_id, typing_state=False)
             except Exception:
