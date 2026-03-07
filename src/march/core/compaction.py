@@ -172,6 +172,7 @@ Output TWO sections in markdown:
 - Concrete facts, decisions, conclusions, technical details
 - Names, IDs, paths, URLs, config values mentioned
 - What was built, fixed, or changed
+- If a fact was updated/changed during the conversation, note the latest version with [UPDATE]
 - Only include things that are STILL RELEVANT (skip resolved issues)
 
 ## Plan
@@ -183,7 +184,8 @@ Rules:
 - Be concise — bullet points only, no prose
 - If nothing fits a section, write "None" under it
 - Max 50 lines total
-- Preserve identifiers verbatim in backticks"""
+- Preserve identifiers verbatim in backticks
+- For conflicting/evolved facts, keep only the latest decision"""
 
 
 def _load_and_clear_session_memory(session_id: str) -> str:
