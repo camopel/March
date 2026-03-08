@@ -322,9 +322,8 @@ class TestTurnLogger:
 
 class TestLogDateRotation:
 
-    @pytest.mark.xfail(reason="TODO: date-based log split not yet implemented")
     def test_log_per_date_file(self, tmp_path: Path) -> None:
-        """Future: each date should get its own log file."""
+        """Each date should get its own log file under turns/ subdirectory."""
         logger = _make_logger(tmp_path)
         logger.turn_start(
             turn_id="d1",
@@ -333,5 +332,8 @@ class TestLogDateRotation:
             source="test",
         )
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        date_file = logger._dir / f"turns-{today}.jsonl"
-        assert date_file.exists(), "Expected per-date log file"
+        date_file = logger._dir / "turns" / f"{today}.jsonl"
+        assert date_file.exists(), f"Expected per-date log file at {date_file}"
+        lines = _read_lines(date_file)
+        assert len(lines) == 1
+        assert lines[0]["turn_id"] == "d1"

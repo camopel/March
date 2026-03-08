@@ -1,8 +1,8 @@
 """Structured JSONL turn logger for debugging agent turns.
 
-Writes one JSON line per event to ``~/.march/logs/turns.jsonl``.
-Thread-safe, with automatic log rotation when the file exceeds 50 MB
-(keeps up to 3 rotated files).
+Writes one JSON line per event to ``~/.march/logs/turns/YYYY-MM-DD.jsonl``.
+Thread-safe, with automatic log rotation when a daily file exceeds 50 MB
+(keeps up to 3 rotated files per day).
 
 Events
 ------
@@ -33,14 +33,33 @@ class TurnLogger:
     Parameters
     ----------
     log_dir:
-        Directory for the log file.  Defaults to ``~/.march/logs``.
+        Parent directory for logs.  Defaults to ``~/.march/logs``.
+        Turn logs are written to ``<log_dir>/turns/YYYY-MM-DD.jsonl``.
     """
 
     def __init__(self, log_dir: Path | None = None) -> None:
         self._dir = log_dir or Path.home() / ".march" / "logs"
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._path = self._dir / "turns.jsonl"
+        # Create turns/ subdirectory
+        self._turns_dir = self._dir / "turns"
+        self._turns_dir.mkdir(parents=True, exist_ok=True)
+        # Track current date for file rotation
+        self._current_date: str | None = None
+        self._path: Path = self._resolve_path()
         self._lock = threading.Lock()
+
+    def _resolve_path(self) -> Path:
+        """Return the log file path for today's date."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._current_date = today
+        return self._turns_dir / f"{today}.jsonl"
+
+    def _ensure_current_date(self) -> None:
+        """Check if the date has changed and update the path if needed."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_date:
+            self._current_date = today
+            self._path = self._turns_dir / f"{today}.jsonl"
 
     # ── public event methods ─────────────────────────────────────────
 
@@ -166,6 +185,7 @@ class TurnLogger:
         line = self._safe_dumps(entry) + "\n"
 
         with self._lock:
+            self._ensure_current_date()
             self._maybe_rotate()
             with open(self._path, "a", encoding="utf-8") as fh:
                 fh.write(line)

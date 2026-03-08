@@ -17,6 +17,7 @@ def guardian_start() -> None:
     import asyncio
     import os
     import sys
+    from datetime import date
     from pathlib import Path
 
     from march.agents.guardian import run_guardian
@@ -30,9 +31,9 @@ def guardian_start() -> None:
     os.setsid()
     sys.stdin.close()
 
-    log_dir = Path.home() / ".march" / "logs"
+    log_dir = Path.home() / ".march" / "logs" / "guardian"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_dir / "guardian.log", "a")
+    log_file = open(log_dir / f"{date.today().isoformat()}.log", "a")
     os.dup2(log_file.fileno(), sys.stdout.fileno())
     os.dup2(log_file.fileno(), sys.stderr.fileno())
 

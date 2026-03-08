@@ -110,6 +110,17 @@ class MarchApp:
         from march.logging.logger import configure_logging
         configure_logging()
 
+        # Run log maintenance: ensure subdirs, migrate legacy files, TTL cleanup
+        from march.core.log_maintenance import (
+            ensure_log_subdirectories,
+            migrate_flat_logs,
+            cleanup_old_logs,
+        )
+        log_dir = Path.home() / ".march" / "logs"
+        ensure_log_subdirectories(log_dir)
+        migrate_flat_logs(log_dir)
+        cleanup_old_logs(log_dir)
+
         # Create LLM providers from config
         self._create_providers()
 

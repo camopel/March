@@ -38,6 +38,65 @@ def get_file_handler(
     return handler
 
 
+class DateBasedFileHandler(logging.Handler):
+    """File handler that writes to ``<subdir>/YYYY-MM-DD.<ext>``.
+
+    Each day gets its own file.  The handler checks the current date on
+    every emit and opens a new file when the date rolls over.
+    """
+
+    def __init__(
+        self,
+        log_dir: Path,
+        ext: str = ".log",
+        encoding: str = "utf-8",
+    ) -> None:
+        super().__init__()
+        self._log_dir = log_dir
+        self._ext = ext
+        self._encoding = encoding
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._current_date: str | None = None
+        self._stream: Any = None
+        self._lock_obj = threading.Lock()
+
+    def _resolve_path(self) -> Path:
+        from datetime import date
+        today = date.today().isoformat()
+        return self._log_dir / f"{today}{self._ext}"
+
+    def _ensure_stream(self) -> None:
+        from datetime import date
+        today = date.today().isoformat()
+        if today != self._current_date:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+            self._current_date = today
+            path = self._log_dir / f"{today}{self._ext}"
+            self._stream = open(path, "a", encoding=self._encoding)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with self._lock_obj:
+                self._ensure_stream()
+                self._stream.write(msg + "\n")
+                self._stream.flush()
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+        super().close()
+
+
 class SQLiteAuditHandler(logging.Handler):
     """Logging handler that writes audit events to a SQLite database.
 

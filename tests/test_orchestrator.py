@@ -11,6 +11,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import shutil
 import sys
 import threading
@@ -492,7 +493,7 @@ class TestTurnLogger:
     def test_turn_start_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_start(turn_id="t1", session_id="s1", user_msg="hello", source="test")
-        lines = (tmp_path / "turns.jsonl").read_text().strip().split("\n")
+        lines = logger._path.read_text().strip().split("\n")
         data = json.loads(lines[0])
         assert data["event"] == "turn_start"
         assert data["turn_id"] == "t1"
@@ -501,35 +502,35 @@ class TestTurnLogger:
     def test_turn_complete_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_complete(turn_id="t2", session_id="s2", tool_calls=3, total_tokens=500, total_cost=0.01, duration_ms=1234.5, final_reply_length=100)
-        data = json.loads((tmp_path / "turns.jsonl").read_text().strip())
+        data = json.loads(logger._path.read_text().strip())
         assert data["event"] == "turn_complete"
         assert data["tool_calls"] == 3
 
     def test_tool_call_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.tool_call(turn_id="t3", session_id="s3", name="web_search", args={"query": "cats"}, duration_ms=200.0, status="complete", summary="Found 5 results")
-        data = json.loads((tmp_path / "turns.jsonl").read_text().strip())
+        data = json.loads(logger._path.read_text().strip())
         assert data["event"] == "tool_call"
         assert data["name"] == "web_search"
 
     def test_turn_cancelled_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_cancelled(turn_id="t4", session_id="s4", partial_content_length=42)
-        data = json.loads((tmp_path / "turns.jsonl").read_text().strip())
+        data = json.loads(logger._path.read_text().strip())
         assert data["event"] == "turn_cancelled"
 
     def test_turn_error_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_error(turn_id="t5", session_id="s5", error="kaboom")
-        data = json.loads((tmp_path / "turns.jsonl").read_text().strip())
+        data = json.loads(logger._path.read_text().strip())
         assert data["event"] == "turn_error"
 
     def test_log_rotation(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
-        log_file = tmp_path / "turns.jsonl"
+        log_file = logger._path
         log_file.write_text("x" * (_MAX_FILE_BYTES + 1))
         logger.turn_start(turn_id="t-rot", session_id="s-rot", user_msg="rotate", source="test")
-        assert (tmp_path / "turns.jsonl.1").exists()
+        assert log_file.with_suffix(".jsonl.1").exists()
         assert "t-rot" in log_file.read_text()
 
     def test_thread_safety(self, tmp_path: Path):
@@ -546,7 +547,7 @@ class TestTurnLogger:
         for t in threads:
             t.join()
 
-        lines = (tmp_path / "turns.jsonl").read_text().strip().split("\n")
+        lines = logger._path.read_text().strip().split("\n")
         assert len(lines) == num_threads * writes_per
         for line in lines:
             json.loads(line)  # Should not raise
@@ -558,14 +559,15 @@ class TestTurnLogger:
             pass
 
         logger.tool_call(turn_id="t-weird", session_id="s-weird", name="test_tool", args={"obj": Weird()}, duration_ms=10.0, status="complete", summary="ok")
-        data = json.loads((tmp_path / "turns.jsonl").read_text().strip())
+        data = json.loads(logger._path.read_text().strip())
         assert "Weird" in data["args"]["obj"]
 
     def test_creates_log_dir(self, tmp_path: Path):
         log_dir = tmp_path / "nested" / "logs"
         logger = TurnLogger(log_dir=log_dir)
         logger.turn_start(turn_id="t-dir", session_id="s-dir", user_msg="hi", source="test")
-        assert (log_dir / "turns.jsonl").exists()
+        assert logger._path.exists()
+        assert (log_dir / "turns").is_dir()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1651,3 +1653,1414 @@ class TestInMemorySessionStore:
         await store.clear_session("s1")
         assert await store.get_session("s1") is None
         assert len(await store.get_messages("s1")) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. Session from Different Devices / Connections
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCrossDeviceSession:
+    """Test session behaviour across multiple WS connections and Matrix event
+    types — takeover, reconnect continuity, and shared-session history."""
+
+    # ── helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_ws(*, closed: bool = False) -> AsyncMock:
+        ws = AsyncMock()
+        ws.closed = closed
+        ws.send_json = AsyncMock()
+        ws.close = AsyncMock()
+        return ws
+
+    @staticmethod
+    def _make_plugin(agent=None, store=None):
+        from march.plugins.ws_proxy import WSProxyPlugin
+        plugin = WSProxyPlugin()
+        plugin._agent = agent or MockAgent([])
+        plugin._db = MagicMock()
+        plugin._db.session_exists = AsyncMock(return_value=True)
+        plugin._db.save_message = AsyncMock(return_value="msg-id")
+        plugin._db.get_history = AsyncMock(return_value={"session": {}, "messages": []})
+        plugin._db.clear_session_messages = AsyncMock()
+        plugin._app_ref = MagicMock()
+        if store is None:
+            store = InMemorySessionStore()
+        plugin._orchestrator = Orchestrator(agent=plugin._agent, session_store=store)
+        return plugin, store
+
+    @staticmethod
+    def _make_matrix_channel(agent=None, store=None):
+        from march.channels.matrix_channel import MatrixChannel
+        ch = MatrixChannel(orchestrator=None)
+        ch._running = True
+        ch._start_ts = 0
+        ch._client = MagicMock()
+        ch._client.user_id = "@march:localhost"
+        ch._client.room_send = AsyncMock()
+        ch._client.room_read_markers = AsyncMock()
+        ch._client.room_typing = AsyncMock()
+        ch._client.download = AsyncMock()
+        if store is None:
+            store = InMemorySessionStore()
+        if agent is None:
+            agent = MockAgent([
+                StreamChunk(delta="Matrix reply"),
+                AgentResponse(content="Matrix reply"),
+            ])
+        ch._orchestrator = Orchestrator(agent=agent, session_store=store)
+        ch._agent = agent
+        return ch, store
+
+    # ── WS takeover ───────────────────────────────────────────────────
+
+    async def test_same_session_different_ws_connections(self):
+        """Second WS client takes over: first gets session.takeover + close,
+        second works normally."""
+        from march.plugins.ws_proxy import _WSConn, _try_send
+
+        plugin, store = self._make_plugin(
+            agent=MockAgent([
+                StreamChunk(delta="From B"),
+                AgentResponse(content="From B"),
+            ]),
+        )
+        sid = "shared-sess"
+        await store.create_session("ws", sid, session_id=sid)
+
+        # --- Client A connects ---
+        ws_a = self._make_ws()
+        plugin._active_connections[sid] = ws_a
+
+        # --- Client B connects to the same session ---
+        ws_b = self._make_ws()
+
+        # Simulate the takeover logic from _handle_ws
+        existing = plugin._active_connections.get(sid)
+        assert existing is ws_a
+        assert not existing.closed
+
+        # Send takeover to A and close it (mirrors _handle_ws)
+        await _try_send(existing, {
+            "type": "session.takeover",
+            "message": "Another client connected to this session",
+        })
+        await existing.close()
+
+        # Register B as the active connection
+        plugin._active_connections[sid] = ws_b
+
+        # Verify A received session.takeover
+        a_calls = ws_a.send_json.call_args_list
+        a_types = [c.args[0].get("type") for c in a_calls]
+        assert "session.takeover" in a_types
+        # Verify A was closed
+        ws_a.close.assert_called_once()
+
+        # Verify B is now the active connection
+        assert plugin._active_connections[sid] is ws_b
+
+        # --- Client B sends a message and gets a normal response ---
+        conn_b = _WSConn(ws=ws_b, session_id=sid)
+        await plugin._ws_handle_message(conn_b, {"type": "message", "content": "Hello from B"})
+
+        b_calls = ws_b.send_json.call_args_list
+        b_types = [c.args[0].get("type") for c in b_calls]
+        assert "stream.start" in b_types
+        assert "stream.delta" in b_types
+        assert "stream.end" in b_types
+
+    # ── Reconnect continuity ─────────────────────────────────────────
+
+    async def test_session_continuity_across_reconnect(self):
+        """Connect → send message → disconnect → reconnect → verify history
+        is preserved and agent has context from previous messages."""
+        from march.plugins.ws_proxy import _WSConn
+
+        store = InMemorySessionStore()
+        sid = "reconnect-sess"
+
+        # --- First connection: send a message ---
+        agent_1 = MockAgent([
+            StreamChunk(delta="First reply"),
+            AgentResponse(content="First reply"),
+        ])
+        plugin, _ = self._make_plugin(agent=agent_1, store=store)
+        await store.create_session("ws", sid, session_id=sid)
+
+        ws_1 = self._make_ws()
+        plugin._active_connections[sid] = ws_1
+        conn_1 = _WSConn(ws=ws_1, session_id=sid)
+        await plugin._ws_handle_message(conn_1, {"type": "message", "content": "Hello first"})
+
+        # Verify first reply was sent
+        ws1_types = [c.args[0].get("type") for c in ws_1.send_json.call_args_list]
+        assert "stream.end" in ws1_types
+
+        # Verify DB has the exchange
+        db_msgs = await store.get_messages(sid)
+        assert len(db_msgs) >= 2  # user + assistant
+
+        # --- Disconnect (simulate) ---
+        plugin._active_connections.pop(sid, None)
+
+        # --- Second connection: send another message ---
+        agent_2 = MockAgent([
+            StreamChunk(delta="Second reply"),
+            AgentResponse(content="Second reply"),
+        ])
+        plugin._agent = agent_2
+        plugin._orchestrator.agent = agent_2
+
+        ws_2 = self._make_ws()
+        plugin._active_connections[sid] = ws_2
+        conn_2 = _WSConn(ws=ws_2, session_id=sid)
+        await plugin._ws_handle_message(conn_2, {"type": "message", "content": "Hello second"})
+
+        # Verify second reply was sent
+        ws2_types = [c.args[0].get("type") for c in ws_2.send_json.call_args_list]
+        assert "stream.end" in ws2_types
+
+        # Verify DB now has both exchanges
+        all_msgs = await store.get_messages(sid)
+        assert len(all_msgs) >= 4  # 2 user + 2 assistant
+
+        # Verify the session's in-memory history has both turns
+        session = plugin._orchestrator.get_cached_session(sid)
+        assert session is not None
+        assert len(session.history) >= 4
+
+    # ── Matrix: mixed event types in same room ───────────────────────
+
+    async def test_matrix_same_room_different_events(self):
+        """Text, image, and audio events in the same Matrix room all share
+        one session with a unified history."""
+        from march.channels.matrix_channel import MatrixChannel
+
+        room_id = "!multi-event:localhost"
+        session_id = MatrixChannel._session_id_for_room(room_id)
+
+        store = InMemorySessionStore()
+
+        # --- Turn 1: text message ---
+        agent = MockAgent([
+            StreamChunk(delta="Text reply"),
+            AgentResponse(content="Text reply"),
+        ])
+        ch, _ = self._make_matrix_channel(agent=agent, store=store)
+        room = MagicMock()
+        room.room_id = room_id
+
+        text_event = MagicMock()
+        text_event.body = "Hello from text"
+        text_event.sender = "@user:localhost"
+        text_event.server_timestamp = 99999999
+        text_event.event_id = "$text-1"
+
+        await ch._on_message(room, text_event)
+        await asyncio.sleep(0.15)
+
+        # Verify text was processed
+        assert ch._client.room_send.called
+        ch._client.room_send.reset_mock()
+
+        # --- Turn 2: image event ---
+        agent.items = [
+            StreamChunk(delta="Image reply"),
+            AgentResponse(content="Image reply"),
+        ]
+
+        img_event = MagicMock()
+        img_event.sender = "@user:localhost"
+        img_event.server_timestamp = 100000000
+        img_event.event_id = "$img-1"
+        img_event.url = "mxc://localhost/test-image"
+        img_event.body = "photo.jpg"
+        img_event.key = None
+        img_event.hashes = None
+        img_event.iv = None
+
+        # Patch _process_image to just call orchestrator with text
+        async def fake_process_image(rid, ev):
+            sid = MatrixChannel._session_id_for_room(rid)
+            content = "[User sent image: photo.jpg]"
+            async for _ in ch._orchestrator.handle_message(sid, content, source="matrix"):
+                pass
+
+        ch._process_image = fake_process_image
+        await ch._on_image(room, img_event)
+        await asyncio.sleep(0.15)
+
+        # --- Turn 3: audio event ---
+        agent.items = [
+            StreamChunk(delta="Audio reply"),
+            AgentResponse(content="Audio reply"),
+        ]
+
+        audio_event = MagicMock()
+        audio_event.sender = "@user:localhost"
+        audio_event.server_timestamp = 100000001
+        audio_event.event_id = "$audio-1"
+        audio_event.url = "mxc://localhost/test-audio"
+        audio_event.body = "voice.ogg"
+        audio_event.mimetype = "audio/ogg"
+        audio_event.key = None
+        audio_event.hashes = None
+        audio_event.iv = None
+
+        # Patch _process_audio to just call orchestrator with transcribed text
+        async def fake_process_audio(rid, ev):
+            sid = MatrixChannel._session_id_for_room(rid)
+            content = "[Voice transcription] Turn on the lights"
+            async for _ in ch._orchestrator.handle_message(sid, content, source="matrix"):
+                pass
+
+        ch._process_audio = fake_process_audio
+        await ch._on_audio(room, audio_event)
+        await asyncio.sleep(0.15)
+
+        # --- Verify all three turns share the same session ---
+        session = ch._orchestrator.get_cached_session(session_id)
+        assert session is not None
+        # 3 turns × 2 messages (user + assistant) = 6
+        assert len(session.history) == 6
+
+        # Verify DB has all messages under the same session_id
+        db_msgs = await store.get_messages(session_id)
+        assert len(db_msgs) >= 6
+
+        # Verify the session_id is deterministic for the room
+        assert session_id == MatrixChannel._session_id_for_room(room_id)
+
+    # ── WS takeover during active stream ─────────────────────────────
+
+    async def test_ws_takeover_during_stream(self):
+        """Client A is streaming. Client B connects to the same session.
+        Client A gets session.takeover. Client B gets stream.active with
+        the partial content accumulated so far."""
+        from march.plugins.ws_proxy import _WSConn, _StreamBuffer, _try_send
+
+        plugin, store = self._make_plugin(
+            agent=SlowAgent([
+                StreamChunk(delta="Chunk 1 "),
+                StreamChunk(delta="Chunk 2 "),
+                StreamChunk(delta="Chunk 3 "),
+                AgentResponse(content="Chunk 1 Chunk 2 Chunk 3 "),
+            ], delay=0.05),
+        )
+        sid = "takeover-stream"
+        await store.create_session("ws", sid, session_id=sid)
+
+        # --- Client A connects and starts streaming ---
+        ws_a = self._make_ws()
+        plugin._active_connections[sid] = ws_a
+        conn_a = _WSConn(ws=ws_a, session_id=sid)
+
+        # Start the stream in the background
+        stream_task = asyncio.create_task(
+            plugin._stream_response(conn_a, "Start streaming")
+        )
+
+        # Wait for some chunks to arrive
+        await asyncio.sleep(0.08)
+
+        # The stream buffer should have partial content
+        buf = plugin._get_stream_buffer(sid)
+        assert buf.streaming is True
+        assert len(buf.collected) > 0
+        partial_at_takeover = buf.collected
+
+        # --- Client B connects mid-stream ---
+        ws_b = self._make_ws()
+
+        # Simulate takeover: send takeover to A, close A, register B
+        existing = plugin._active_connections.get(sid)
+        assert existing is ws_a
+        await _try_send(existing, {
+            "type": "session.takeover",
+            "message": "Another client connected to this session",
+        })
+        await existing.close()
+        ws_a.closed = True  # Mark as closed so stream_response stops sending to it
+        plugin._active_connections[sid] = ws_b
+
+        # Simulate what _handle_ws does on connect: check buf.streaming
+        assert buf.streaming is True
+        await _try_send(ws_b, {
+            "type": "stream.active",
+            "chunk_id": buf.next_id - 1 if buf.next_id > 0 else -1,
+            "collected": buf.collected,
+        })
+
+        # Verify A received session.takeover
+        a_calls = ws_a.send_json.call_args_list
+        a_types = [c.args[0].get("type") for c in a_calls]
+        assert "session.takeover" in a_types
+        ws_a.close.assert_called_once()
+
+        # Verify B received stream.active with partial content
+        b_calls = ws_b.send_json.call_args_list
+        b_types = [c.args[0].get("type") for c in b_calls]
+        assert "stream.active" in b_types
+
+        # Find the stream.active message and verify it has the partial content
+        active_msg = next(
+            c.args[0] for c in b_calls if c.args[0].get("type") == "stream.active"
+        )
+        assert active_msg["collected"] == partial_at_takeover
+        assert len(active_msg["collected"]) > 0
+        assert active_msg["chunk_id"] >= 0
+
+        # Let the stream finish
+        await stream_task
+
+        # After stream completes, buffer should be done
+        assert buf.done is True
+        assert buf.streaming is False
+
+    # ── Edge cases ────────────────────────────────────────────────────
+
+    async def test_takeover_when_first_client_already_closed(self):
+        """If the first client already disconnected (ws.closed=True),
+        takeover skips the send+close and just registers the new client."""
+        from march.plugins.ws_proxy import _WSConn, _try_send
+
+        plugin, store = self._make_plugin(
+            agent=MockAgent([
+                StreamChunk(delta="Reply"),
+                AgentResponse(content="Reply"),
+            ]),
+        )
+        sid = "takeover-closed"
+        await store.create_session("ws", sid, session_id=sid)
+
+        # Client A is already closed
+        ws_a = self._make_ws(closed=True)
+        plugin._active_connections[sid] = ws_a
+
+        # Client B connects
+        ws_b = self._make_ws()
+
+        # Simulate takeover check — existing is closed, so skip send+close
+        existing = plugin._active_connections.get(sid)
+        if existing is not None and not existing.closed:
+            await _try_send(existing, {"type": "session.takeover"})
+            await existing.close()
+
+        plugin._active_connections[sid] = ws_b
+
+        # A should NOT have received takeover (it was already closed)
+        assert ws_a.send_json.call_count == 0
+        assert ws_a.close.call_count == 0
+
+        # B is now active and can send messages
+        conn_b = _WSConn(ws=ws_b, session_id=sid)
+        await plugin._ws_handle_message(conn_b, {"type": "message", "content": "Hello"})
+
+        b_types = [c.args[0].get("type") for c in ws_b.send_json.call_args_list]
+        assert "stream.start" in b_types
+        assert "stream.end" in b_types
+
+    async def test_reconnect_gets_stream_catchup_when_done(self):
+        """If a stream finished while the client was disconnected,
+        reconnecting gets stream.catchup with the full content."""
+        from march.plugins.ws_proxy import _StreamBuffer, _try_send
+
+        plugin, store = self._make_plugin()
+        sid = "catchup-sess"
+
+        # Simulate a completed stream in the buffer
+        buf = plugin._get_stream_buffer(sid)
+        buf.collected = "The complete answer to your question."
+        buf.done = True
+        buf.streaming = False
+        buf.add_chunk({"type": "stream.start"})
+        buf.add_chunk({"type": "stream.delta", "content": "The complete answer to your question."})
+        buf.add_chunk({"type": "stream.end"})
+
+        # New client connects
+        ws_new = self._make_ws()
+
+        # Simulate the catchup logic from _handle_ws
+        if buf.streaming:
+            await _try_send(ws_new, {
+                "type": "stream.active",
+                "chunk_id": buf.next_id - 1,
+                "collected": buf.collected,
+            })
+        elif buf.done and buf.collected:
+            await _try_send(ws_new, {
+                "type": "stream.catchup",
+                "content": buf.collected,
+                "done": True,
+                "chunk_id": buf.next_id - 1,
+            })
+
+        calls = ws_new.send_json.call_args_list
+        types = [c.args[0].get("type") for c in calls]
+        assert "stream.catchup" in types
+
+        catchup_msg = next(c.args[0] for c in calls if c.args[0].get("type") == "stream.catchup")
+        assert catchup_msg["content"] == "The complete answer to your question."
+        assert catchup_msg["done"] is True
+        assert catchup_msg["chunk_id"] == buf.next_id - 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. Guardian Process Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGuardian:
+    """Test the Guardian process: registration, health checks, PID watching,
+    restart protection, and graceful shutdown.
+
+    All tests use a tmp_path-scoped Guardian with patched state dirs so nothing
+    touches the real ~/.march/guardian.
+    """
+
+    # ── helpers ────────────────────────────────────────────────────────
+
+    def _make_guardian(self, tmp_path: Path, **overrides) -> "Guardian":
+        """Create a Guardian whose state files live under tmp_path."""
+        from march.agents.guardian import Guardian, GuardianConfig
+
+        defaults = dict(
+            check_interval=1,  # fast for tests
+            march_config_path=str(tmp_path / "config.yaml"),
+        )
+        defaults.update(overrides)
+        cfg = GuardianConfig(**defaults)
+        g = Guardian(config=cfg)
+
+        # Redirect all state to tmp_path so tests are hermetic
+        import march.agents.guardian as gmod
+
+        gmod.GUARDIAN_STATE_DIR = tmp_path / "guardian"
+        gmod.CONFIG_BACKUP_DIR = tmp_path / "guardian" / "config_backups"
+        gmod.REGISTRY_FILE = tmp_path / "guardian" / "watched.json"
+
+        return g
+
+    @pytest.fixture(autouse=True)
+    def _save_and_restore_module_paths(self, tmp_path: Path):
+        """Save the module-level paths before each test and restore after."""
+        import march.agents.guardian as gmod
+
+        orig_state = gmod.GUARDIAN_STATE_DIR
+        orig_backup = gmod.CONFIG_BACKUP_DIR
+        orig_registry = gmod.REGISTRY_FILE
+        yield
+        gmod.GUARDIAN_STATE_DIR = orig_state
+        gmod.CONFIG_BACKUP_DIR = orig_backup
+        gmod.REGISTRY_FILE = orig_registry
+
+    # ── WatchEntry dataclass ──────────────────────────────────────────
+
+    def test_watch_entry_round_trip(self):
+        """WatchEntry serialises to dict and back."""
+        from march.agents.guardian import WatchEntry
+
+        entry = WatchEntry(
+            id="task-1", pid=12345, log_path="/tmp/test.log",
+            target="matrix:!room:server", timeout=120,
+            command="pytest tests/",
+        )
+        d = entry.to_dict()
+        restored = WatchEntry.from_dict(d)
+        assert restored.id == entry.id
+        assert restored.pid == entry.pid
+        assert restored.log_path == entry.log_path
+        assert restored.command == entry.command
+        assert restored.registered_at == entry.registered_at
+
+    def test_watch_entry_auto_timestamp(self):
+        """WatchEntry gets a timestamp on creation."""
+        from march.agents.guardian import WatchEntry
+
+        before = time.time()
+        entry = WatchEntry(id="ts-test", pid=1)
+        after = time.time()
+        assert before <= entry.registered_at <= after
+
+    # ── Registration & removal ────────────────────────────────────────
+
+    async def test_register_and_status(self, tmp_path: Path):
+        """Register an entry, verify it appears in status."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        entry = WatchEntry(id="test-reg", pid=os.getpid(), command="self")
+        g.register(entry)
+
+        st = g.status()
+        assert st["running"] is False  # not in run_loop yet
+        assert len(st["entries"]) == 1
+        assert st["entries"][0]["id"] == "test-reg"
+        assert st["entries"][0]["alive"] is True  # our own PID
+
+    async def test_register_persists_to_disk(self, tmp_path: Path):
+        """Registered entries survive a fresh Guardian load."""
+        from march.agents.guardian import WatchEntry
+
+        g1 = self._make_guardian(tmp_path)
+        await g1.initialize()
+        g1.register(WatchEntry(id="persist-test", pid=99999, command="fake"))
+
+        # Create a second guardian instance that loads from the same state dir
+        g2 = self._make_guardian(tmp_path)
+        await g2.initialize()
+
+        assert "persist-test" in g2._entries
+        assert g2._entries["persist-test"].pid == 99999
+
+    async def test_remove_entry(self, tmp_path: Path):
+        """Remove an entry by id."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+        g.register(WatchEntry(id="rm-test", pid=1, command="test"))
+        assert "rm-test" in g._entries
+
+        removed = g.remove("rm-test")
+        assert removed is True
+        assert "rm-test" not in g._entries
+
+    async def test_remove_nonexistent(self, tmp_path: Path):
+        """Removing a nonexistent entry returns False."""
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+        assert g.remove("nope") is False
+
+    # ── PID liveness checks ───────────────────────────────────────────
+
+    async def test_health_check_alive_pid(self, tmp_path: Path):
+        """Guardian detects that our own PID is alive."""
+        from march.agents.guardian import Guardian
+
+        g = self._make_guardian(tmp_path)
+        assert g._is_pid_alive(os.getpid()) is True
+
+    async def test_health_check_dead_pid(self, tmp_path: Path):
+        """Guardian detects a dead PID (use a PID that can't exist)."""
+        g = self._make_guardian(tmp_path)
+        # PID 2^22 is almost certainly not running
+        assert g._is_pid_alive(4194304) is False
+
+    async def test_health_check_zero_pid(self, tmp_path: Path):
+        """PID 0 is treated as not alive."""
+        g = self._make_guardian(tmp_path)
+        assert g._is_pid_alive(0) is False
+
+    async def test_health_check_negative_pid(self, tmp_path: Path):
+        """Negative PID is treated as not alive."""
+        g = self._make_guardian(tmp_path)
+        assert g._is_pid_alive(-1) is False
+
+    # ── Dead PID detection (simulated crash) ──────────────────────────
+
+    async def test_dead_pid_triggers_notification_and_removal(self, tmp_path: Path):
+        """When a watched PID dies, guardian notifies and removes the entry."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        # Spawn a real subprocess, then kill it
+        proc = await asyncio.create_subprocess_exec(
+            "sleep", "60",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        child_pid = proc.pid
+        assert g._is_pid_alive(child_pid) is True
+
+        g.register(WatchEntry(
+            id="crash-test", pid=child_pid,
+            target="test-channel", command="sleep 60",
+        ))
+
+        # Kill the child to simulate a crash
+        proc.kill()
+        await proc.wait()
+        assert g._is_pid_alive(child_pid) is False
+
+        # Run one check cycle — should detect the dead PID
+        notifications: list[str] = []
+        g._notify = AsyncMock(side_effect=lambda t, m: notifications.append(m))
+
+        await g._check_entries()
+
+        # Entry should be removed
+        assert "crash-test" not in g._entries
+        # Notification should mention the dead process
+        assert len(notifications) == 1
+        assert "Process died" in notifications[0]
+        assert "sleep 60" in notifications[0]
+
+    async def test_alive_pid_not_removed(self, tmp_path: Path):
+        """A healthy PID is not removed during check."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        g.register(WatchEntry(
+            id="healthy", pid=os.getpid(), command="self",
+        ))
+
+        g._notify = AsyncMock()
+        await g._check_entries()
+
+        # Should still be registered
+        assert "healthy" in g._entries
+        g._notify.assert_not_called()
+
+    # ── Log staleness detection ───────────────────────────────────────
+
+    async def test_stale_log_triggers_notification(self, tmp_path: Path):
+        """A log file that hasn't been modified triggers a stale warning."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path, log_stale_threshold=1)
+        await g.initialize()
+
+        # Create a log file and backdate its mtime
+        log_file = tmp_path / "stale.log"
+        log_file.write_text("old log content")
+        old_time = time.time() - 600  # 10 minutes ago
+        os.utime(log_file, (old_time, old_time))
+
+        g.register(WatchEntry(
+            id="stale-log", pid=0,  # no PID — log-only watch
+            log_path=str(log_file), target="test",
+            timeout=2, command="stale task",
+        ))
+
+        notifications: list[str] = []
+        g._notify = AsyncMock(side_effect=lambda t, m: notifications.append(m))
+
+        await g._check_entries()
+
+        assert "stale-log" not in g._entries
+        assert len(notifications) == 1
+        assert "Log stale" in notifications[0]
+
+    async def test_fresh_log_not_flagged(self, tmp_path: Path):
+        """A recently-modified log file is not flagged as stale."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        log_file = tmp_path / "fresh.log"
+        log_file.write_text("fresh content")
+        # mtime is now — well within any threshold
+
+        g.register(WatchEntry(
+            id="fresh-log", pid=0,
+            log_path=str(log_file), timeout=300, command="fresh task",
+        ))
+
+        g._notify = AsyncMock()
+        await g._check_entries()
+
+        assert "fresh-log" in g._entries
+        g._notify.assert_not_called()
+
+    async def test_missing_log_treated_as_stale(self, tmp_path: Path):
+        """A log path that doesn't exist is treated as stale."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        g.register(WatchEntry(
+            id="missing-log", pid=0,
+            log_path=str(tmp_path / "nonexistent.log"),
+            timeout=1, command="missing log task",
+        ))
+
+        notifications: list[str] = []
+        g._notify = AsyncMock(side_effect=lambda t, m: notifications.append(m))
+
+        await g._check_entries()
+
+        assert "missing-log" not in g._entries
+        assert len(notifications) == 1
+
+    # ── Restart protection (config backup / revert) ───────────────────
+
+    async def test_register_restart_creates_backup(self, tmp_path: Path):
+        """register_restart() copies config.yaml to a timestamped backup."""
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        # Create a config file to back up
+        config_path = Path(g.config.march_config_path)
+        config_path.write_text("model: gpt-4o\nport: 8100\n")
+
+        import march.agents.guardian as gmod
+        backup_dir = gmod.CONFIG_BACKUP_DIR
+
+        backup_path = g.register_restart()
+        assert backup_path != ""
+        assert Path(backup_path).exists()
+        assert Path(backup_path).read_text() == "model: gpt-4o\nport: 8100\n"
+        assert len(list(backup_dir.glob("*.yaml"))) == 1
+
+    async def test_register_restart_prunes_old_backups(self, tmp_path: Path):
+        """Only the N most recent backups are kept."""
+        g = self._make_guardian(tmp_path, config_backup_count=3)
+        await g.initialize()
+
+        config_path = Path(g.config.march_config_path)
+
+        import march.agents.guardian as gmod
+        backup_dir = gmod.CONFIG_BACKUP_DIR
+
+        # Create 5 backups with distinct timestamps by patching time.time
+        fake_time = 1000000
+        for i in range(5):
+            config_path.write_text(f"version: {i}\n")
+            with patch("march.agents.guardian.time.time", return_value=fake_time + i):
+                g.register_restart()
+
+        # Should only keep 3
+        backups = list(backup_dir.glob("*.yaml"))
+        assert len(backups) == 3
+
+    async def test_register_restart_no_config(self, tmp_path: Path):
+        """register_restart() returns empty string if config doesn't exist."""
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+        # Don't create the config file
+        assert g.register_restart() == ""
+
+    async def test_verify_after_restart_success(self, tmp_path: Path):
+        """verify_after_restart returns True when march --status succeeds."""
+        g = self._make_guardian(tmp_path)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = await g.verify_after_restart()
+        assert result is True
+
+    async def test_verify_after_restart_failure(self, tmp_path: Path):
+        """verify_after_restart returns False when march --status fails."""
+        g = self._make_guardian(tmp_path)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)
+            result = await g.verify_after_restart()
+        assert result is False
+
+    async def test_verify_after_restart_timeout(self, tmp_path: Path):
+        """verify_after_restart returns False on timeout."""
+        import subprocess as sp
+
+        g = self._make_guardian(tmp_path)
+
+        with patch("subprocess.run", side_effect=sp.TimeoutExpired("march", 30)):
+            result = await g.verify_after_restart()
+        assert result is False
+
+    async def test_recover_from_failed_restart(self, tmp_path: Path):
+        """recover_from_failed_restart tries backups until one works."""
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        import march.agents.guardian as gmod
+        backup_dir = gmod.CONFIG_BACKUP_DIR
+
+        config_path = Path(g.config.march_config_path)
+
+        # Create two backups: old (bad) and new (good)
+        (backup_dir / "config_1000.yaml").write_text("bad: true\n")
+        (backup_dir / "config_2000.yaml").write_text("good: true\n")
+
+        call_count = 0
+
+        def mock_run(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return MagicMock(returncode=0)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with patch.object(g, "verify_after_restart", return_value=True):
+                g._notify = AsyncMock()
+                result = await g.recover_from_failed_restart()
+
+        assert result is True
+        # Should have tried the newest backup first (config_2000)
+        assert config_path.read_text() == "good: true\n"
+
+    async def test_recover_all_backups_fail(self, tmp_path: Path):
+        """If all backups fail, recovery returns False and notifies."""
+        g = self._make_guardian(tmp_path)
+        await g.initialize()
+
+        import march.agents.guardian as gmod
+        backup_dir = gmod.CONFIG_BACKUP_DIR
+
+        config_path = Path(g.config.march_config_path)
+        config_path.write_text("broken: true\n")
+        (backup_dir / "config_1000.yaml").write_text("also_broken: true\n")
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            with patch.object(g, "verify_after_restart", return_value=False):
+                notifications: list[str] = []
+                g._notify = AsyncMock(side_effect=lambda t, m: notifications.append(m))
+                result = await g.recover_from_failed_restart()
+
+        assert result is False
+        assert any("recovery failed" in n for n in notifications)
+
+    # ── Run loop & graceful shutdown ──────────────────────────────────
+
+    async def test_run_loop_starts_and_stops(self, tmp_path: Path):
+        """Guardian run_loop sets _running=True, stop() sets it False."""
+        g = self._make_guardian(tmp_path, check_interval=1)
+        await g.initialize()
+
+        assert g._running is False
+
+        # Start the loop in the background
+        loop_task = asyncio.create_task(g.run_loop())
+        await asyncio.sleep(0.05)
+        assert g._running is True
+
+        # Stop it
+        await g.stop()
+        await asyncio.sleep(0.05)
+
+        # The task should finish
+        try:
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            loop_task.cancel()
+            pytest.fail("Guardian run_loop did not stop within 2s")
+
+        assert g._running is False
+
+    async def test_graceful_shutdown_cleans_up(self, tmp_path: Path):
+        """After stop(), status shows running=False and entries are preserved."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path, check_interval=1)
+        await g.initialize()
+
+        g.register(WatchEntry(id="survive-stop", pid=os.getpid(), command="self"))
+
+        loop_task = asyncio.create_task(g.run_loop())
+        await asyncio.sleep(0.05)
+
+        await g.stop()
+        try:
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            loop_task.cancel()
+
+        st = g.status()
+        assert st["running"] is False
+        # Entries survive shutdown (persisted to disk)
+        assert len(st["entries"]) == 1
+        assert st["entries"][0]["id"] == "survive-stop"
+
+    async def test_check_runs_during_loop(self, tmp_path: Path):
+        """The monitoring loop actually calls _check_entries periodically."""
+        from march.agents.guardian import WatchEntry
+
+        g = self._make_guardian(tmp_path, check_interval=1)
+        await g.initialize()
+
+        check_count = 0
+        original_check = g._check_entries
+
+        async def counting_check():
+            nonlocal check_count
+            check_count += 1
+            await original_check()
+
+        g._check_entries = counting_check
+
+        loop_task = asyncio.create_task(g.run_loop())
+        # Let it run for ~1.5 intervals
+        await asyncio.sleep(1.5)
+        await g.stop()
+        try:
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            loop_task.cancel()
+
+        assert check_count >= 1
+
+    # ── Guardian spawned alongside March (CLI integration) ────────────
+
+    async def test_start_command_spawns_guardian(self):
+        """The `march start` CLI spawns a guardian subprocess by default."""
+        from march.cli.start import start
+
+        with patch("march.cli.start._start_subprocess", return_value=42) as mock_spawn:
+            with patch("march.cli.start._find_march_pids", return_value=[]):
+                with patch("march.cli.start._ensure_templates"):
+                    with patch("march.app.MarchApp") as mock_app:
+                        mock_instance = MagicMock()
+                        mock_app.return_value = mock_instance
+                        mock_instance.run = MagicMock(side_effect=SystemExit(0))
+
+                        from click.testing import CliRunner
+                        runner = CliRunner()
+                        result = runner.invoke(start, [], catch_exceptions=True)
+
+                        # Verify guardian was spawned
+                        guardian_calls = [
+                            c for c in mock_spawn.call_args_list
+                            if c.args[0] == "guardian"
+                        ]
+                        assert len(guardian_calls) == 1
+
+    async def test_start_no_guardian_flag(self):
+        """The --no-guardian flag skips guardian spawning."""
+        from march.cli.start import start
+
+        with patch("march.cli.start._start_subprocess", return_value=42) as mock_spawn:
+            with patch("march.cli.start._find_march_pids", return_value=[]):
+                with patch("march.cli.start._ensure_templates"):
+                    with patch("march.app.MarchApp") as mock_app:
+                        mock_instance = MagicMock()
+                        mock_app.return_value = mock_instance
+                        mock_instance.run = MagicMock(side_effect=SystemExit(0))
+
+                        from click.testing import CliRunner
+                        runner = CliRunner()
+                        result = runner.invoke(start, ["--no-guardian"], catch_exceptions=True)
+
+                        guardian_calls = [
+                            c for c in mock_spawn.call_args_list
+                            if c.args[0] == "guardian"
+                        ]
+                        assert len(guardian_calls) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. Logging System Structure Tests
+#
+# These tests verify the post-refactor log directory layout:
+#
+#   ~/.march/logs/
+#     agent/YYYY-MM-DD.log        ← structured agent logs
+#     guardian/YYYY-MM-DD.log     ← guardian process logs  (TODO: not date-based yet)
+#     turns/YYYY-MM-DD.jsonl      ← per-turn debug JSONL
+#     metrics/YYYY-MM-DD.jsonl    ← machine-readable metrics
+#
+# Tests marked @pytest.mark.xfail depend on the guardian date-based log
+# refactor that hasn't landed yet.  All other tests verify the current
+# (working) implementation.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestLogDirectoryStructure:
+    """Verify the log subdirectory layout is created on startup."""
+
+    def test_ensure_log_subdirectories(self, tmp_path: Path):
+        """ensure_log_subdirectories creates all canonical subdirs."""
+        from march.core.log_maintenance import ensure_log_subdirectories, LOG_SUBDIRS
+
+        result = ensure_log_subdirectories(tmp_path)
+        assert result == tmp_path
+        for name in LOG_SUBDIRS:
+            assert (tmp_path / name).is_dir(), f"Missing subdir: {name}"
+
+    def test_subdirectories_are_idempotent(self, tmp_path: Path):
+        """Calling ensure_log_subdirectories twice doesn't fail or duplicate."""
+        from march.core.log_maintenance import ensure_log_subdirectories
+
+        ensure_log_subdirectories(tmp_path)
+        ensure_log_subdirectories(tmp_path)  # second call — no error
+        assert (tmp_path / "agent").is_dir()
+
+    def test_canonical_subdirs_list(self):
+        """The canonical subdirectory list includes all expected names."""
+        from march.core.log_maintenance import LOG_SUBDIRS
+
+        expected = {"agent", "guardian", "turns", "metrics", "dashboard"}
+        assert set(LOG_SUBDIRS) == expected
+
+    def test_configure_logging_creates_agent_dir(self, tmp_path: Path):
+        """configure_logging() creates the agent/ subdir and a DateBasedFileHandler."""
+        from march.logging.handlers import DateBasedFileHandler
+
+        agent_dir = tmp_path / "agent"
+        handler = DateBasedFileHandler(log_dir=agent_dir, ext=".log")
+        assert agent_dir.is_dir()
+        handler.close()
+
+    def test_turn_logger_creates_turns_subdir(self, tmp_path: Path):
+        """TurnLogger creates turns/ subdir under its log_dir."""
+        logger = TurnLogger(log_dir=tmp_path)
+        assert (tmp_path / "turns").is_dir()
+
+    def test_metrics_logger_creates_metrics_dir(self, tmp_path: Path):
+        """MetricsLogger creates its metrics directory."""
+        from march.logging.logger import MetricsLogger
+
+        MetricsLogger.reset()
+        metrics_dir = tmp_path / "metrics"
+        ml = MetricsLogger(metrics_dir=metrics_dir)
+        assert metrics_dir.is_dir()
+        MetricsLogger.reset()
+
+
+class TestLogDateRotation:
+    """Verify that logs rotate by date (each day → new file)."""
+
+    def test_turn_logger_uses_date_filename(self, tmp_path: Path):
+        """TurnLogger writes to turns/YYYY-MM-DD.jsonl."""
+        from datetime import datetime, timezone
+
+        logger = TurnLogger(log_dir=tmp_path)
+        logger.turn_start(turn_id="t1", session_id="s1", user_msg="hi", source="test")
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        expected = tmp_path / "turns" / f"{today}.jsonl"
+        assert expected.exists()
+        data = json.loads(expected.read_text().strip())
+        assert data["event"] == "turn_start"
+
+    def test_metrics_logger_uses_date_filename(self, tmp_path: Path):
+        """MetricsLogger writes to metrics/YYYY-MM-DD.jsonl."""
+        from datetime import datetime, timezone
+        from march.logging.logger import MetricsLogger
+
+        MetricsLogger.reset()
+        metrics_dir = tmp_path / "metrics"
+        ml = MetricsLogger(metrics_dir=metrics_dir)
+        ml.llm_call(
+            session_id="s1", provider="openai", model="gpt-4o",
+            input_tokens=100, output_tokens=50, cost_usd=0.005, duration_ms=800,
+        )
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        expected = metrics_dir / f"{today}.jsonl"
+        assert expected.exists()
+        data = json.loads(expected.read_text().strip())
+        assert data["event"] == "llm.call"
+        MetricsLogger.reset()
+
+    def test_date_based_file_handler_uses_date_filename(self, tmp_path: Path):
+        """DateBasedFileHandler writes to <dir>/YYYY-MM-DD.<ext>."""
+        import logging as stdlib_logging
+        from datetime import date
+        from march.logging.handlers import DateBasedFileHandler
+
+        handler = DateBasedFileHandler(log_dir=tmp_path, ext=".log")
+        handler.setFormatter(stdlib_logging.Formatter("%(message)s"))
+
+        record = stdlib_logging.LogRecord(
+            name="test", level=stdlib_logging.INFO, pathname="", lineno=0,
+            msg="test log line", args=(), exc_info=None,
+        )
+        handler.emit(record)
+        handler.close()
+
+        today = date.today().isoformat()
+        expected = tmp_path / f"{today}.log"
+        assert expected.exists()
+        assert "test log line" in expected.read_text()
+
+    def test_turn_logger_date_change(self, tmp_path: Path):
+        """When the date changes, TurnLogger writes to a new file."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        logger = TurnLogger(log_dir=tmp_path)
+        logger.turn_start(turn_id="t1", session_id="s1", user_msg="day1", source="test")
+
+        old_path = logger._path
+        assert old_path.exists()
+
+        # Simulate date change by patching datetime in the turn_log module
+        with _patch("march.core.turn_log.datetime") as mock_dt:
+            mock_dt.now.return_value.isoformat.return_value = "2099-12-31T00:00:00+00:00"
+            mock_dt.now.return_value.strftime.return_value = "2099-12-31"
+            # Force the date check to see a new date
+            logger._current_date = "2099-12-31"
+            logger._path = tmp_path / "turns" / "2099-12-31.jsonl"
+            logger.turn_start(turn_id="t2", session_id="s1", user_msg="day2", source="test")
+
+        new_path = tmp_path / "turns" / "2099-12-31.jsonl"
+        assert old_path.exists()
+        assert new_path.exists()
+        assert "day1" in old_path.read_text()
+        assert "day2" in new_path.read_text()
+
+    @pytest.mark.xfail(
+        reason="Guardian date-based logging not yet implemented — "
+               "guardian_cmd.py still writes to flat guardian.log. "
+               "Pending log refactor PR.",
+        strict=False,
+    )
+    def test_guardian_log_uses_date_filename(self, tmp_path: Path):
+        """Guardian should write to guardian/YYYY-MM-DD.log (post-refactor).
+
+        Currently the guardian CLI writes to a flat ``guardian.log`` file.
+        This test will pass once the guardian is migrated to DateBasedFileHandler.
+        """
+        from datetime import date
+        from march.logging.handlers import DateBasedFileHandler
+
+        guardian_dir = tmp_path / "guardian"
+        guardian_dir.mkdir()
+
+        # Simulate what the refactored guardian_cmd.py should do:
+        handler = DateBasedFileHandler(log_dir=guardian_dir, ext=".log")
+
+        import logging as stdlib_logging
+        handler.setFormatter(stdlib_logging.Formatter("%(message)s"))
+        record = stdlib_logging.LogRecord(
+            name="guardian", level=stdlib_logging.INFO, pathname="", lineno=0,
+            msg="guardian health check", args=(), exc_info=None,
+        )
+        handler.emit(record)
+        handler.close()
+
+        today = date.today().isoformat()
+        expected = guardian_dir / f"{today}.log"
+        assert expected.exists()
+
+        # Verify the actual guardian_cmd.py uses DateBasedFileHandler
+        # (this is the part that will fail until the refactor lands)
+        import inspect
+        from march.cli.guardian_cmd import guardian_start
+        source = inspect.getsource(guardian_start)
+        assert "DateBasedFileHandler" in source, (
+            "guardian_cmd.py should use DateBasedFileHandler for date-based logs"
+        )
+
+
+class TestGuardianLogContent:
+    """Verify the guardian writes meaningful log events."""
+
+    @pytest.fixture(autouse=True)
+    def _guardian_state_isolation(self, tmp_path: Path):
+        """Redirect guardian state to tmp_path for every test in this class."""
+        import march.agents.guardian as gmod
+        orig_state = gmod.GUARDIAN_STATE_DIR
+        orig_backup = gmod.CONFIG_BACKUP_DIR
+        orig_registry = gmod.REGISTRY_FILE
+        gmod.GUARDIAN_STATE_DIR = tmp_path / "guardian"
+        gmod.CONFIG_BACKUP_DIR = tmp_path / "guardian" / "config_backups"
+        gmod.REGISTRY_FILE = tmp_path / "guardian" / "watched.json"
+        yield
+        gmod.GUARDIAN_STATE_DIR = orig_state
+        gmod.CONFIG_BACKUP_DIR = orig_backup
+        gmod.REGISTRY_FILE = orig_registry
+
+    async def test_guardian_logs_register_events(self, tmp_path: Path, capsys):
+        """Guardian.register() logs the registration to stdout."""
+        from march.agents.guardian import Guardian, GuardianConfig, WatchEntry
+
+        cfg = GuardianConfig(check_interval=1, march_config_path=str(tmp_path / "config.yaml"))
+        g = Guardian(config=cfg)
+        await g.initialize()
+
+        g.register(WatchEntry(id="log-test", pid=os.getpid(), command="test process"))
+
+        captured = capsys.readouterr()
+        assert "log-test" in captured.out or "log-test" in captured.err
+
+    async def test_guardian_logs_dead_pid_notification(self, tmp_path: Path):
+        """Guardian logs a warning when a watched PID dies."""
+        from march.agents.guardian import Guardian, GuardianConfig, WatchEntry
+
+        cfg = GuardianConfig(check_interval=1, march_config_path=str(tmp_path / "config.yaml"))
+        g = Guardian(config=cfg)
+        await g.initialize()
+
+        g.register(WatchEntry(id="dead-log", pid=4194304, command="dead process"))
+
+        notifications: list[str] = []
+        g._notify = AsyncMock(side_effect=lambda t, m: notifications.append(m))
+
+        await g._check_entries()
+
+        assert len(notifications) == 1
+        assert "Process died" in notifications[0]
+        assert "dead process" in notifications[0]
+
+    async def test_guardian_logs_restart_backup(self, tmp_path: Path, capsys):
+        """Guardian logs config backup during register_restart."""
+        from march.agents.guardian import Guardian, GuardianConfig
+
+        cfg = GuardianConfig(check_interval=1, march_config_path=str(tmp_path / "config.yaml"))
+        g = Guardian(config=cfg)
+        await g.initialize()
+
+        Path(cfg.march_config_path).write_text("model: test\n")
+        backup = g.register_restart()
+
+        assert backup != ""
+        captured = capsys.readouterr()
+        assert "register_restart" in captured.out or "register_restart" in captured.err
+
+
+class TestTurnLogPerDate:
+    """Verify turn logs are split by date."""
+
+    def test_turn_log_writes_to_dated_file(self, tmp_path: Path):
+        """Each turn event goes to turns/YYYY-MM-DD.jsonl."""
+        from datetime import datetime, timezone
+
+        logger = TurnLogger(log_dir=tmp_path)
+        logger.turn_start(turn_id="t1", session_id="s1", user_msg="hello", source="test")
+        logger.turn_complete(
+            turn_id="t1", session_id="s1", tool_calls=0,
+            total_tokens=100, total_cost=0.001, duration_ms=500,
+            final_reply_length=50,
+        )
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        log_file = tmp_path / "turns" / f"{today}.jsonl"
+        assert log_file.exists()
+
+        lines = log_file.read_text().strip().split("\n")
+        assert len(lines) == 2
+        assert json.loads(lines[0])["event"] == "turn_start"
+        assert json.loads(lines[1])["event"] == "turn_complete"
+
+    def test_turn_log_multiple_sessions_same_file(self, tmp_path: Path):
+        """Multiple sessions on the same day write to the same dated file."""
+        from datetime import datetime, timezone
+
+        logger = TurnLogger(log_dir=tmp_path)
+        logger.turn_start(turn_id="t1", session_id="sess-A", user_msg="A", source="ws")
+        logger.turn_start(turn_id="t2", session_id="sess-B", user_msg="B", source="matrix")
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        log_file = tmp_path / "turns" / f"{today}.jsonl"
+        lines = log_file.read_text().strip().split("\n")
+        assert len(lines) == 2
+
+        sessions = {json.loads(l)["session_id"] for l in lines}
+        assert sessions == {"sess-A", "sess-B"}
+
+    def test_turn_log_all_event_types_in_one_file(self, tmp_path: Path):
+        """All event types (start, complete, tool, cancel, error, llm) land in the same dated file."""
+        logger = TurnLogger(log_dir=tmp_path)
+        logger.turn_start(turn_id="t1", session_id="s1", user_msg="hi", source="test")
+        logger.llm_call(turn_id="t1", session_id="s1", provider="openai", model="gpt-4o",
+                        input_tokens=100, output_tokens=50, cost=0.005, duration_ms=800)
+        logger.tool_call(turn_id="t1", session_id="s1", name="exec", args={"cmd": "ls"},
+                         duration_ms=50, status="complete", summary="listed files")
+        logger.turn_complete(turn_id="t1", session_id="s1", tool_calls=1,
+                             total_tokens=150, total_cost=0.005, duration_ms=1200,
+                             final_reply_length=100)
+        logger.turn_cancelled(turn_id="t2", session_id="s1", partial_content_length=42)
+        logger.turn_error(turn_id="t3", session_id="s1", error="boom")
+
+        log_file = logger._path
+        lines = log_file.read_text().strip().split("\n")
+        assert len(lines) == 6
+
+        events = [json.loads(l)["event"] for l in lines]
+        assert events == ["turn_start", "llm_call", "tool_call", "turn_complete",
+                          "turn_cancelled", "turn_error"]
+
+    @pytest.mark.xfail(
+        reason="Metrics date-based logging for guardian events not yet wired — "
+               "guardian health checks don't emit to metrics/YYYY-MM-DD.jsonl yet. "
+               "Pending log refactor PR.",
+        strict=False,
+    )
+    def test_guardian_health_checks_in_metrics(self, tmp_path: Path):
+        """Guardian health check events should appear in metrics/ (post-refactor).
+
+        Currently the guardian only logs to its own log file and stdout.
+        This test will pass once guardian health checks emit metrics events.
+        """
+        from march.logging.logger import MetricsLogger
+
+        MetricsLogger.reset()
+        metrics_dir = tmp_path / "metrics"
+        ml = MetricsLogger(metrics_dir=metrics_dir)
+
+        # After the refactor, guardian._check_entries should call
+        # MetricsLogger.get().guardian_health_check(...) or similar
+        assert hasattr(ml, "guardian_health_check"), (
+            "MetricsLogger should have a guardian_health_check() method "
+            "once the guardian metrics integration lands"
+        )
+        MetricsLogger.reset()
+
+
+class TestLogMigration:
+    """Test migration of legacy flat log files to the new structure."""
+
+    def test_migrate_flat_logs(self, tmp_path: Path):
+        """Legacy flat files are moved into subdirectories."""
+        from march.core.log_maintenance import migrate_flat_logs
+
+        # Create legacy flat files
+        (tmp_path / "march.log").write_text("old agent log\n")
+        (tmp_path / "guardian.log").write_text("old guardian log\n")
+        (tmp_path / "turns.jsonl").write_text('{"event":"turn_start"}\n')
+        (tmp_path / "metrics.jsonl").write_text('{"event":"llm.call"}\n')
+
+        # Ensure subdirs exist
+        for d in ("agent", "guardian", "turns", "metrics"):
+            (tmp_path / d).mkdir(exist_ok=True)
+
+        migrated = migrate_flat_logs(tmp_path)
+        assert migrated == 4
+
+        # Flat files should be gone
+        assert not (tmp_path / "march.log").exists()
+        assert not (tmp_path / "guardian.log").exists()
+        assert not (tmp_path / "turns.jsonl").exists()
+        assert not (tmp_path / "metrics.jsonl").exists()
+
+        # Migrated files should be in subdirs
+        assert len(list((tmp_path / "agent").glob("migrated-*"))) == 1
+        assert len(list((tmp_path / "guardian").glob("migrated-*"))) == 1
+        assert len(list((tmp_path / "turns").glob("migrated-*"))) == 1
+        assert len(list((tmp_path / "metrics").glob("migrated-*"))) == 1
+
+    def test_migrate_idempotent(self, tmp_path: Path):
+        """Running migration twice doesn't fail or duplicate."""
+        from march.core.log_maintenance import migrate_flat_logs
+
+        (tmp_path / "march.log").write_text("log\n")
+        for d in ("agent",):
+            (tmp_path / d).mkdir(exist_ok=True)
+
+        first = migrate_flat_logs(tmp_path)
+        second = migrate_flat_logs(tmp_path)
+        assert first == 1
+        assert second == 0  # nothing left to migrate
+
+    def test_cleanup_old_logs(self, tmp_path: Path):
+        """cleanup_old_logs removes files older than TTL."""
+        from march.core.log_maintenance import cleanup_old_logs
+
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+
+        # Create an old file
+        old_file = agent_dir / "2020-01-01.log"
+        old_file.write_text("ancient log\n")
+        old_time = time.time() - (365 * 86400)  # 1 year ago
+        os.utime(old_file, (old_time, old_time))
+
+        # Create a fresh file
+        fresh_file = agent_dir / "2099-01-01.log"
+        fresh_file.write_text("fresh log\n")
+
+        deleted = cleanup_old_logs(tmp_path, ttl_days=30)
+        assert deleted == 1
+        assert not old_file.exists()
+        assert fresh_file.exists()

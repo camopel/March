@@ -304,18 +304,18 @@ class TestGuardian:
 
 
 class TestLogStructure:
-    """Expected log directory structure and TTL — xfail until implemented."""
+    """Log directory structure and TTL cleanup verification."""
 
-    @pytest.mark.xfail(reason="Log subdirectory structure not yet created on startup")
     def test_log_subdirectories(self):
         """~/.march/logs/{agent,guardian,turns,metrics}/ should exist."""
+        from march.core.log_maintenance import ensure_log_subdirectories
         log_base = Path.home() / ".march" / "logs"
+        ensure_log_subdirectories(log_base)
         expected_dirs = ["agent", "guardian", "turns", "metrics"]
         for subdir in expected_dirs:
             d = log_base / subdir
             assert d.is_dir(), f"Expected log subdirectory {d} to exist"
 
-    @pytest.mark.xfail(reason="Log TTL auto-deletion not yet implemented")
     def test_log_ttl_30_days(self):
         """A log TTL cleanup function should exist and be called on startup."""
         # The framework should expose a cleanup_old_logs() or similar function

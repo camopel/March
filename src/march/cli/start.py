@@ -291,16 +291,22 @@ def _start_subprocess(*args) -> int | None:
     """Start a march subcommand as a background process."""
     import subprocess
     import sys
+    from datetime import date
     from pathlib import Path
 
     log_dir = Path.home() / ".march" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_name = args[0] if args else "subprocess"
 
+    # Use categorised subdirectory with date-based log file
+    sub_log_dir = log_dir / log_name
+    sub_log_dir.mkdir(parents=True, exist_ok=True)
+    log_file_path = sub_log_dir / f"{date.today().isoformat()}.log"
+
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "march.cli.main", *args],
-            stdout=open(log_dir / f"{log_name}.log", "a"),
+            stdout=open(log_file_path, "a"),
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )

@@ -48,20 +48,26 @@ def configure_logging(level: str = "INFO") -> None:
         return
 
     from march.logging.formatters import SubsystemConsoleRenderer, SubsystemJSONRenderer
-    from march.logging.handlers import get_file_handler
+    from march.logging.handlers import DateBasedFileHandler
 
     log_level = getattr(logging, level.upper(), logging.INFO)
 
-    # ── stdlib logging setup (file rotation + stderr) ──────────────────
+    # ── Ensure subdirectories + migrate legacy files ───────────────────
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    from march.core.log_maintenance import ensure_log_subdirectories, migrate_flat_logs
+    ensure_log_subdirectories(LOG_DIR)
+    migrate_flat_logs(LOG_DIR)
+
+    # ── stdlib logging setup (date-based file + stderr) ────────────────
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     root_logger.handlers.clear()
 
-    # Rotating file handler (daily, 7-day retention)
-    file_handler = get_file_handler(LOG_FILE, retention_days=LOG_RETENTION_DAYS)
+    # Date-based file handler → agent/YYYY-MM-DD.log
+    agent_log_dir = LOG_DIR / "agent"
+    agent_log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = DateBasedFileHandler(log_dir=agent_log_dir, ext=".log")
     file_handler.setLevel(log_level)
     root_logger.addHandler(file_handler)
 
@@ -284,7 +290,7 @@ class MarchLogger:
 class MetricsLogger:
     """Append-only JSONL metrics logger.
 
-    Writes machine-readable metrics events to ~/.march/logs/metrics.jsonl.
+    Writes machine-readable metrics events to ~/.march/logs/metrics/YYYY-MM-DD.jsonl.
     Events: llm.call, tool.call, turn.complete, message.received,
             message.complete, compaction, stream.draft_saved
     Thread-safe via a lock.
@@ -293,18 +299,45 @@ class MetricsLogger:
     _instance: MetricsLogger | None = None
     _lock = threading.Lock()
 
-    def __init__(self, path: str | Path | None = None) -> None:
-        self._path = Path(path or "~/.march/logs/metrics.jsonl").expanduser()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, metrics_dir: str | Path | None = None) -> None:
+        self._metrics_dir = Path(metrics_dir or "~/.march/logs/metrics").expanduser()
+        self._metrics_dir.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.Lock()
+        self._current_date: str | None = None
+        self._path: Path = self._resolve_path()
+
+    def _resolve_path(self) -> Path:
+        """Return the metrics file path for today's date."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._current_date = today
+        return self._metrics_dir / f"{today}.jsonl"
+
+    def _ensure_current_date(self) -> None:
+        """Check if the date has changed and update the path if needed."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_date:
+            self._current_date = today
+            self._path = self._metrics_dir / f"{today}.jsonl"
 
     @classmethod
     def get(cls, path: str | Path | None = None) -> MetricsLogger:
-        """Get or create the singleton MetricsLogger."""
+        """Get or create the singleton MetricsLogger.
+
+        For backward compatibility, if *path* points to a file (not a
+        directory), the parent ``metrics/`` subdirectory is derived from it.
+        """
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = cls(path)
+                    metrics_dir: str | Path | None = None
+                    if path is not None:
+                        p = Path(path).expanduser()
+                        # If caller passes a file path, use its parent
+                        if p.suffix:
+                            metrics_dir = p.parent / "metrics"
+                        else:
+                            metrics_dir = p
+                    cls._instance = cls(metrics_dir)
         return cls._instance
 
     @classmethod
@@ -317,6 +350,7 @@ class MetricsLogger:
         record["ts"] = datetime.now(timezone.utc).isoformat()
         line = json.dumps(record, default=str, ensure_ascii=False)
         with self._write_lock:
+            self._ensure_current_date()
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
