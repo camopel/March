@@ -72,7 +72,9 @@ class MatrixChannel(Channel):
         try:
             from nio import (
                 AsyncClient, RoomMessageText, RoomMessageImage, RoomEncryptedImage,
-                RoomMessageAudio, RoomEncryptedAudio, InviteMemberEvent, MegolmEvent,
+                RoomMessageAudio, RoomEncryptedAudio,
+                RoomMessageFile, RoomEncryptedFile,
+                InviteMemberEvent, MegolmEvent,
             )
         except ImportError:
             logger.error("matrix-nio not installed. Install with: pip install matrix-nio")
@@ -174,6 +176,12 @@ class MatrixChannel(Channel):
         )
         self._client.add_event_callback(
             self._on_audio, RoomEncryptedAudio
+        )
+        self._client.add_event_callback(
+            self._on_file, RoomMessageFile
+        )
+        self._client.add_event_callback(
+            self._on_file, RoomEncryptedFile
         )
         self._client.add_event_callback(
             self._on_invite, InviteMemberEvent
@@ -635,6 +643,174 @@ class MatrixChannel(Channel):
                 await self._client.room_typing(room_id, typing_state=False)
             except Exception:
                 pass
+
+    async def _on_file(self, room: Any, event: Any) -> None:
+        """Handle incoming file attachments from Matrix rooms.
+
+        Downloads the file, processes based on type (PDF → extract text,
+        text files → read content, binary → note), then sends to agent.
+        """
+        if not self._agent or not self._running:
+            return
+
+        if self._client and event.sender == self._client.user_id:
+            return
+
+        room_id = room.room_id
+        logger.info("matrix: file in %s from %s: %s", room_id, event.sender, getattr(event, "body", "file"))
+
+        try:
+            await self._client.room_read_markers(
+                room_id,
+                fully_read_event=event.event_id,
+                read_event=event.event_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            await self._client.room_typing(room_id, typing_state=True, timeout=60000)
+        except Exception:
+            pass
+
+        asyncio.create_task(self._process_file(room_id, event))
+
+    async def _process_file(self, room_id: str, event: Any) -> None:
+        """Download, decrypt, and process a file attachment."""
+        session = self._get_or_create_session(room_id)
+
+        try:
+            mxc_url = event.url
+            if not mxc_url:
+                logger.warning("matrix: file event has no URL")
+                return
+
+            from nio import DownloadError
+            response = await self._client.download(mxc_url)
+            if isinstance(response, DownloadError):
+                logger.warning("matrix: failed to download file: %s", response)
+                return
+
+            raw_bytes = response.body
+            mime_type = getattr(event, "mimetype", None) or response.content_type or "application/octet-stream"
+            filename = getattr(event, "body", "file") or "file"
+
+            # Decrypt if E2EE
+            enc_key = getattr(event, "key", None)
+            enc_hashes = getattr(event, "hashes", None)
+            enc_iv = getattr(event, "iv", None)
+            if enc_key and enc_hashes and enc_iv:
+                k = enc_key.get("k", "") if isinstance(enc_key, dict) else ""
+                sha256_hash = enc_hashes.get("sha256", "") if isinstance(enc_hashes, dict) else ""
+                if k and sha256_hash and enc_iv:
+                    try:
+                        from nio.crypto import decrypt_attachment
+                        raw_bytes = decrypt_attachment(raw_bytes, k, sha256_hash, enc_iv)
+                        logger.info("matrix: decrypted file attachment (%dKB)", len(raw_bytes) // 1024)
+                    except Exception as e:
+                        logger.warning("matrix: file decryption failed: %s", e)
+
+            # Save to disk
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
+            file_path.write_bytes(raw_bytes)
+            size_kb = len(raw_bytes) // 1024
+
+            logger.info("matrix: file saved %s (%s, %dKB)", file_path.name, mime_type, size_kb)
+
+            # Process based on file type
+            content_text = ""
+
+            # PDF
+            if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+                content_text = self._extract_pdf_text(raw_bytes, filename, size_kb)
+
+            # Text-based files
+            elif self._is_text_file(filename, mime_type):
+                try:
+                    text = raw_bytes.decode("utf-8")
+                    # Truncate if too long (keep first 8000 chars for context)
+                    if len(text) > 8000:
+                        content_text = (
+                            f"[File: {filename} ({mime_type}, {size_kb}KB) — truncated to first 8000 chars]\n\n"
+                            f"{text[:8000]}\n\n[... truncated ...]"
+                        )
+                    else:
+                        content_text = f"[File: {filename} ({mime_type}, {size_kb}KB)]\n\n{text}"
+                except UnicodeDecodeError:
+                    content_text = f"[File: {filename} ({mime_type}, {size_kb}KB) — binary, could not decode as text]"
+
+            # Binary/unknown
+            else:
+                content_text = f"[File: {filename} ({mime_type}, {size_kb}KB) — binary file saved to disk]"
+
+            # Send to agent
+            from march.core.agent import AgentResponse
+            collected = ""
+            async for item in self._agent.run_stream(content_text, session):
+                if isinstance(item, AgentResponse):
+                    break
+                if hasattr(item, "delta") and item.delta:
+                    collected += item.delta
+
+            if collected:
+                await self.send(collected, room_id=room_id)
+
+        except Exception as e:
+            logger.error("matrix: error processing file in %s: %s", room_id, e)
+            await self.send(f"Error processing file: {e}", room_id=room_id)
+        finally:
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _extract_pdf_text(raw_bytes: bytes, filename: str, size_kb: int) -> str:
+        """Extract text from a PDF using PyMuPDF."""
+        try:
+            import fitz
+            doc = fitz.open(stream=raw_bytes, filetype="pdf")
+            pages = []
+            for page in doc:
+                text = page.get_text().strip()
+                if text:
+                    pages.append(text)
+            num_pages = len(doc)
+            doc.close()
+
+            if pages:
+                full_text = "\n\n".join(pages)
+                # Truncate if too long
+                if len(full_text) > 12000:
+                    full_text = full_text[:12000] + "\n\n[... truncated ...]"
+                return f"[PDF: {filename} ({num_pages} pages, {size_kb}KB)]\n\n{full_text}"
+            return f"[PDF: {filename} ({num_pages} pages, {size_kb}KB) — no extractable text]"
+        except ImportError:
+            return f"[PDF: {filename} ({size_kb}KB) — PyMuPDF not installed, cannot extract text]"
+        except Exception as e:
+            return f"[PDF: {filename} ({size_kb}KB) — extraction failed: {e}]"
+
+    @staticmethod
+    def _is_text_file(filename: str, mime_type: str) -> bool:
+        """Check if a file is likely a text file."""
+        text_extensions = {
+            ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".csv",
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css",
+            ".sh", ".bash", ".zsh", ".conf", ".cfg", ".ini",
+            ".xml", ".svg", ".sql", ".rs", ".go", ".java", ".c", ".cpp",
+            ".h", ".hpp", ".rb", ".lua", ".r", ".swift", ".kt",
+            ".dockerfile", ".env", ".gitignore", ".log",
+        }
+        ext = ""
+        if "." in filename:
+            ext = "." + filename.rsplit(".", 1)[-1].lower()
+        return (
+            mime_type.startswith("text/")
+            or mime_type in ("application/json", "application/xml", "application/yaml")
+            or ext in text_extensions
+        )
 
     async def _on_invite(self, room: Any, event: Any) -> None:
         """Handle room invites — auto-join."""
