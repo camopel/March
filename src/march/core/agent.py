@@ -886,6 +886,17 @@ class Agent:
                     },
                 )
 
+                # Yield tool progress for real-time frontend updates
+                yield StreamChunk(
+                    delta="",
+                    tool_progress={
+                        "name": core_tool_call.name,
+                        "status": "complete" if not result.is_error else "error",
+                        "summary": result.summary[:200] if hasattr(result, 'summary') else "",
+                        "duration_ms": _tool_dur,
+                    },
+                )
+
             # Add to messages for next LLM call
             assistant_msg = {
                 "role": "assistant",

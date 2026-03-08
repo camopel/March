@@ -238,6 +238,7 @@ class StreamChunk:
     delta_text: str = ""  # Alias — providers can use either
     tool_call_delta: dict[str, Any] | None = None
     delta_tool_call: DeltaToolCall | None = None  # Structured form used by providers
+    tool_progress: dict[str, Any] | None = None  # Tool execution progress info
     usage: LLMUsage | None = None
     is_final: bool = False
     finish_reason: str | None = None

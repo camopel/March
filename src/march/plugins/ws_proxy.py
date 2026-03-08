@@ -938,6 +938,19 @@ class WSProxyPlugin(Plugin):
             return
 
         if conn.busy:
+            # Check for stop/interrupt commands
+            if content.lower().strip() in _WSConn.STOP_COMMANDS:
+                logger.info("stop command received",
+                            session_id=conn.session_id,
+                            command=content.strip())
+                # Signal cancellation to the running stream
+                conn.cancel_event.set()
+                # Clear any queued messages — user wants to stop everything
+                conn.pending.clear()
+                # Notify the client immediately
+                await _try_send(conn.ws, {"type": "stream.cancelled"})
+                return
+
             if len(conn.pending) >= self._max_queue_size:
                 logger.warning("message queue full",
                                session_id=conn.session_id,
@@ -1194,6 +1207,7 @@ class WSProxyPlugin(Plugin):
     async def _run_agent(self, conn: "_WSConn", content: str | list) -> None:
         """Run the agent on a message, then drain any queued messages."""
         conn.busy = True
+        conn.cancel_event.clear()  # Reset cancellation flag for new run
         _agent_t0 = time.monotonic()
         try:
             await self._stream_response(conn, content)
@@ -1284,10 +1298,22 @@ class WSProxyPlugin(Plugin):
         tool_calls_collected: list[dict] = []
         final_response = None
 
+        cancelled = False
+
         try:
             from march.core.agent import AgentResponse
 
             async for item in self._agent.run_stream(content, session):
+                # ── Check for cancellation ────────────────────────────
+                if conn.cancel_event.is_set():
+                    cancelled = True
+                    stream_log.info(
+                        "stream cancelled by user",
+                        session_id=conn.session_id,
+                        collected_chars=len(collected),
+                    )
+                    break
+
                 if isinstance(item, AgentResponse):
                     final_response = item
                     break
@@ -1306,6 +1332,16 @@ class WSProxyPlugin(Plugin):
                             "name": name,
                             "args": td.get("args", {}),
                         })
+
+                if hasattr(item, "tool_progress") and item.tool_progress:
+                    tp = item.tool_progress
+                    await try_send({
+                        "type": "tool.progress",
+                        "name": tp.get("name", ""),
+                        "status": tp.get("status", ""),
+                        "summary": tp.get("summary", ""),
+                        "duration_ms": tp.get("duration_ms", 0),
+                    })
 
                 if hasattr(item, "delta_tool_call") and item.delta_tool_call:
                     dtc = item.delta_tool_call
@@ -1349,6 +1385,33 @@ class WSProxyPlugin(Plugin):
                     await self._db.save_message(
                         conn.session_id, "assistant", error_content, tool_calls_collected,
                     )
+            return
+
+        # ── Handle cancellation: save partial content and end gracefully ──
+        if cancelled:
+            buf.streaming = False
+            buf.done = True
+            buf.collected = collected
+            # Save whatever was collected so far
+            if collected or tool_calls_collected:
+                cancel_content = collected
+                if cancel_content:
+                    cancel_content += "\n\n⏹ _Response stopped by user_"
+                if buf.last_draft_save_chunks > 0:
+                    await self._db.finalize_draft(
+                        buf.draft_id, cancel_content, tool_calls_collected
+                    )
+                else:
+                    await self._db.save_message(
+                        conn.session_id, "assistant", cancel_content, tool_calls_collected,
+                    )
+            # Send stream.end so the frontend knows the stream is over
+            await try_send({"type": "stream.end", "cancelled": True})
+            stream_log.info(
+                "stream cancelled — partial content saved",
+                session_id=conn.session_id,
+                collected_chars=len(collected),
+            )
             return
 
         end_msg: dict[str, Any] = {"type": "stream.end"}
@@ -1507,11 +1570,15 @@ class WSProxyPlugin(Plugin):
 class _WSConn:
     """A single WebSocket connection."""
 
+    # Commands that trigger cancellation of the current agent run.
+    STOP_COMMANDS = frozenset({"stop", "停止", "/stop"})
+
     def __init__(self, ws: Any, session_id: str) -> None:
         self.ws = ws
         self.session_id = session_id
         self.busy: bool = False
         self.pending: list[Any] = []
+        self.cancel_event: asyncio.Event = asyncio.Event()
 
 
 class _StreamBuffer:
