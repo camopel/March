@@ -60,9 +60,7 @@ class LLMConfig(BaseModel):
 class ExecToolConfig(BaseModel):
     """Exec tool configuration."""
 
-    sandbox: bool = True
     timeout: int = 30
-    pty: bool = False
 
 
 class WebSearchToolConfig(BaseModel):
@@ -71,12 +69,6 @@ class WebSearchToolConfig(BaseModel):
     engine: str = "ddgs"
     max_results: int = 10
     backends: list[str] = Field(default_factory=lambda: ["google"])
-
-
-class BrowserToolConfig(BaseModel):
-    """Browser tool configuration."""
-
-    backend: str = "playwright"
 
 
 class VoiceToTextToolConfig(BaseModel):
@@ -104,22 +96,8 @@ class MCPServerConfig(BaseModel):
 class ToolsConfig(BaseModel):
     """Tool system configuration."""
 
-    builtin: list[str] = Field(
-        default_factory=lambda: [
-            "read", "write", "edit", "apply_patch", "exec", "process",
-            "web_search", "web_fetch",
-            "pdf", "browser", "screenshot",
-            "clipboard", "message", "diff", "glob",
-            "voice_to_text", "tts", "translate",
-            "sessions_list", "sessions_history", "sessions_send",
-            "sessions_spawn", "subagents", "session_status",
-        ]
-    )
-    deny: list[str] = Field(default_factory=list)
-    default_profile: str = "full"
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     web_search: WebSearchToolConfig = Field(default_factory=WebSearchToolConfig)
-    browser: BrowserToolConfig = Field(default_factory=BrowserToolConfig)
     voice_to_text: VoiceToTextToolConfig = Field(default_factory=VoiceToTextToolConfig)
     tts: TTSToolConfig = Field(default_factory=TTSToolConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
@@ -132,12 +110,6 @@ class SessionMemoryConfig(BaseModel):
     """Session memory configuration."""
 
     auto_save: bool = True
-
-
-class GlobalMemoryConfig(BaseModel):
-    """Global memory configuration — written only on /rmb command."""
-
-    pass
 
 
 class CompactionConfig(BaseModel):
@@ -159,8 +131,8 @@ class MemoryConfig(BaseModel):
     system_rules: str = "SYSTEM.md"
     agent_profile: str = "AGENT.md"
     tool_rules: str = "TOOLS.md"
+    memory_path: str = "MEMORY.md"
     session: SessionMemoryConfig = Field(default_factory=SessionMemoryConfig)
-    global_memory: GlobalMemoryConfig = Field(default_factory=GlobalMemoryConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
 
@@ -249,17 +221,9 @@ class SubagentConfig(BaseModel):
     announce_timeout_seconds: int = 60
 
 
-class AgentIdentityConfig(BaseModel):
-    """Agent identity configuration."""
-
-    name: str = "march"
-    version: str = "0.1.0"
-
-
 class AgentsConfig(BaseModel):
     """Agent manager configuration."""
 
-    identity: AgentIdentityConfig = Field(default_factory=AgentIdentityConfig)
     max_concurrent: int = 4
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
 
@@ -272,16 +236,6 @@ class DashboardConfig(BaseModel):
 
     enabled: bool = True
     port: str = "auto"
-    open_browser: bool = False
-
-
-# ─── i18n Config ───
-
-
-class I18nConfig(BaseModel):
-    """Internationalization configuration."""
-
-    locale: str = "auto"
 
 
 # ─── Root Config ───
@@ -294,7 +248,6 @@ class MarchConfig(BaseModel):
     ~/.march/config.yaml and validated at startup.
     """
 
-    agent: AgentIdentityConfig = Field(default_factory=AgentIdentityConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
@@ -302,6 +255,5 @@ class MarchConfig(BaseModel):
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
-    i18n: I18nConfig = Field(default_factory=I18nConfig)
 
     model_config = {"extra": "ignore"}

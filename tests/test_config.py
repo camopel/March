@@ -19,12 +19,10 @@ from march.config.loader import (
     ConfigNotFoundError,
 )
 from march.config.schema import (
-    AgentIdentityConfig,
     AgentsConfig,
     ChannelsConfig,
     CompactionConfig,
     DashboardConfig,
-    I18nConfig,
     LLMConfig,
     LLMProviderConfig,
     MarchConfig,
@@ -70,8 +68,6 @@ def minimal_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         textwrap.dedent("""\
-            agent:
-              name: "test-agent"
             llm:
               default: ""
         """),
@@ -89,9 +85,7 @@ class TestSchemaDefaults:
     def test_march_config_defaults(self):
         """MarchConfig with no input should produce valid defaults."""
         config = MarchConfig()
-        assert config.agent.name == "march"
         assert config.llm.default == ""
-        assert config.i18n.locale == "auto"
 
     def test_llm_config_defaults(self):
         config = LLMConfig()
@@ -107,12 +101,6 @@ class TestSchemaDefaults:
 
     def test_tools_config_defaults(self):
         config = ToolsConfig()
-        assert "read" in config.builtin
-        assert "write" in config.builtin
-        assert "exec" in config.builtin
-        assert config.deny == []
-        assert config.default_profile == "full"
-        assert config.exec.sandbox is True
         assert config.exec.timeout == 30
 
     def test_memory_config_defaults(self):
@@ -120,6 +108,7 @@ class TestSchemaDefaults:
         assert config.system_rules == "SYSTEM.md"
         assert config.agent_profile == "AGENT.md"
         assert config.tool_rules == "TOOLS.md"
+        assert config.memory_path == "MEMORY.md"
 
     def test_compaction_config_defaults(self):
         config = CompactionConfig()
@@ -186,11 +175,6 @@ class TestSchemaDefaults:
         config = DashboardConfig()
         assert config.enabled is True
         assert config.port == "auto"
-        assert config.open_browser is False
-
-    def test_i18n_config_defaults(self):
-        config = I18nConfig()
-        assert config.locale == "auto"
 
 
 class TestSchemaValidation:
@@ -205,7 +189,7 @@ class TestSchemaValidation:
     def test_extra_fields_ignored(self):
         """MarchConfig ignores extra fields at root."""
         config = MarchConfig(unknown_field="value")  # type: ignore[call-arg]
-        assert config.agent.name == "march"
+        assert config.llm.default == ""
 
     def test_full_config_from_yaml(self):
         """Parse a full YAML config and validate."""
@@ -219,7 +203,6 @@ class TestSchemaValidation:
         )
         config = MarchConfig.model_validate(raw)
         assert config.llm.default == "openai"
-        assert len(config.tools.builtin) > 20
 
 
 # ─── Interpolation Tests ───
@@ -319,15 +302,12 @@ class TestLoader:
     def test_load_config_full_defaults(self, tmp_config: Path):
         config = load_config(tmp_config, use_cache=False)
         assert isinstance(config, MarchConfig)
-        assert config.agent.name == "march"
         assert config.llm.default == "openai"
         assert config.channels.terminal.enabled is True
 
     def test_load_config_minimal(self, minimal_config: Path):
         config = load_config(minimal_config, use_cache=False)
-        assert config.agent.name == "test-agent"
         assert config.llm.default == ""
-        # Everything else should be defaults
 
     def test_load_config_caching(self, tmp_config: Path):
         config1 = load_config(tmp_config, use_cache=True)
@@ -338,7 +318,7 @@ class TestLoader:
         config1 = load_config(tmp_config, use_cache=False)
         config2 = load_config(tmp_config, use_cache=False)
         assert config1 is not config2
-        assert config1.agent.name == config2.agent.name
+        assert config1.llm.default == config2.llm.default
 
     def test_load_config_with_env_interpolation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("MY_MODEL", "gpt-4o")
@@ -400,18 +380,16 @@ class TestConfigRoundTrip:
     def test_default_yaml_is_valid(self):
         """An empty config should produce valid MarchConfig via defaults."""
         config = MarchConfig()
-        assert config.agent.name == "march"
+        assert config.llm.default == ""
 
     def test_config_serialization_roundtrip(self):
         """Config should survive dump→load cycle."""
         config = MarchConfig()
         dumped = config.model_dump()
         restored = MarchConfig.model_validate(dumped)
-        assert restored.agent.name == config.agent.name
         assert restored.llm.default == config.llm.default
 
     def test_all_tool_names_present(self):
-        """Verify all expected tools are in the default builtin list."""
+        """Verify exec timeout is configurable."""
         config = ToolsConfig()
-        expected = {"read", "write", "edit", "exec", "web_search", "web_fetch", "browser"}
-        assert expected.issubset(set(config.builtin))
+        assert config.exec.timeout == 30

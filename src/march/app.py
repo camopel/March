@@ -81,6 +81,7 @@ class MarchApp:
             system_rules_path=self.config.memory.system_rules,
             agent_profile_path=self.config.memory.agent_profile,
             tool_rules_path=self.config.memory.tool_rules,
+            memory_path=self.config.memory.memory_path,
         )
         # NOTE: SessionStore is the single persistence layer for ALL channels
         self.session_store: SessionStore | None = None
