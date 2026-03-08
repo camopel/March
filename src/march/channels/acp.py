@@ -3,6 +3,10 @@
 Implements the official ACP spec (https://agentclientprotocol.com).
 JSON-RPC 2.0 over stdio with newline-delimited framing.
 
+This channel is a **pure I/O adapter**: it translates between the ACP wire
+protocol and the Orchestrator layer.  It does NOT touch the Agent or
+SessionStore directly.
+
 Flow:
   1. Client → Agent: initialize (version + capabilities)
   2. Client → Agent: session/new
@@ -21,11 +25,18 @@ import uuid
 from typing import Any, AsyncIterator, TYPE_CHECKING
 
 from march.channels.base import Channel
-from march.core.session import Session
+from march.core.orchestrator import (
+    Cancelled,
+    Error,
+    FinalResponse,
+    Orchestrator,
+    TextDelta,
+    ToolProgress,
+)
 from march.logging import get_logger
 
 if TYPE_CHECKING:
-    from march.core.agent import Agent, AgentResponse
+    from march.core.agent import Agent
     from march.llm.base import StreamChunk
 
 logger = get_logger("march.acp")
@@ -40,23 +51,35 @@ class ACPChannel(Channel):
 
     Designed for IDE integration (IntelliJ, Zed, VS Code).
     The IDE spawns `march start --channel acp` and communicates via stdin/stdout.
+
+    This channel is a pure I/O adapter.  All session management, agent
+    execution, and message persistence are delegated to the Orchestrator.
     """
 
     name: str = "acp"
 
     def __init__(self) -> None:
-        self._agent: Agent | None = None
-        self._session_store: Any = None
-        self._sessions: dict[str, Session] = {}
+        self._orchestrator: Orchestrator | None = None
         self._running = False
         self._initialized = False
         self._client_capabilities: dict[str, Any] = {}
-        self._current_task: asyncio.Task | None = None
+        # Per-session cancel events — keyed by session ID
+        self._cancel_events: dict[str, asyncio.Event] = {}
+        # Per-session prompt tasks — for cancellation via asyncio.Task.cancel()
+        self._prompt_tasks: dict[str, asyncio.Task] = {}
 
     async def start(self, agent: "Agent", **kwargs: Any) -> None:
-        """Start the ACP channel, reading newline-delimited JSON from stdin."""
-        self._agent = agent
-        self._session_store = kwargs.get("session_store")
+        """Start the ACP channel, reading newline-delimited JSON from stdin.
+
+        The ``orchestrator`` keyword argument is **required**.  The channel
+        does not interact with the Agent or SessionStore directly.
+        """
+        orchestrator = kwargs.get("orchestrator")
+        if orchestrator is None:
+            raise ValueError(
+                "ACPChannel requires an 'orchestrator' keyword argument"
+            )
+        self._orchestrator = orchestrator
         self._running = True
 
         # ACP uses stdout for JSON-RPC — redirect all logging to stderr
@@ -95,8 +118,12 @@ class ACPChannel(Channel):
     async def stop(self) -> None:
         """Stop the ACP channel."""
         self._running = False
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
+        # Cancel all in-flight prompt tasks
+        for task in self._prompt_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._prompt_tasks.clear()
+        self._cancel_events.clear()
 
     async def send(self, content: str, **kwargs: Any) -> None:
         """Send a complete response (used by agent internals)."""
@@ -147,34 +174,6 @@ class ACPChannel(Channel):
             "params": {"sessionId": session_id, "update": update},
         })
 
-    async def _request_permission(
-        self, session_id: str, tool_name: str, args: dict[str, Any]
-    ) -> str:
-        """Request tool permission from the client. Returns outcome."""
-        request_id = str(uuid.uuid4())
-        self._write({
-            "jsonrpc": JSONRPC,
-            "id": request_id,
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": session_id,
-                "permissions": [{
-                    "id": str(uuid.uuid4()),
-                    "type": "tool_call",
-                    "toolName": tool_name,
-                    "args": args,
-                    "options": [
-                        {"id": "allow-once", "label": "Allow Once"},
-                        {"id": "allow-always", "label": "Allow Always"},
-                        {"id": "reject-once", "label": "Reject"},
-                    ],
-                }],
-            },
-        })
-        # In a real implementation, we'd wait for the client's response.
-        # For now, auto-approve (the agent's safety plugin handles blocking).
-        return "allow-once"
-
     # ── Message Routing ──────────────────────────────────────────────────
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
@@ -192,7 +191,7 @@ class ACPChannel(Channel):
         handlers = {
             "initialize": self._handle_initialize,
             "session/new": self._handle_session_new,
-            "session/load": self._handle_session_load,
+            "session/destroy": self._handle_session_destroy,
             "session/prompt": self._handle_session_prompt,
             "session/set_mode": self._handle_set_mode,
             "shutdown": self._handle_shutdown,
@@ -211,7 +210,9 @@ class ACPChannel(Channel):
 
     # ── Handlers ─────────────────────────────────────────────────────────
 
-    async def _handle_initialize(self, request_id: Any, params: dict[str, Any]) -> None:
+    async def _handle_initialize(
+        self, request_id: Any, params: dict[str, Any]
+    ) -> None:
         """Initialize — negotiate version and capabilities."""
         self._client_capabilities = params.get("clientCapabilities", {})
         client_info = params.get("clientInfo", {})
@@ -244,44 +245,72 @@ class ACPChannel(Channel):
             "authMethods": [],
         })
 
-    async def _handle_session_new(self, request_id: Any, params: dict[str, Any]) -> None:
-        """Create a new session."""
+    async def _handle_session_new(
+        self, request_id: Any, params: dict[str, Any]
+    ) -> None:
+        """Create a new session via the Orchestrator."""
+        assert self._orchestrator is not None
+
         if not self._initialized:
             self._send_error(request_id, -32002, "Not initialized")
             return
 
         workspace = params.get("workspacePath", "")
 
-        # Use session store for persistence if available
-        if self._session_store and workspace:
-            session = await self._session_store.get_or_create_session(
-                "acp", workspace, name=f"ACP: {workspace}"
-            )
-        else:
-            session = Session(source_type="acp", source_id=workspace)
+        # Build a deterministic session ID from the workspace path so
+        # reconnecting to the same workspace resumes the same session.
+        from march.core.session import deterministic_session_id
 
-        self._sessions[session.id] = session
+        session_id = deterministic_session_id("acp", workspace or str(uuid.uuid4()))
 
-        logger.info("acp session created: %s workspace=%s", session.id, workspace)
-        self._send_response(request_id, {"sessionId": session.id})
+        # Warm the Orchestrator's session cache by issuing a no-op peek.
+        # The Orchestrator will lazily create the session on the first
+        # handle_message() call, so we just need to track the ID here.
+        logger.info("acp session created: %s workspace=%s", session_id, workspace)
+        self._send_response(request_id, {"sessionId": session_id})
 
-    async def _handle_session_load(self, request_id: Any, params: dict[str, Any]) -> None:
-        """Load an existing session (not supported yet)."""
-        self._send_error(request_id, -32601, "session/load not supported")
-
-    async def _handle_session_prompt(self, request_id: Any, params: dict[str, Any]) -> None:
-        """Handle a user prompt — run the agent and stream updates."""
-        assert self._agent is not None
+    async def _handle_session_destroy(
+        self, request_id: Any, params: dict[str, Any]
+    ) -> None:
+        """Destroy a session — reset via Orchestrator."""
+        assert self._orchestrator is not None
 
         session_id = params.get("sessionId", "")
-        session = self._sessions.get(session_id)
-        if not session:
-            self._send_error(request_id, -32602, f"Unknown session: {session_id}")
+        if not session_id:
+            self._send_error(request_id, -32602, "Missing sessionId")
             return
 
-        # Extract text from content blocks
+        # Cancel any in-flight prompt for this session
+        self._signal_cancel(session_id)
+
+        try:
+            await self._orchestrator.reset_session(session_id)
+        except Exception as e:
+            logger.error("session destroy failed: %s", e)
+            self._send_error(request_id, -32000, str(e))
+            return
+
+        # Clean up local cancel state
+        self._cancel_events.pop(session_id, None)
+        self._prompt_tasks.pop(session_id, None)
+
+        logger.info("acp session destroyed: %s", session_id[:8])
+        self._send_response(request_id, {})
+
+    async def _handle_session_prompt(
+        self, request_id: Any, params: dict[str, Any]
+    ) -> None:
+        """Handle a user prompt — delegate to Orchestrator and stream events."""
+        assert self._orchestrator is not None
+
+        session_id = params.get("sessionId", "")
+        if not session_id:
+            self._send_error(request_id, -32602, "Missing sessionId")
+            return
+
+        # Extract text from ACP content blocks
         content_blocks = params.get("content", [])
-        text_parts = []
+        text_parts: list[str] = []
         for block in content_blocks:
             if isinstance(block, dict):
                 if block.get("type") == "text":
@@ -301,64 +330,82 @@ class ACPChannel(Channel):
 
         logger.info("acp prompt: session=%s len=%d", session_id[:8], len(text))
 
-        # Run agent with streaming
-        try:
-            final_response = None
-            async for item in self._agent.run_stream(text, session):
-                if hasattr(item, "content") and hasattr(item, "total_tokens"):
-                    # This is the final AgentResponse
-                    final_response = item
-                    break
+        # Create a fresh cancel event for this turn
+        cancel_event = asyncio.Event()
+        self._cancel_events[session_id] = cancel_event
 
-                # StreamChunk — send delta as session/update
-                if hasattr(item, "delta") and item.delta:
+        # Run the prompt in a task so session/cancel can interrupt it
+        task = asyncio.create_task(
+            self._run_prompt(request_id, session_id, text, cancel_event)
+        )
+        self._prompt_tasks[session_id] = task
+
+    async def _run_prompt(
+        self,
+        request_id: Any,
+        session_id: str,
+        text: str,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        """Stream OrchestratorEvents and translate them to ACP wire messages."""
+        assert self._orchestrator is not None
+
+        try:
+            async for event in self._orchestrator.handle_message(
+                session_id=session_id,
+                content=text,
+                source="acp",
+                cancel_event=cancel_event,
+            ):
+                if isinstance(event, TextDelta):
                     await self._send_update(session_id, {
                         "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": item.delta},
+                        "content": {"type": "text", "text": event.delta},
                     })
 
-                # Tool call notifications
-                if hasattr(item, "tool_call_delta") and item.tool_call_delta:
-                    tool_info = item.tool_call_delta
+                elif isinstance(event, ToolProgress):
                     await self._send_update(session_id, {
                         "sessionUpdate": "tool_call",
-                        "toolName": tool_info.get("name", ""),
-                        "status": tool_info.get("status", ""),
+                        "toolName": event.name,
+                        "status": event.status,
+                        "summary": event.summary,
+                        "durationMs": event.duration_ms,
                     })
 
-            # Send final response
-            if final_response:
-                # Persist messages to DB
-                if self._session_store:
-                    try:
-                        from march.core.message import Message
-                        await self._session_store.add_message(
-                            session_id, Message.user(text)
-                        )
-                        await self._session_store.add_message(
-                            session_id, Message.assistant(final_response.content)
-                        )
-                    except Exception as e:
-                        logger.error("acp persist failed: %s", e)
+                elif isinstance(event, FinalResponse):
+                    self._send_response(request_id, {
+                        "stopReason": "endTurn",
+                        "_meta": {
+                            "totalTokens": event.total_tokens,
+                            "totalCost": event.total_cost,
+                            "toolCallsMade": event.tool_calls_made,
+                        },
+                    })
+                    return
 
-                self._send_response(request_id, {
-                    "stopReason": "endTurn",
-                    "_meta": {
-                        "totalTokens": final_response.total_tokens,
-                        "totalCost": final_response.total_cost,
-                        "toolCallsMade": final_response.tool_calls_made,
-                    },
-                })
-            else:
-                self._send_response(request_id, {"stopReason": "endTurn"})
+                elif isinstance(event, Cancelled):
+                    self._send_response(request_id, {
+                        "stopReason": "cancelled",
+                    })
+                    return
+
+                elif isinstance(event, Error):
+                    self._send_error(request_id, -32000, event.message)
+                    return
 
         except asyncio.CancelledError:
             self._send_response(request_id, {"stopReason": "cancelled"})
         except Exception as e:
-            logger.error("acp prompt error: %s", e)
+            logger.error("acp prompt error: %s", e, exc_info=True)
             self._send_error(request_id, -32000, str(e))
+        finally:
+            # Clean up task tracking
+            self._prompt_tasks.pop(session_id, None)
+            self._cancel_events.pop(session_id, None)
 
-    async def _handle_set_mode(self, request_id: Any, params: dict[str, Any]) -> None:
+    async def _handle_set_mode(
+        self, request_id: Any, params: dict[str, Any]
+    ) -> None:
         """Set session mode (agent/plan/ask)."""
         mode = params.get("mode", "agent")
         logger.info("acp mode set: %s", mode)
@@ -367,11 +414,26 @@ class ACPChannel(Channel):
     def _handle_cancel(self, params: dict[str, Any]) -> None:
         """Cancel ongoing operation (notification — no response)."""
         session_id = params.get("sessionId", "")
-        logger.info("acp cancel: session=%s", session_id[:8] if session_id else "?")
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
+        logger.info(
+            "acp cancel: session=%s", session_id[:8] if session_id else "?"
+        )
+        self._signal_cancel(session_id)
 
-    async def _handle_shutdown(self, request_id: Any, params: dict[str, Any]) -> None:
+    def _signal_cancel(self, session_id: str) -> None:
+        """Signal cancellation for a session's in-flight prompt."""
+        # Set the cooperative cancel event (Orchestrator checks this)
+        cancel_event = self._cancel_events.get(session_id)
+        if cancel_event is not None:
+            cancel_event.set()
+
+        # Also cancel the asyncio task as a fallback
+        task = self._prompt_tasks.get(session_id)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _handle_shutdown(
+        self, request_id: Any, params: dict[str, Any]
+    ) -> None:
         """Shutdown — clean disconnect."""
         logger.info("acp shutdown")
         self._running = False
@@ -383,9 +445,9 @@ def _redirect_logging_to_stderr() -> None:
     import logging
 
     # Redirect all stdlib logging handlers from stdout to stderr
-    for name in list(logging.Logger.manager.loggerDict) + ['']:
+    for name in list(logging.Logger.manager.loggerDict) + [""]:
         lgr = logging.getLogger(name)
-        for handler in getattr(lgr, 'handlers', []):
+        for handler in getattr(lgr, "handlers", []):
             if isinstance(handler, logging.StreamHandler):
                 if handler.stream is sys.stdout:
                     handler.stream = sys.stderr
@@ -395,6 +457,7 @@ def _redirect_logging_to_stderr() -> None:
     # directly, reconfigure to use stderr.
     try:
         import structlog
+
         cfg = structlog.get_config()
         factory = cfg.get("logger_factory")
         # Only reconfigure if NOT using stdlib (stdlib is already redirected above)

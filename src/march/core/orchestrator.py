@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Union
 
 from march.core.agent import Agent, AgentResponse, _extract_text
 from march.core.message import Message, Role, ToolCall, ToolResult
 from march.core.session import Session, SessionStore
+from march.core.turn_log import TurnLogger
 from march.llm.base import StreamChunk
 from march.logging import get_logger
 
@@ -106,6 +108,8 @@ class Orchestrator:
         self.session_store = session_store
         # In-memory session cache — avoids DB round-trips on every turn.
         self._sessions: dict[str, Session] = {}
+        # Structured JSONL turn logger for debugging.
+        self._turn_log = TurnLogger()
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -135,14 +139,21 @@ class Orchestrator:
               or ``Cancelled``.
         """
         cancel = cancel_event or asyncio.Event()
+        turn_id = uuid.uuid4().hex
+        turn_start_time = time.monotonic()
 
         # 1. Resolve session (cache hit or cold-start from DB)
         try:
             session = await self._get_or_create_session(session_id, source)
         except Exception as exc:
             logger.error("session load failed", session_id=session_id, error=str(exc))
+            self._turn_log.turn_error(turn_id=turn_id, session_id=session_id, error=f"session load failed: {exc}")
             yield Error(message=f"Failed to load session: {exc}")
             return
+
+        # Log turn start
+        user_text = _extract_text(content) if not isinstance(content, str) else content
+        self._turn_log.turn_start(turn_id=turn_id, session_id=session_id, user_msg=user_text, source=source)
 
         # 2. Persist the user message to DB
         try:
@@ -157,15 +168,21 @@ class Orchestrator:
 
         # 3. Check for early cancellation
         if cancel.is_set():
+            self._turn_log.turn_cancelled(turn_id=turn_id, session_id=session_id, partial_content_length=0)
             yield Cancelled(partial_content="")
             return
 
         # 4. Delegate to Agent.run_stream() and translate events
         partial_content = ""
+        _llm_call_count = 0
         try:
             async for item in self.agent.run_stream(content, session):
                 # ── Cancel checkpoint ────────────────────────────────
                 if cancel.is_set():
+                    self._turn_log.turn_cancelled(
+                        turn_id=turn_id, session_id=session_id,
+                        partial_content_length=len(partial_content),
+                    )
                     yield Cancelled(partial_content=partial_content)
                     return
 
@@ -175,9 +192,32 @@ class Orchestrator:
                         partial_content += item.delta
                         yield TextDelta(delta=item.delta)
 
+                    # LLM usage data (emitted on final chunk of each LLM call)
+                    if item.usage and (item.usage.input_tokens or item.usage.output_tokens):
+                        _llm_call_count += 1
+                        self._turn_log.llm_call(
+                            turn_id=turn_id,
+                            session_id=session_id,
+                            provider="",
+                            model="",
+                            input_tokens=item.usage.input_tokens,
+                            output_tokens=item.usage.output_tokens,
+                            cost=item.usage.cost,
+                            duration_ms=0.0,
+                        )
+
                     # Tool progress embedded in StreamChunk
                     if item.tool_progress:
                         tp = item.tool_progress
+                        self._turn_log.tool_call(
+                            turn_id=turn_id,
+                            session_id=session_id,
+                            name=tp.get("name", ""),
+                            args={},
+                            duration_ms=tp.get("duration_ms", 0.0),
+                            status=tp.get("status", ""),
+                            summary=tp.get("summary", ""),
+                        )
                         yield ToolProgress(
                             name=tp.get("name", ""),
                             status=tp.get("status", ""),
@@ -198,6 +238,17 @@ class Orchestrator:
                             error=str(exc),
                         )
 
+                    turn_duration = (time.monotonic() - turn_start_time) * 1000
+                    self._turn_log.turn_complete(
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        tool_calls=item.tool_calls_made,
+                        total_tokens=item.total_tokens,
+                        total_cost=item.total_cost,
+                        duration_ms=turn_duration,
+                        final_reply_length=len(item.content),
+                    )
+
                     yield FinalResponse(
                         content=item.content,
                         tool_calls_made=item.tool_calls_made,
@@ -208,6 +259,10 @@ class Orchestrator:
                     return
 
         except asyncio.CancelledError:
+            self._turn_log.turn_cancelled(
+                turn_id=turn_id, session_id=session_id,
+                partial_content_length=len(partial_content),
+            )
             yield Cancelled(partial_content=partial_content)
             return
         except Exception as exc:
@@ -217,12 +272,17 @@ class Orchestrator:
                 error=str(exc),
                 exc_info=True,
             )
+            self._turn_log.turn_error(turn_id=turn_id, session_id=session_id, error=str(exc))
             yield Error(message=str(exc))
             return
 
         # If we exit the loop without yielding a terminal event (shouldn't
         # happen in normal flow), emit an error so the channel isn't left
         # hanging.
+        self._turn_log.turn_error(
+            turn_id=turn_id, session_id=session_id,
+            error="Agent stream ended without a final response.",
+        )
         yield Error(message="Agent stream ended without a final response.")
 
     async def reset_session(self, session_id: str) -> None:

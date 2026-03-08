@@ -1,7 +1,16 @@
-"""Matrix channel for March.
+"""Matrix channel for March — pure I/O adapter.
 
 Bot joins Matrix rooms, sends/receives messages. One room = one session.
 Uses matrix-nio for Matrix client functionality.
+
+This channel is a thin I/O adapter: all session management, agent calls,
+and message persistence are delegated to the Orchestrator. The channel
+only handles:
+  - Matrix nio client setup, login, sync_forever
+  - Converting Matrix events → Orchestrator.handle_message()
+  - Converting OrchestratorEvents → Matrix messages
+  - E2EE setup and key management
+  - Read receipts and typing indicators
 
 Auto-setup: detect homeserver, create user, persist credentials.
 E2EE support is optional and config-driven.
@@ -18,11 +27,11 @@ from pathlib import Path
 from typing import Any, AsyncIterator, TYPE_CHECKING
 
 from march.channels.base import Channel
-from march.core.session import Session
 from march.logging import get_logger
 
 if TYPE_CHECKING:
-    from march.core.agent import Agent, AgentResponse
+    from march.core.agent import Agent
+    from march.core.orchestrator import Orchestrator
     from march.llm.base import StreamChunk
 
 logger = get_logger("march.matrix")
@@ -35,6 +44,9 @@ class MatrixChannel(Channel):
 
     Each room March is in = one session. Messages in room A don't mix
     with room B. Each room has its own conversation history.
+
+    The channel delegates all agent interaction to an Orchestrator instance.
+    It only handles Matrix I/O: connecting, sending, receiving, E2EE.
     """
 
     name: str = "matrix"
@@ -49,6 +61,7 @@ class MatrixChannel(Channel):
         e2ee: bool = False,
         auto_setup: bool = True,
         display_name: str = "March",
+        orchestrator: "Orchestrator | None" = None,
     ) -> None:
         self.homeserver = homeserver
         self.user_id = user_id
@@ -60,14 +73,30 @@ class MatrixChannel(Channel):
         self.display_name = display_name
 
         self._agent: Agent | None = None
+        self._orchestrator: Orchestrator | None = orchestrator
         self._client: Any = None  # nio.AsyncClient
-        self._sessions: dict[str, Session] = {}  # room_id → session
         self._running = False
         self._start_ts: int = 0  # server_timestamp threshold — ignore events before this
+
+        # Per-room cancel events — set to signal the current turn should stop
+        self._cancel_events: dict[str, asyncio.Event] = {}
 
     async def start(self, agent: "Agent", **kwargs: Any) -> None:
         """Start the Matrix client, join rooms, and begin listening."""
         self._agent = agent
+
+        # Resolve orchestrator: explicit > kwarg > build from agent
+        if self._orchestrator is None:
+            self._orchestrator = kwargs.get("orchestrator")
+        if self._orchestrator is None:
+            # Build an Orchestrator from the agent (agent must have session_store)
+            from march.core.orchestrator import Orchestrator
+            if not hasattr(agent, "session_store") or agent.session_store is None:
+                logger.error("matrix: agent has no session_store — cannot create Orchestrator")
+                return
+            self._orchestrator = Orchestrator(agent, agent.session_store)
+            logger.info("matrix: created Orchestrator from agent")
+
         self._running = True
 
         try:
@@ -284,16 +313,106 @@ class MatrixChannel(Channel):
         if collected:
             await self.send(collected, room_id=room_id)
 
+    # ── Cancel support ───────────────────────────────────────────────────
+
+    def _get_cancel_event(self, room_id: str) -> asyncio.Event:
+        """Get or create a cancel event for a room."""
+        if room_id not in self._cancel_events:
+            self._cancel_events[room_id] = asyncio.Event()
+        return self._cancel_events[room_id]
+
+    def _reset_cancel_event(self, room_id: str) -> asyncio.Event:
+        """Create a fresh (unset) cancel event for a room, replacing any old one."""
+        self._cancel_events[room_id] = asyncio.Event()
+        return self._cancel_events[room_id]
+
+    # ── Orchestrator event processing ────────────────────────────────────
+
+    async def _process_orchestrator_events(
+        self,
+        room_id: str,
+        content: str | list,
+        session_id: str,
+    ) -> None:
+        """Send content to the Orchestrator and convert events to Matrix messages.
+
+        Collects all TextDelta events into a single message (Matrix doesn't
+        stream). Sends typing indicators while processing. Handles cancel,
+        error, and final response events.
+        """
+        from march.core.orchestrator import (
+            TextDelta, ToolProgress, FinalResponse, Error, Cancelled,
+        )
+
+        cancel_event = self._reset_cancel_event(room_id)
+
+        try:
+            collected = ""
+            async for event in self._orchestrator.handle_message(
+                session_id=session_id,
+                content=content,
+                source="matrix",
+                cancel_event=cancel_event,
+            ):
+                if isinstance(event, TextDelta):
+                    collected += event.delta
+
+                elif isinstance(event, ToolProgress):
+                    logger.debug(
+                        "matrix: tool %s %s in %s",
+                        event.name, event.status, room_id,
+                    )
+
+                elif isinstance(event, FinalResponse):
+                    if event.content:
+                        await self.send(event.content, room_id=room_id)
+                    return
+
+                elif isinstance(event, Cancelled):
+                    # Send whatever partial content we have
+                    text = event.partial_content or collected
+                    if text:
+                        await self.send(text + "\n\n⚠️ _Cancelled_", room_id=room_id)
+                    else:
+                        await self.send("⚠️ Cancelled", room_id=room_id)
+                    return
+
+                elif isinstance(event, Error):
+                    await self.send(f"Error: {event.message}", room_id=room_id)
+                    return
+
+            # If we exit the loop without a terminal event, send collected text
+            if collected:
+                await self.send(collected, room_id=room_id)
+
+        except Exception as e:
+            logger.error("matrix: error processing in %s: %s", room_id, e)
+            await self.send(f"Error: {e}", room_id=room_id)
+        finally:
+            # Clear typing indicator
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
+
+    # ── Session ID helper ────────────────────────────────────────────────
+
+    @staticmethod
+    def _session_id_for_room(room_id: str) -> str:
+        """Deterministic session ID from a Matrix room ID."""
+        from march.core.session import deterministic_session_id
+        return deterministic_session_id("matrix", room_id)
+
     # ── Event Callbacks ──────────────────────────────────────────────────
 
     async def _on_message(self, room: Any, event: Any) -> None:
         """Handle incoming messages from Matrix rooms.
 
         Sends read receipt + typing indicator immediately, then spawns
-        the LLM processing as a background task so the sync loop isn't
-        blocked and the ack is visible to the sender right away.
+        the Orchestrator processing as a background task so the sync loop
+        isn't blocked and the ack is visible to the sender right away.
         """
-        if not self._agent or not self._running:
+        if not self._orchestrator or not self._running:
             return
 
         # Ignore our own messages
@@ -314,8 +433,6 @@ class MatrixChannel(Channel):
         logger.info("matrix: message in %s from %s: %s", room_id, event.sender, text[:80])
 
         # ── Immediate acknowledgment ─────────────────────────────────
-        # Send read receipt + typing indicator BEFORE processing so the
-        # sender knows the message was received instantly.
         try:
             await self._client.room_read_markers(
                 room_id,
@@ -330,48 +447,59 @@ class MatrixChannel(Channel):
         except Exception as e:
             logger.debug("matrix: failed to send typing indicator: %s", e)
 
-        # ── Handle /reset synchronously, everything else as background task ─
+        # ── Handle cancel commands ───────────────────────────────────
+        text_lower = text.strip().lower()
+        if text_lower in ("/stop", "停止"):
+            cancel_ev = self._cancel_events.get(room_id)
+            if cancel_ev and not cancel_ev.is_set():
+                cancel_ev.set()
+                await self.send("⚠️ Stopping…", room_id=room_id)
+            else:
+                await self.send("Nothing to cancel.", room_id=room_id)
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
+            return
+
+        # ── Handle /reset — delegate to Orchestrator ─────────────────
         # /reset MUST complete before any new messages are processed for this
         # room, otherwise a race condition allows the next message to pick up
         # the old (not-yet-cleared) session history.  We await it directly so
         # the sync loop blocks until cleanup is done.
-        #
-        # Normal messages are still spawned as background tasks so the sync
-        # loop isn't blocked and the read receipt / typing indicator flush.
-        if text.strip().lower() == "/reset":
+        if text_lower == "/reset":
             await self._handle_matrix_reset(room_id)
-        else:
-            asyncio.create_task(self._process_message(room_id, text, event))
+            return
+
+        # ── Normal message — background task via Orchestrator ────────
+        session_id = self._session_id_for_room(room_id)
+        asyncio.create_task(
+            self._process_orchestrator_events(room_id, text, session_id)
+        )
 
     async def _handle_matrix_reset(self, room_id: str) -> None:
-        """Handle /reset: clear session history, attachments, and DB entries."""
+        """Handle /reset: delegate to Orchestrator.reset_session().
+
+        Also cleans up Matrix-specific resources (attachments on disk).
+        """
         import shutil
 
-        session = self._get_or_create_session(room_id)
-        session_id = session.id
+        session_id = self._session_id_for_room(room_id)
         cleaned = []
 
         try:
-            # 1. Clear in-memory session (history, backup, summaries)
-            session.clear()
-            cleaned.append("history")
+            # 1. Delegate session reset to Orchestrator (clears cache + DB)
+            await self._orchestrator.reset_session(session_id)
+            cleaned.append("session history")
 
-            # 2. Clear persisted messages from SessionStore (SQLite)
-            if self._agent and self._agent.session_store:
-                try:
-                    await self._agent.session_store.clear_session(session_id)
-                    cleaned.append("persisted messages")
-                except Exception as e:
-                    logger.warning("matrix: reset - failed to clear session store: %s", e)
-
-            # 3. Clear session from MemoryStore (facts, embeddings, etc.)
+            # 2. Clear session from MemoryStore (facts, embeddings, etc.)
             if self._agent and hasattr(self._agent, "memory"):
                 result = await self._agent.memory.reset_session(session_id)
                 db_count = result.get("sqlite_entries", 0)
                 if db_count:
                     cleaned.append(f"{db_count} DB entries")
 
-            # 4. Delete session memory files (facts.md, plan.md, etc.)
+            # 3. Delete session memory files (facts.md, plan.md, etc.)
             try:
                 from march.core.compaction import delete_session_memory
                 if delete_session_memory(session_id):
@@ -379,7 +507,7 @@ class MatrixChannel(Channel):
             except Exception as e:
                 logger.warning("matrix: reset - failed to delete session memory: %s", e)
 
-            # 5. Clean up attachments for THIS session only
+            # 4. Clean up attachments for THIS session only (Matrix-specific)
             attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             if attach_dir.exists():
                 file_count = sum(1 for _ in attach_dir.iterdir())
@@ -387,8 +515,8 @@ class MatrixChannel(Channel):
                     shutil.rmtree(str(attach_dir))
                     cleaned.append(f"{file_count} attachments")
 
-            # 6. Remove from in-memory sessions dict so next message creates fresh
-            self._sessions.pop(room_id, None)
+            # 5. Clear cancel event for this room
+            self._cancel_events.pop(room_id, None)
 
             msg = f"✓ Session reset. Cleaned: {', '.join(cleaned)}."
             logger.info("matrix: reset session %s: %s", session_id[:8], msg)
@@ -403,37 +531,13 @@ class MatrixChannel(Channel):
             except Exception:
                 pass
 
-    async def _process_message(self, room_id: str, text: str, event: Any) -> None:
-        """Process a message with the LLM in the background."""
-        session = self._get_or_create_session(room_id)
-
-        try:
-            from march.core.agent import AgentResponse
-            collected = ""
-            async for item in self._agent.run_stream(text, session):
-                if isinstance(item, AgentResponse):
-                    break
-                if hasattr(item, "delta") and item.delta:
-                    collected += item.delta
-
-            if collected:
-                await self.send(collected, room_id=room_id)
-        except Exception as e:
-            logger.error("matrix: error processing message in %s: %s", room_id, e)
-            await self.send(f"Error: {e}", room_id=room_id)
-        finally:
-            # ── Clear typing indicator ───────────────────────────────
-            try:
-                await self._client.room_typing(room_id, typing_state=False)
-            except Exception:
-                pass
-
     async def _on_image(self, room: Any, event: Any) -> None:
         """Handle incoming image messages from Matrix rooms.
 
-        Downloads the image, resizes for LLM, and sends as multimodal content.
+        Downloads the image, resizes for LLM, and sends as multimodal content
+        via the Orchestrator.
         """
-        if not self._agent or not self._running:
+        if not self._orchestrator or not self._running:
             return
 
         # Ignore our own messages
@@ -465,8 +569,8 @@ class MatrixChannel(Channel):
         asyncio.create_task(self._process_image(room_id, event))
 
     async def _process_image(self, room_id: str, event: Any) -> None:
-        """Download and process an image message with the LLM."""
-        session = self._get_or_create_session(room_id)
+        """Download and process an image message via the Orchestrator."""
+        session_id = self._session_id_for_room(room_id)
 
         try:
             # Download the image from Matrix
@@ -545,12 +649,12 @@ class MatrixChannel(Channel):
                 logger.warning("matrix: image resize failed: %s", e)
 
             # Save resized version to disk (not the original)
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session.id
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             attach_dir.mkdir(parents=True, exist_ok=True)
             file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
             file_path.write_bytes(resized_bytes)
 
-            # Build multimodal content for the agent
+            # Build multimodal content for the Orchestrator
             b64_str = base64.b64encode(resized_bytes).decode("ascii")
             content: list[dict[str, Any]] = [
                 {
@@ -572,21 +676,11 @@ class MatrixChannel(Channel):
             if body_text and body_text != filename:
                 content.append({"type": "text", "text": body_text})
 
-            from march.core.agent import AgentResponse
-            collected = ""
-            async for item in self._agent.run_stream(content, session):
-                if isinstance(item, AgentResponse):
-                    break
-                if hasattr(item, "delta") and item.delta:
-                    collected += item.delta
-
-            if collected:
-                await self.send(collected, room_id=room_id)
+            await self._process_orchestrator_events(room_id, content, session_id)
 
         except Exception as e:
             logger.error("matrix: error processing image in %s: %s", room_id, e)
             await self.send(f"Error processing image: {e}", room_id=room_id)
-        finally:
             try:
                 await self._client.room_typing(room_id, typing_state=False)
             except Exception:
@@ -596,9 +690,9 @@ class MatrixChannel(Channel):
         """Handle incoming audio/voice messages from Matrix rooms.
 
         Downloads the audio, transcribes via voice_to_text tool, then
-        processes the transcribed text as a regular message.
+        processes the transcribed text via the Orchestrator.
         """
-        if not self._agent or not self._running:
+        if not self._orchestrator or not self._running:
             return
 
         if self._client and event.sender == self._client.user_id:
@@ -628,8 +722,8 @@ class MatrixChannel(Channel):
         asyncio.create_task(self._process_audio(room_id, event))
 
     async def _process_audio(self, room_id: str, event: Any) -> None:
-        """Download, decrypt, transcribe, and process an audio message."""
-        session = self._get_or_create_session(room_id)
+        """Download, decrypt, transcribe, and process an audio message via the Orchestrator."""
+        session_id = self._session_id_for_room(room_id)
 
         try:
             mxc_url = event.url
@@ -668,7 +762,7 @@ class MatrixChannel(Channel):
                 "audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/aac": ".aac",
             }
             ext = ext_map.get(mime_type, ".ogg")
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session.id
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             attach_dir.mkdir(parents=True, exist_ok=True)
             voice_path = attach_dir / f"voice_{uuid.uuid4().hex[:8]}{ext}"
             voice_path.write_bytes(raw_bytes)
@@ -711,22 +805,12 @@ class MatrixChannel(Channel):
 
             logger.info("matrix: voice transcribed (%d chars): %s", len(transcription), transcription[:80])
 
-            # Process transcribed text as a regular message
-            from march.core.agent import AgentResponse
-            collected = ""
-            async for item in self._agent.run_stream(transcription, session):
-                if isinstance(item, AgentResponse):
-                    break
-                if hasattr(item, "delta") and item.delta:
-                    collected += item.delta
-
-            if collected:
-                await self.send(collected, room_id=room_id)
+            # Process transcribed text via Orchestrator
+            await self._process_orchestrator_events(room_id, transcription, session_id)
 
         except Exception as e:
             logger.error("matrix: error processing audio in %s: %s", room_id, e)
             await self.send(f"Error processing voice message: {e}", room_id=room_id)
-        finally:
             try:
                 await self._client.room_typing(room_id, typing_state=False)
             except Exception:
@@ -736,9 +820,9 @@ class MatrixChannel(Channel):
         """Handle incoming file attachments from Matrix rooms.
 
         Downloads the file, processes based on type (PDF → extract text,
-        text files → read content, binary → note), then sends to agent.
+        text files → read content, binary → note), then sends to Orchestrator.
         """
-        if not self._agent or not self._running:
+        if not self._orchestrator or not self._running:
             return
 
         if self._client and event.sender == self._client.user_id:
@@ -768,8 +852,8 @@ class MatrixChannel(Channel):
         asyncio.create_task(self._process_file(room_id, event))
 
     async def _process_file(self, room_id: str, event: Any) -> None:
-        """Download, decrypt, and process a file attachment."""
-        session = self._get_or_create_session(room_id)
+        """Download, decrypt, and process a file attachment via the Orchestrator."""
+        session_id = self._session_id_for_room(room_id)
 
         try:
             mxc_url = event.url
@@ -803,7 +887,7 @@ class MatrixChannel(Channel):
                         logger.warning("matrix: file decryption failed: %s", e)
 
             # Save to disk
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session.id
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             attach_dir.mkdir(parents=True, exist_ok=True)
             file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
             file_path.write_bytes(raw_bytes)
@@ -837,22 +921,12 @@ class MatrixChannel(Channel):
             else:
                 content_text = f"[File: {filename} ({mime_type}, {size_kb}KB) — binary file saved to disk]"
 
-            # Send to agent
-            from march.core.agent import AgentResponse
-            collected = ""
-            async for item in self._agent.run_stream(content_text, session):
-                if isinstance(item, AgentResponse):
-                    break
-                if hasattr(item, "delta") and item.delta:
-                    collected += item.delta
-
-            if collected:
-                await self.send(collected, room_id=room_id)
+            # Send to Orchestrator
+            await self._process_orchestrator_events(room_id, content_text, session_id)
 
         except Exception as e:
             logger.error("matrix: error processing file in %s: %s", room_id, e)
             await self.send(f"Error processing file: {e}", room_id=room_id)
-        finally:
             try:
                 await self._client.room_typing(room_id, typing_state=False)
             except Exception:
@@ -922,17 +996,6 @@ class MatrixChannel(Channel):
         logger.warning("matrix: could not decrypt event %s in %s (session_id=%s)",
                         event.event_id, room.room_id,
                         getattr(event, "session_id", "?"))
-
-    # ── Session Management ───────────────────────────────────────────────
-
-    def _get_or_create_session(self, room_id: str) -> Session:
-        """Get the session for a room, or create a new one."""
-        if room_id not in self._sessions:
-            self._sessions[room_id] = Session(
-                source_type="matrix",
-                source_id=room_id,
-            )
-        return self._sessions[room_id]
 
     # ── Setup Helpers ────────────────────────────────────────────────────
 

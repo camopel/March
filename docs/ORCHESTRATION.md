@@ -1,8 +1,9 @@
 # Agent Orchestration Refactor — Design Document
 
-**Status:** Draft  
+**Status:** Draft (updated after design review)  
 **Date:** 2026-03-07  
-**Scope:** Replace inline tool execution in the agent loop with a sub-agent orchestration model.
+**Scope:** Replace inline tool execution in the agent loop with a sub-agent orchestration model.  
+**Last Updated:** 2026-03-07 — design review decisions added (channels, persistence, turn log, hooks, history contract).
 
 ---
 
@@ -26,21 +27,23 @@ The new architecture introduces a **two-tier execution model**: a **main agent**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Frontend (WebSocket)                         │
+│                     Channels (Pure I/O Adapters)                     │
 │                                                                     │
-│  User message ──►  stream.delta / tool.progress / stream.end  ◄──  │
-│  stop command ──►  stream.cancelled                           ◄──  │
-└─────────────┬───────────────────────────────────────────────────────┘
-              │ WS messages (JSON)
-              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     WSProxyPlugin (_WSConn)                          │
-│                                                                     │
-│  _ws_handle_message() ──► _run_agent() ──► Orchestrator             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
+│  │  Matrix   │  │ WS Proxy │  │ Terminal  │  │   ACP    │           │
+│  │(matrix-nio│  │(WebSocket│  │ (stdin/   │  │(JSON-RPC │           │
+│  │  async)   │  │HomeHub)  │  │  stdout)  │  │ stdio,   │           │
+│  │          │  │          │  │          │  │ all IDEs)│           │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘           │
+│       │              │              │              │                 │
+│       └──────────────┴──────┬───────┴──────────────┘                │
+│                             │                                       │
+│  User input → normalize → pass to Orchestrator                      │
+│  OrchestratorEvents → adapt to channel format → send to user        │
 │  stop/cancel ──────────► cancel_event.set()                         │
-└─────────────┬───────────────────────────────────────────────────────┘
-              │
-              ▼
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │
+                          ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Orchestrator                                  │
 │                   (new: orchestrator.py)                              │
@@ -80,10 +83,13 @@ The new architecture introduces a **two-tier execution model**: a **main agent**
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| `Orchestrator` | `core/orchestrator.py` (new) | Drives the LLM↔tool loop, manages sub-agents, handles cancellation |
+| `Orchestrator` | `core/orchestrator.py` (new) | Drives the LLM↔tool loop, manages sub-agents, handles cancellation, session persistence, progress |
 | `SubAgent` | `core/sub_agent.py` (new) | Executes a batch of tool calls, reports progress |
 | `Agent` | `core/agent.py` (modified) | Simplified to delegate to `Orchestrator`; retains `_build_context`, `_finalize` |
-| `_WSConn` | `plugins/ws_proxy.py` (modified) | Passes cancel events to orchestrator, relays progress |
+| `MatrixChannel` | `channels/matrix.py` | Pure I/O adapter: matrix-nio async, receives messages, relays OrchestratorEvents |
+| `WSProxyChannel` | `channels/ws_proxy.py` | Pure I/O adapter: WebSocket for HomeHub dashboard |
+| `TerminalChannel` | `channels/terminal.py` | Pure I/O adapter: stdin/stdout for local CLI |
+| `ACPChannel` | `channels/acp.py` | Pure I/O adapter: JSON-RPC over stdio, works with all IDEs |
 | `Session` | `core/session.py` (unchanged) | Stores only user + final assistant messages |
 
 ---
@@ -93,38 +99,36 @@ The new architecture introduces a **two-tier execution model**: a **main agent**
 ### Sequence: User asks "What's the weather in Tokyo and translate it to Japanese"
 
 ```
-Frontend                WSProxy              Orchestrator           SubAgent
-   │                      │                      │                     │
-   │── message ──────────►│                      │                     │
-   │                      │── save user msg ────►│(DB)                 │
-   │                      │── run_agent() ──────►│                     │
-   │                      │                      │                     │
-   │                      │                      │── LLM call #1 ────►│(LLM)
-   │                      │                      │◄── tool_calls: ────│
-   │                      │                      │    [weather, translate]
-   │                      │                      │                     │
-   │                      │                      │── spawn SubAgent ──►│
-   │◄─ tool.progress ─────│◄── progress ─────────│◄── tool.started ───│
-   │   {weather,started}  │                      │    (weather)        │
-   │                      │                      │                     │
-   │                      │                      │                     │── execute weather
-   │                      │                      │                     │── execute translate
-   │                      │                      │                     │
-   │◄─ tool.progress ─────│◄── progress ─────────│◄── tool.done ──────│
-   │   {weather,done}     │                      │    (weather result) │
-   │◄─ tool.progress ─────│◄── progress ─────────│◄── tool.done ──────│
-   │   {translate,done}   │                      │    (translate result)│
-   │                      │                      │                     │
-   │                      │                      │◄── SubAgent returns │
-   │                      │                      │    list[ToolResult] │
-   │                      │                      │                     │
-   │                      │                      │── LLM call #2 ────►│(LLM)
-   │                      │                      │◄── final text ─────│
-   │                      │                      │                     │
-   │◄─ stream.delta ──────│◄── yield chunks ─────│                     │
-   │◄─ stream.end ────────│◄── yield AgentResp ──│                     │
-   │                      │── save assistant ────►│(DB)                 │
-   │                      │── session.add_exchange()                   │
+Channel                  Orchestrator           SubAgent
+   │                          │                     │
+   │── user message ─────────►│                     │
+   │   (normalized)           │── save user msg ──►│(DB)
+   │                          │                     │
+   │                          │── LLM call #1 ────►│(LLM)
+   │                          │◄── tool_calls: ────│
+   │                          │    [weather, translate]
+   │                          │                     │
+   │                          │── spawn SubAgent ──►│
+   │◄─ tool.progress ─────────│◄── tool.started ───│
+   │   {weather,started}      │    (weather)        │
+   │                          │                     │
+   │                          │                     │── execute weather
+   │                          │                     │── execute translate
+   │                          │                     │
+   │◄─ tool.progress ─────────│◄── tool.done ──────│
+   │   {weather,done}         │    (weather result) │
+   │◄─ tool.progress ─────────│◄── tool.done ──────│
+   │   {translate,done}       │    (translate result)│
+   │                          │                     │
+   │                          │◄── SubAgent returns │
+   │                          │    list[ToolResult] │
+   │                          │                     │
+   │                          │── LLM call #2 ────►│(LLM)
+   │                          │◄── final text ─────│
+   │                          │                     │
+   │◄─ stream.delta ──────────│                     │
+   │◄─ stream.end ────────────│── save assistant ──►│(DB)
+   │                          │── session.add_exchange()
 ```
 
 ### What the LLM sees at each call
@@ -161,9 +165,10 @@ tools: [weather_tool, translate_tool, ...]
 
 | Storage | Content |
 |---------|---------|
-| `session.history` | `[Message(user, "What's the weather..."), Message(assistant, "The weather in Tokyo...")]` |
-| SQLite `messages` | Same two rows: user message + final assistant reply |
-| **NOT stored** | The two intermediate assistant+tool messages from the tool loop |
+| `session.history` (RAM) | `[Message(user, "What's the weather..."), Message(assistant, "The weather in Tokyo...")]` |
+| SQLite `messages` (DB) | Same two rows: user message (saved on receive) + final assistant reply (saved on turn complete) |
+| Structured turn log (JSONL) | Tool calls, tool results, LLM intermediate steps — for debugging only |
+| **NOT stored anywhere** | Streaming chunks (memory buffer only), draft responses |
 
 ---
 
@@ -176,24 +181,22 @@ tools: [weather_tool, translate_tool, ...]
 ### New Flow
 
 ```
-Frontend              WSProxy                Orchestrator              SubAgent
-   │                    │                        │                        │
-   │── "stop" ─────────►│                        │                        │
-   │                    │── cancel_event.set() ──►│                        │
-   │                    │── pending.clear()       │                        │
-   │                    │                         │── sub_agent.cancel() ──►│
+Channel               Orchestrator              SubAgent
+   │                        │                        │
+   │── "stop" ─────────────►│                        │
+   │  (cancel_event.set())  │                        │
+   │                        │── sub_agent.cancel() ──►│
    │                    │                         │                        │── (raises Cancelled
    │                    │                         │                        │    or returns partial)
    │                    │                         │                        │
-   │                    │                         │◄── CancelledError ─────│
-   │                    │                         │                        │
-   │                    │                         │── cleanup ephemeral ───│
-   │                    │                         │   state (tool_messages │
-   │                    │                         │   turn_usage, etc.)    │
-   │                    │                         │                        │
-   │◄─ stream.cancelled │◄── yield cancelled ─────│                        │
-   │                    │                         │                        │
-   │                    │── conn.busy = False     │                        │
+   │                        │◄── CancelledError ─────│
+   │                        │                        │
+   │                        │── cleanup ephemeral ───│
+   │                        │   state (tool_messages │
+   │                        │   turn_usage, etc.)    │
+   │                        │                        │
+   │◄─ stream.cancelled ────│                        │
+   │                        │                        │
 ```
 
 ### Cancellation Contract
@@ -271,15 +274,18 @@ The existing compaction system (`core/compaction.py`) continues to work unchange
 
 The compaction trigger point remains the same: at the start of `run_stream()` / `run()`, before the orchestration loop begins.
 
-### Database Persistence
+### Database Persistence (Event-Driven, No Drafts)
 
-The `SessionStore` and `ChatDB` adapter persist messages at the same points as today:
+The persistence strategy is **event-driven** with no draft mechanism:
 
-| Event | Persisted By | What's Stored |
-|-------|-------------|---------------|
-| User sends message | `_ws_handle_message()` → `save_message()` | User message text |
-| Agent finishes turn | `_stream_response()` → `finalize_draft()` or `save_message()` | Final assistant reply |
-| Stream in progress | `save_draft()` (periodic) | Partial assistant text (overwritten on finalize) |
+| Event | Action | What's Stored |
+|-------|--------|---------------|
+| User sends message | Save to DB **immediately** on receive | User message text |
+| Agent finishes turn | Save to DB on **turn complete** | Final assistant reply |
+| Tool call intermediates | **NOT in DB** — only in structured turn log (JSONL) | N/A |
+| Streaming chunks | **Memory buffer only** (for reconnect) — no DB drafts | N/A |
+
+**Draft mechanism is REMOVED.** If the process crashes mid-turn, the turn is considered failed. Half-responses have no value and are not worth persisting. The user message is already saved; the user can retry.
 
 Tool calls and results are **never** written to the `messages` table.
 
@@ -777,9 +783,13 @@ class MarchConfig(BaseModel):
 
 | File | Description |
 |------|-------------|
-| `core/orchestrator.py` | `Orchestrator` class — drives the LLM↔sub-agent loop |
+| `core/orchestrator.py` | `Orchestrator` class — drives the LLM↔sub-agent loop, owns session/persistence/cancel logic |
 | `core/sub_agent.py` | `SubAgent` class — executes tool batches with progress |
-| `core/types.py` | `TurnContext`, `SubAgentResult`, `ProgressEvent`, `SubAgentConfig` |
+| `core/types.py` | `TurnContext`, `SubAgentResult`, `ProgressEvent`, `SubAgentConfig`, `OrchestratorEvent` |
+| `channels/matrix.py` | Matrix channel — pure I/O adapter using matrix-nio |
+| `channels/ws_proxy.py` | WS Proxy channel — pure I/O adapter for HomeHub WebSocket |
+| `channels/terminal.py` | Terminal channel — pure I/O adapter for stdin/stdout |
+| `channels/acp.py` | ACP channel — pure I/O adapter for JSON-RPC stdio (all IDEs) |
 | `tests/test_orchestrator.py` | Unit tests for orchestrator |
 | `tests/test_sub_agent.py` | Unit tests for sub-agent |
 
@@ -788,8 +798,13 @@ class MarchConfig(BaseModel):
 | File | Changes |
 |------|---------|
 | `core/agent.py` | `run()` and `run_stream()` delegate to `Orchestrator`; tool loop removed. Retains `_build_context`, `_finalize`, `_truncate_messages`, `_call_llm_with_retry`. |
-| `plugins/ws_proxy.py` | `_stream_response()` passes `cancel_event` to agent. Handles new `tool.progress` and `orchestration.*` message types. |
 | `config/schema.py` | Add `OrchestrationConfig` model and `orchestration` field to `MarchConfig`. |
+
+### Removed Files
+
+| File | Reason |
+|------|--------|
+| `plugins/vscode.py` (or equivalent) | **DEPRECATED.** VSCode channel was just a ws_proxy WS client. Replaced by ACP channel which works with all IDEs. |
 
 ### Unchanged Files
 
@@ -797,14 +812,311 @@ class MarchConfig(BaseModel):
 |------|-----|
 | `core/session.py` | Session history management is already correct (only stores user+assistant). No changes needed. |
 | `core/message.py` | Message types are sufficient. `ToolCall`, `ToolResult`, `Message` used as-is. |
-| `core/compaction.py` | Operates on session history, which is unaffected. |
+| `core/compaction.py` | Operates on session history (user+assistant pairs only), which is unaffected. |
 | `llm/base.py` | `StreamChunk`, `LLMResponse`, `LLMProvider` unchanged. |
 | `tools/registry.py` | `ToolRegistry.execute()` unchanged — sub-agent calls it the same way. |
 | `plugins/_manager.py` | Plugin hooks (`before_tool`, `after_tool`, etc.) unchanged — sub-agent dispatches them. |
 
 ---
 
-## 13. Open Questions
+## 13. Final Channel List (Design Review Decision)
+
+March supports exactly **4 channels**. Each channel is a pure I/O adapter (see §15).
+
+| Channel | Transport | Use Case |
+|---------|-----------|----------|
+| **Matrix** | matrix-nio (async) | Primary chat interface, mobile/desktop clients |
+| **WS Proxy** | WebSocket | HomeHub dashboard, web UI |
+| **Terminal** | stdin/stdout | Local CLI, development, scripting |
+| **ACP** | JSON-RPC over stdio | IDE integration — works with all IDEs (VSCode, JetBrains, Neovim, etc.) |
+
+### Deprecated: VSCode Channel
+
+The standalone VSCode channel is **DEPRECATED** and will be removed. It was just a WebSocket client connecting to ws_proxy — functionally identical to the WS Proxy channel but IDE-specific. ACP (Agent Communication Protocol) over JSON-RPC stdio is the universal replacement:
+
+- ACP works with **any IDE** that supports the protocol, not just VSCode
+- ACP uses stdio (no port management, no WebSocket handshake)
+- ACP is the emerging standard for agent↔IDE communication
+- Existing VSCode users should migrate to the ACP channel
+
+---
+
+## 14. Persistence Strategy (Design Review Decision)
+
+### Principle: Event-Driven, No Drafts
+
+Persistence follows a strict event-driven model. Messages are saved at exactly two points:
+
+1. **User message → save to DB immediately on receive** — before any processing begins
+2. **Final assistant reply → save to DB on turn complete** — after the full response is generated
+
+Everything else is either ephemeral or goes to the structured turn log.
+
+### What Goes Where
+
+| Data | Storage | Lifetime |
+|------|---------|----------|
+| User messages | SQLite `messages` table | Permanent |
+| Final assistant replies | SQLite `messages` table | Permanent |
+| Tool call/result intermediates | Structured turn log (JSONL, see §16) | Permanent (debug) |
+| Streaming chunks | Memory buffer only | Current turn only |
+| Draft/partial responses | **REMOVED — not stored anywhere** | N/A |
+
+### Why No Drafts
+
+The draft mechanism (`save_draft()` / `finalize_draft()`) is **removed entirely**:
+
+- **Process crash = turn failed.** A half-generated response has no value to the user. The user message is already persisted; they can retry.
+- **Streaming chunks stay in a memory buffer** for the sole purpose of allowing reconnecting clients to catch up on the current stream. This buffer is discarded when the turn completes or is cancelled.
+- **Simpler persistence code.** No periodic draft saves, no finalize-vs-save branching, no orphaned drafts to clean up.
+
+### Session.history in RAM
+
+`session.history` contains **only** completed conversational turns:
+
+```python
+session.history = [
+    Message(role="user", content="Hello"),
+    Message(role="assistant", content="Hi! How can I help?"),
+    Message(role="user", content="What's the weather?"),
+    Message(role="assistant", content="It's 15°C in Tokyo."),
+]
+```
+
+No tool calls, no tool results, no intermediate assistant messages, no partial responses.
+
+---
+
+## 15. Channel = Pure I/O Adapter (Design Review Decision)
+
+### Principle
+
+Channels are **dumb pipes**. They do exactly two things:
+
+1. **Receive user input** (text, voice, attachment) → **normalize** to a common format → **pass to Orchestrator**
+2. **Receive OrchestratorEvents** → **adapt** to channel-specific format → **send to user**
+
+### What Lives in the Orchestrator (NOT in Channels)
+
+All agent control logic is centralized in the Orchestrator:
+
+| Concern | Owner |
+|---------|-------|
+| Session management (create, lookup, history) | Orchestrator |
+| Cancellation (cancel_event, cleanup) | Orchestrator |
+| Persistence (save user msg, save final reply) | Orchestrator |
+| Progress reporting (tool.progress events) | Orchestrator |
+| Turn lifecycle (start, complete, error) | Orchestrator |
+| Plugin hooks (on_turn_start, etc.) | Orchestrator |
+| Compaction trigger | Orchestrator |
+
+### What Lives in Channels
+
+| Concern | Owner |
+|---------|-------|
+| Protocol handling (WS frames, matrix events, stdio lines, JSON-RPC) | Channel |
+| Input normalization (voice→text, attachments→content parts) | Channel |
+| Output formatting (markdown→matrix HTML, stream→WS JSON, etc.) | Channel |
+| Connection lifecycle (connect, reconnect, auth) | Channel |
+| Queue management (pending messages while busy) | Channel |
+| Stop command detection (channel-specific stop words) | Channel |
+
+### Channel Interface
+
+All channels implement a common interface:
+
+```python
+class Channel(Protocol):
+    async def start(self, orchestrator: Orchestrator) -> None:
+        """Start listening for user input."""
+        ...
+    
+    async def send_event(self, event: OrchestratorEvent) -> None:
+        """Adapt and send an orchestrator event to the user."""
+        ...
+    
+    async def stop(self) -> None:
+        """Gracefully shut down the channel."""
+        ...
+```
+
+---
+
+## 16. Structured Turn Log (Design Review Decision)
+
+### Purpose
+
+A JSONL log of every orchestration event, designed for **debugging and observability**. The agent itself knows about this log (documented in `AGENT.md`) and can query it with `jq` and `grep`.
+
+### Location
+
+```
+~/.march/logs/turns.jsonl
+```
+
+### Event Types
+
+| Event | When | Key Fields |
+|-------|------|------------|
+| `turn_start` | User message received | `user_message`, `channel` |
+| `llm_call` | Before each LLM invocation | `model`, `message_count`, `tool_count`, `call_index` |
+| `tool_call` | Tool execution starts | `tool_name`, `tool_call_id`, `arguments` (truncated) |
+| `tool_result` | Tool execution completes | `tool_name`, `tool_call_id`, `duration_ms`, `is_error`, `result_chars` |
+| `turn_complete` | Final response ready | `response_chars`, `total_tokens`, `total_cost`, `tool_calls_made`, `duration_ms` |
+| `turn_cancelled` | Turn was cancelled | `reason`, `partial_content_chars` |
+| `turn_error` | Turn failed with error | `error`, `traceback` |
+
+### Common Fields (Every Event)
+
+```json
+{
+  "ts": "2026-03-07T19:15:32.456Z",
+  "turn_id": "turn_a1b2c3d4",
+  "session_id": "sess_x9y8z7",
+  "event": "tool_call",
+  ...event-specific fields...
+}
+```
+
+### Example: Multi-Tool Turn
+
+```jsonl
+{"ts":"2026-03-07T19:15:30.100Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"turn_start","user_message":"What's the weather in Tokyo and translate it to Japanese","channel":"matrix"}
+{"ts":"2026-03-07T19:15:30.150Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"llm_call","model":"claude-sonnet-4-20250514","message_count":5,"tool_count":8,"call_index":1}
+{"ts":"2026-03-07T19:15:31.200Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"tool_call","tool_name":"weather","tool_call_id":"call_abc","arguments":"{\"city\":\"Tokyo\"}"}
+{"ts":"2026-03-07T19:15:31.210Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"tool_call","tool_name":"translate","tool_call_id":"call_def","arguments":"{\"text\":\"...\",\"to\":\"ja\"}"}
+{"ts":"2026-03-07T19:15:32.400Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"tool_result","tool_name":"weather","tool_call_id":"call_abc","duration_ms":1200,"is_error":false,"result_chars":42}
+{"ts":"2026-03-07T19:15:32.010Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"tool_result","tool_name":"translate","tool_call_id":"call_def","duration_ms":800,"is_error":false,"result_chars":38}
+{"ts":"2026-03-07T19:15:32.450Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"llm_call","model":"claude-sonnet-4-20250514","message_count":9,"tool_count":8,"call_index":2}
+{"ts":"2026-03-07T19:15:33.800Z","turn_id":"turn_a1b2","session_id":"sess_x9y8","event":"turn_complete","response_chars":156,"total_tokens":2847,"total_cost":0.0142,"tool_calls_made":2,"duration_ms":3700}
+```
+
+### Querying
+
+```bash
+# All errors in the last hour
+jq 'select(.event == "turn_error")' ~/.march/logs/turns.jsonl | tail -20
+
+# Slow tool calls (>5s)
+jq 'select(.event == "tool_result" and .duration_ms > 5000)' ~/.march/logs/turns.jsonl
+
+# Full trace of a specific turn
+grep '"turn_a1b2"' ~/.march/logs/turns.jsonl | jq .
+
+# Tool usage frequency
+jq -r 'select(.event == "tool_call") | .tool_name' ~/.march/logs/turns.jsonl | sort | uniq -c | sort -rn
+```
+
+---
+
+## 17. Plugin Hooks (Design Review Decision)
+
+### Orchestrator-Level Hooks
+
+These hooks fire at the **orchestrator level**, meaning all channels benefit from them automatically. They are distinct from the existing agent-loop hooks.
+
+```python
+class OrchestratorHooks(Protocol):
+    async def on_turn_start(self, session: Session, user_message: str | list) -> None:
+        """Called when a new turn begins (after user message is persisted)."""
+        ...
+    
+    async def on_turn_complete(self, session: Session, response: AgentResponse) -> None:
+        """Called when a turn completes successfully (after assistant reply is persisted)."""
+        ...
+    
+    async def on_cancel(self, session: Session, partial_content: str | None) -> None:
+        """Called when a turn is cancelled."""
+        ...
+    
+    async def on_orchestrator_step(self, session: Session, step_type: str, data: dict) -> None:
+        """Called on each orchestration step (LLM call, tool dispatch, etc.)."""
+        ...
+```
+
+### Relationship to Existing Hooks
+
+The existing plugin hooks (`before_llm`, `after_llm`, `before_tool`, `after_tool`) continue to work **inside the agent loop** (now inside the Orchestrator/SubAgent). They are fine-grained, per-call hooks.
+
+The new orchestrator hooks are **coarse-grained, turn-level** hooks:
+
+| Hook | Level | Fires When |
+|------|-------|------------|
+| `before_llm` / `after_llm` | Agent loop (per LLM call) | Each LLM invocation within a turn |
+| `before_tool` / `after_tool` | Agent loop (per tool call) | Each tool execution within a turn |
+| `on_turn_start` | Orchestrator (per turn) | Once, when user message arrives |
+| `on_turn_complete` | Orchestrator (per turn) | Once, when final response is ready |
+| `on_cancel` | Orchestrator (per turn) | Once, if turn is cancelled |
+| `on_orchestrator_step` | Orchestrator (per step) | Each major step (LLM call, tool batch, etc.) |
+
+### Use Cases
+
+- **`on_turn_start`**: Logging, analytics, rate limiting, session warm-up
+- **`on_turn_complete`**: Logging, analytics, notifications, post-processing
+- **`on_cancel`**: Cleanup, analytics, user notification
+- **`on_orchestrator_step`**: Debug UI updates, progress tracking, audit trail
+
+---
+
+## 18. Session History Contract (Design Review Decision)
+
+### The Rule
+
+```python
+session.history = [user, assistant, user, assistant, ...]  # ONLY
+```
+
+This is the **single source of truth** for conversational context. No exceptions.
+
+### What's In History
+
+- `Message(role="user", content=...)` — the user's input
+- `Message(role="assistant", content=...)` — the agent's final response
+
+### What's NOT In History
+
+- Tool call messages (`role="assistant"` with `tool_calls`)
+- Tool result messages (`role="tool"`)
+- System messages
+- Partial/streaming content
+- Any intermediate reasoning
+
+### Tool Call Intermediates Are Ephemeral
+
+During a turn, the Orchestrator maintains a working `messages` list that includes tool call/result messages (needed for the LLM to see tool results). This list exists **only for the duration of the current turn** and is discarded when the turn completes or is cancelled.
+
+```python
+# During turn execution (ephemeral):
+turn.messages = [
+    *session.get_messages_for_llm(),           # history pairs
+    {"role": "user", "content": "..."},         # current user message
+    {"role": "assistant", "tool_calls": [...]}, # LLM's tool request (ephemeral)
+    {"role": "tool", "content": "..."},         # tool result (ephemeral)
+    {"role": "tool", "content": "..."},         # tool result (ephemeral)
+]
+
+# After turn completes, only this is added to history:
+session.history.append(Message(role="user", content="..."))
+session.history.append(Message(role="assistant", content="final response"))
+```
+
+### Compaction
+
+The agent's compaction system (`core/compaction.py`) operates on `session.history` and handles history growth. Since history only contains user+assistant pairs, compaction logic remains simple and unchanged.
+
+### Cold Start (Rebuilding from DB)
+
+When a session is loaded from the database:
+
+1. Query all messages for the session, ordered by timestamp
+2. Messages are already user+assistant pairs (tool intermediates were never persisted)
+3. Rebuild `session.history` as `[user, assistant, user, assistant, ...]`
+4. If the last message is a user message with no corresponding assistant reply → it was an unprocessed message (crash recovery) or a cancelled turn. It remains in history; the next user message will appear after it.
+5. Separate completed turns from unprocessed user messages for correct context building
+
+---
+
+## 19. Open Questions
 
 1. **Should the orchestrator support "planning" mode?** — Where the LLM first outputs a plan (text), then the orchestrator confirms before executing tools. Deferred to a future design.
 

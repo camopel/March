@@ -1,5 +1,11 @@
 """WSProxyPlugin — Embedded HTTP/WS server for the frontend chat.
 
+Pure I/O adapter: accepts WebSocket/HTTP connections, converts user input
+into Orchestrator calls, and maps OrchestratorEvents back to WebSocket JSON.
+
+All agent execution, session management, message persistence, and draft
+handling are delegated to the Orchestrator layer.
+
 Owns the conversation SQLite DB, runs an aiohttp server, handles image
 resizing, PDF extraction, voice transcription, and stream persistence
 (even if frontend disconnects mid-stream).
@@ -35,6 +41,7 @@ from march.plugins._base import Plugin
 if TYPE_CHECKING:
     from march.app import MarchApp
     from march.core.agent import Agent
+    from march.core.orchestrator import Orchestrator
 
 # Subsystem loggers
 logger = get_logger("march.ws_proxy", subsystem="ws_proxy")
@@ -119,21 +126,6 @@ def _extract_pdf_text(raw_bytes: bytes) -> str:
     except Exception as e:
         logger.warning("PDF text extraction failed", error=str(e))
     return ""
-
-
-def _build_attachment_content(
-    raw_bytes: bytes,
-    filename: str,
-    mime_type: str,
-    tmp_path: str,
-    max_image_dim: int,
-    image_quality: int,
-) -> str | list:
-    """Build LLM-ready content from an attachment based on its type.
-
-    DEPRECATED: Kept for reference. Use _process_attachment() instead.
-    """
-    raise NotImplementedError("Use _process_attachment() instead")
 
 
 async def _summarize_with_llm(
@@ -473,16 +465,6 @@ class ChatDB:
         )
         await self._store._db.commit()
 
-    async def save_draft(self, session_id: str, draft_id: str, content: str) -> None:
-        await self._store.save_draft(session_id, draft_id, content)
-
-    async def finalize_draft(self, draft_id: str, content: str,
-                              tool_calls: list | None = None, summary: str = "") -> None:
-        await self._store.finalize_draft(
-            draft_id, content, tool_calls,
-            metadata={"summary": summary} if summary else None,
-        )
-
     async def clear_session_messages(self, session_id: str) -> None:
         await self._store.clear_session(session_id)
 
@@ -516,7 +498,17 @@ class ChatDB:
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
 class WSProxyPlugin(Plugin):
-    """Embedded HTTP/WS server for the frontend chat with DB persistence.
+    """Embedded HTTP/WS server for the frontend chat — pure I/O adapter.
+
+    All agent execution, session resolution, message persistence, and draft
+    handling are delegated to the Orchestrator.  This plugin only handles:
+    - WebSocket I/O (accept connections, send/receive JSON messages)
+    - Converting user input → Orchestrator.handle_message()
+    - Converting OrchestratorEvents → WebSocket JSON messages
+    - File upload handling (save to disk, pass path to Orchestrator)
+    - Voice transcription (transcribe, pass text to Orchestrator)
+    - HTTP REST endpoints (delegating to ChatDB / Orchestrator)
+    - Stream buffer management for reconnect recovery
 
     Configuration (config.yaml → plugins.ws_proxy):
       port: 8101                    # HTTP/WS server port
@@ -540,9 +532,9 @@ class WSProxyPlugin(Plugin):
         self._agent: Agent | None = None
         self._app_ref: MarchApp | None = None
         self._db: ChatDB | None = None
+        self._orchestrator: Orchestrator | None = None
         self._site: Any = None
         self._runner: Any = None
-        self._march_sessions: dict[str, Any] = {}
         self._stream_buffers: dict[str, _StreamBuffer] = {}  # session_id → buffer
         self._metrics = MetricsLogger.get()
         # Config values (populated in on_start from config.yaml)
@@ -598,8 +590,9 @@ class WSProxyPlugin(Plugin):
         )
 
     async def on_start(self, app: Any) -> None:
-        """Start the HTTP/WS server and initialize the DB."""
+        """Start the HTTP/WS server, initialize DB, and create Orchestrator."""
         import aiohttp.web as web
+        from march.core.orchestrator import Orchestrator
 
         self._app_ref = app
         self._agent = app.agent
@@ -614,6 +607,12 @@ class WSProxyPlugin(Plugin):
             # Fallback: create our own store
             self._db = ChatDB(db_path=self._db_path)
             await self._db.initialize()
+
+        # Create the Orchestrator — single control layer for agent execution
+        self._orchestrator = Orchestrator(
+            agent=app.agent,
+            session_store=app.session_store,
+        )
 
         # Build aiohttp app
         webapp = web.Application()
@@ -643,10 +642,7 @@ class WSProxyPlugin(Plugin):
         )
 
     async def on_shutdown(self, app: Any) -> None:
-        """Stop the HTTP/WS server, flush in-flight streams, and close the DB."""
-        # Flush all in-flight streaming drafts to DB before shutdown
-        await self._flush_all_streams()
-
+        """Stop the HTTP/WS server and close the DB."""
         if self._site:
             await self._site.stop()
         if self._runner:
@@ -654,30 +650,6 @@ class WSProxyPlugin(Plugin):
         if self._db:
             await self._db.close()
         logger.info("server stopped")
-
-    async def _flush_all_streams(self) -> None:
-        """Save all in-flight streaming content to DB as drafts.
-
-        Called before shutdown/restart to prevent data loss.
-        """
-        flushed = 0
-        for session_id, buf in self._stream_buffers.items():
-            if buf.streaming and buf.collected and buf.draft_id:
-                try:
-                    await self._db.save_draft(session_id, buf.draft_id, buf.collected)
-                    flushed += 1
-                    stream_log.info(
-                        "draft flushed on shutdown",
-                        session_id=session_id,
-                        content_length=len(buf.collected),
-                        chunks=buf.next_id,
-                    )
-                except Exception as e:
-                    stream_log.warning("draft flush failed",
-                                       session_id=session_id, error=str(e),
-                                       action="data may be lost")
-        if flushed:
-            stream_log.info("shutdown flush complete", drafts_saved=flushed)
 
     # ── CORS Middleware ───────────────────────────────────────────────────
 
@@ -806,6 +778,9 @@ class WSProxyPlugin(Plugin):
         deleted = await self._db.delete_session(session_id)
         if not deleted:
             return web.json_response({"error": "Session not found"}, status=404)
+        # Evict from Orchestrator cache
+        if self._orchestrator:
+            self._orchestrator.evict_session(session_id)
         return web.json_response({"deleted": True})
 
     async def _handle_rename_session(self, request: Any) -> Any:
@@ -969,7 +944,7 @@ class WSProxyPlugin(Plugin):
             })
             return
 
-        await self._db.save_message(conn.session_id, "user", content)
+        # User message persistence is handled by the Orchestrator
         await self._run_agent(conn, content)
 
     async def _ws_handle_attachment(self, conn: "_WSConn", data: dict) -> None:
@@ -1019,8 +994,6 @@ class WSProxyPlugin(Plugin):
         # Save display message to DB IMMEDIATELY — before processing.
         # This prevents the message from disappearing if the WebSocket
         # disconnects during the (potentially slow) _process_attachment call.
-        # If the client reconnects and fetchHistory runs, the message is
-        # already in the DB.
         msg_id = await self._db.save_message(
             conn.session_id, "user", display
         )
@@ -1184,8 +1157,8 @@ class WSProxyPlugin(Plugin):
 
         logger.info("voice transcribed", session_id=conn.session_id, text_length=len(transcription))
         await _try_send(conn.ws, {"type": "voice.transcribed", "text": transcription})
-        await self._db.save_message(conn.session_id, "user", transcription)
 
+        # User message persistence is handled by the Orchestrator
         if conn.busy:
             if len(conn.pending) >= self._max_queue_size:
                 await _try_send(conn.ws, {
@@ -1202,10 +1175,10 @@ class WSProxyPlugin(Plugin):
 
         await self._run_agent(conn, transcription)
 
-    # ── Agent Execution ───────────────────────────────────────────────────
+    # ── Agent Execution (via Orchestrator) ────────────────────────────────
 
     async def _run_agent(self, conn: "_WSConn", content: str | list) -> None:
-        """Run the agent on a message, then drain any queued messages."""
+        """Run the agent on a message via Orchestrator, then drain queued messages."""
         conn.busy = True
         conn.cancel_event.clear()  # Reset cancellation flag for new run
         _agent_t0 = time.monotonic()
@@ -1221,8 +1194,6 @@ class WSProxyPlugin(Plugin):
                 duration_ms=_agent_dur,
             )
             conn.busy = False
-            # Session stays cached in memory — preserves full tool call context
-            # across turns. Only rebuilt from DB on first access or after /reset.
         await self._drain_queue(conn)
 
     async def _drain_queue(self, conn: "_WSConn") -> None:
@@ -1242,41 +1213,26 @@ class WSProxyPlugin(Plugin):
         )
         logger.info("draining message queue", session_id=conn.session_id, queued_count=len(queued))
 
-        if isinstance(combined, str):
-            await self._db.save_message(conn.session_id, "user", combined)
-
         await self._run_agent(conn, combined)
 
     async def _stream_response(self, conn: "_WSConn", content: str | list) -> None:
-        """Stream the agent response, persisting even if client disconnects.
+        """Stream the agent response via Orchestrator, mapping events to WS JSON.
 
-        All chunks are buffered with sequential IDs for reconnect recovery.
-        Draft is saved to SQLite every 10 chunks or 60s for crash resilience.
+        All agent execution, session resolution, message persistence, and
+        draft handling are delegated to the Orchestrator.  This method only:
+        1. Calls orchestrator.handle_message() with the content and cancel_event
+        2. Iterates OrchestratorEvents and maps them to WebSocket JSON messages
+        3. Manages the stream buffer for reconnect recovery
         """
-        assert self._agent is not None
+        assert self._orchestrator is not None
 
-        session = await self._resolve_march_session(conn.session_id)
-
-        # On cold start, check for unprocessed user messages from before restart.
-        # These are trailing user messages in DB that never got an assistant reply.
-        unprocessed = session.metadata.pop("_unprocessed_messages", [])
-        if unprocessed:
-            logger.info(
-                "replaying unprocessed messages",
-                session_id=conn.session_id,
-                count=len(unprocessed),
-            )
-            # Prepend unprocessed messages to current content
-            if isinstance(content, str):
-                all_msgs = unprocessed + [content]
-                content = "\n\n".join(all_msgs)
-            # Note: unprocessed msgs are already in DB, no need to save again
+        from march.core.orchestrator import (
+            TextDelta, ToolProgress, FinalResponse, Cancelled, Error,
+        )
 
         buf = self._get_stream_buffer(conn.session_id)
         buf.reset()
         buf.streaming = True
-        buf.draft_id = str(uuid.uuid4())
-        buf.last_draft_save_time = time.monotonic()
 
         client_gone = False
 
@@ -1294,171 +1250,95 @@ class WSProxyPlugin(Plugin):
 
         await try_send({"type": "stream.start"})
 
-        collected = ""
-        tool_calls_collected: list[dict] = []
-        final_response = None
-
-        cancelled = False
-
         try:
-            from march.core.agent import AgentResponse
-
-            async for item in self._agent.run_stream(content, session):
-                # ── Check for cancellation ────────────────────────────
-                if conn.cancel_event.is_set():
-                    cancelled = True
-                    stream_log.info(
-                        "stream cancelled by user",
-                        session_id=conn.session_id,
-                        collected_chars=len(collected),
-                    )
-                    break
-
-                if isinstance(item, AgentResponse):
-                    final_response = item
-                    break
-
-                if hasattr(item, "tool_call_delta") and item.tool_call_delta:
-                    td = item.tool_call_delta
-                    if isinstance(td, dict):
-                        name = td.get("name", "")
-                        if name and td.get("status"):
-                            tool_calls_collected.append({
-                                "name": name,
-                                "args": td.get("args", {}),
-                            })
-                        await try_send({
-                            "type": "tool.start",
-                            "name": name,
-                            "args": td.get("args", {}),
-                        })
-
-                if hasattr(item, "tool_progress") and item.tool_progress:
-                    tp = item.tool_progress
-                    await try_send({
-                        "type": "tool.progress",
-                        "name": tp.get("name", ""),
-                        "status": tp.get("status", ""),
-                        "summary": tp.get("summary", ""),
-                        "duration_ms": tp.get("duration_ms", 0),
-                    })
-
-                if hasattr(item, "delta_tool_call") and item.delta_tool_call:
-                    dtc = item.delta_tool_call
-                    if dtc.name:
-                        await try_send({
-                            "type": "tool.start",
-                            "name": dtc.name,
-                            "args": {},
-                        })
-
-                if hasattr(item, "delta") and item.delta:
-                    collected += item.delta
-                    buf.collected = collected
+            async for event in self._orchestrator.handle_message(
+                session_id=conn.session_id,
+                content=content,
+                source="ws",
+                cancel_event=conn.cancel_event,
+            ):
+                if isinstance(event, TextDelta):
+                    buf.collected += event.delta
                     await try_send({
                         "type": "stream.delta",
-                        "content": item.delta,
+                        "content": event.delta,
                     })
-                    # Periodic draft save (every 10 chunks or 60s)
-                    if buf.needs_draft_save():
-                        try:
-                            await self._db.save_draft(
-                                conn.session_id, buf.draft_id, collected
-                            )
-                            buf.mark_draft_saved()
-                        except Exception:
-                            pass  # Non-critical, best-effort
+
+                elif isinstance(event, ToolProgress):
+                    await try_send({
+                        "type": "tool.progress",
+                        "name": event.name,
+                        "status": event.status,
+                        "summary": event.summary,
+                        "duration_ms": event.duration_ms,
+                    })
+
+                elif isinstance(event, FinalResponse):
+                    end_msg: dict[str, Any] = {"type": "stream.end"}
+                    if event.total_tokens or event.total_cost:
+                        end_msg["usage"] = {
+                            "input_tokens": event.total_tokens,
+                            "output_tokens": event.total_tokens,
+                            "cost": event.total_cost,
+                        }
+                    if event.turn_summary:
+                        end_msg["turn_summary"] = event.turn_summary
+                    await try_send(end_msg)
+
+                    buf.streaming = False
+                    buf.done = True
+                    buf.collected = event.content or buf.collected
+
+                    if client_gone:
+                        stream_log.info(
+                            "client disconnected during stream",
+                            session_id=conn.session_id,
+                            content_length=len(buf.collected),
+                            chunks_buffered=buf.next_id,
+                        )
+                    return
+
+                elif isinstance(event, Cancelled):
+                    buf.streaming = False
+                    buf.done = True
+                    await try_send({"type": "stream.end", "cancelled": True})
+                    stream_log.info(
+                        "stream cancelled — partial content saved by orchestrator",
+                        session_id=conn.session_id,
+                        collected_chars=len(event.partial_content),
+                    )
+                    return
+
+                elif isinstance(event, Error):
+                    buf.streaming = False
+                    buf.done = True
+                    await try_send({"type": "error", "message": event.message})
+                    stream_log.error(
+                        "orchestrator error",
+                        session_id=conn.session_id,
+                        error=event.message,
+                    )
+                    return
+
         except Exception as e:
             stream_log.error("streaming error",
                              session_id=conn.session_id, error=str(e),
-                             collected_chars=len(collected),
+                             collected_chars=len(buf.collected),
                              action="aborting stream",
                              exc_info=True)
             await try_send({"type": "error", "message": str(e)})
             buf.streaming = False
             buf.done = True
-            if collected:
-                error_content = collected + "\n\n⚠️ _Response interrupted by error_"
-                if buf.last_draft_save_chunks > 0:
-                    await self._db.finalize_draft(buf.draft_id, error_content, tool_calls_collected)
-                else:
-                    await self._db.save_message(
-                        conn.session_id, "assistant", error_content, tool_calls_collected,
-                    )
             return
 
-        # ── Handle cancellation: save partial content and end gracefully ──
-        if cancelled:
-            buf.streaming = False
-            buf.done = True
-            buf.collected = collected
-            # Save whatever was collected so far
-            if collected or tool_calls_collected:
-                cancel_content = collected
-                if cancel_content:
-                    cancel_content += "\n\n⏹ _Response stopped by user_"
-                if buf.last_draft_save_chunks > 0:
-                    await self._db.finalize_draft(
-                        buf.draft_id, cancel_content, tool_calls_collected
-                    )
-                else:
-                    await self._db.save_message(
-                        conn.session_id, "assistant", cancel_content, tool_calls_collected,
-                    )
-            # Send stream.end so the frontend knows the stream is over
-            await try_send({"type": "stream.end", "cancelled": True})
-            stream_log.info(
-                "stream cancelled — partial content saved",
-                session_id=conn.session_id,
-                collected_chars=len(collected),
-            )
-            return
-
-        end_msg: dict[str, Any] = {"type": "stream.end"}
-        if final_response:
-            end_msg["usage"] = {
-                "input_tokens": getattr(final_response, "total_tokens", 0),
-                "output_tokens": getattr(final_response, "total_tokens", 0),
-                "cost": getattr(final_response, "total_cost", 0),
-            }
-            turn_summary = getattr(final_response, "turn_summary", "")
-            if turn_summary:
-                end_msg["turn_summary"] = turn_summary
-        await try_send(end_msg)
-
+        # If we exit the loop without a terminal event (shouldn't happen),
+        # mark the stream as done to avoid leaving the client hanging.
         buf.streaming = False
         buf.done = True
-        buf.collected = collected
-
-        # Store summary alongside the message if available
-        turn_summary = ""
-        if final_response:
-            turn_summary = getattr(final_response, "turn_summary", "")
-
-        if collected or tool_calls_collected:
-            # If draft exists in DB, finalize it; otherwise save new
-            if buf.last_draft_save_chunks > 0:
-                await self._db.finalize_draft(
-                    buf.draft_id, collected, tool_calls_collected, turn_summary
-                )
-            else:
-                await self._db.save_message(
-                    conn.session_id, "assistant", collected, tool_calls_collected,
-                    summary=turn_summary,
-                )
-
-        # Compaction is handled by agent.py run_stream() — no DB-level compaction needed.
-
-        if client_gone:
-            stream_log.info(
-                "client disconnected during stream",
-                session_id=conn.session_id,
-                content_length=len(collected), chunks_buffered=buf.next_id,
-            )
 
     async def _handle_reset(self, conn: "_WSConn") -> None:
-        """Handle /reset: clear DB messages, queue, attachments, and reset March session.
-        
+        """Handle /reset: clear DB messages, queue, attachments, and reset session.
+
         Only cleans data belonging to this session — other sessions are untouched.
         """
         conn.pending.clear()
@@ -1468,8 +1348,9 @@ class WSProxyPlugin(Plugin):
         if conn.session_id in self._stream_buffers:
             self._stream_buffers[conn.session_id].reset()
 
-        # Clear cached March session
-        self._march_sessions.pop(conn.session_id, None)
+        # Evict from Orchestrator cache
+        if self._orchestrator:
+            self._orchestrator.evict_session(conn.session_id)
 
         # Clean up this session's attachment folder
         attach_dir = Path.home() / ".march" / "attachments" / conn.session_id
@@ -1478,10 +1359,9 @@ class WSProxyPlugin(Plugin):
             shutil.rmtree(attach_dir, ignore_errors=True)
             logger.info("attachments cleaned", session_id=conn.session_id)
 
-        session = await self._resolve_march_session(conn.session_id)
+        # Reset agent memory for this session
         try:
-            result = await self._agent.memory.reset_session(session.id)
-            session.clear()
+            result = await self._agent.memory.reset_session(conn.session_id)
             logger.info("session reset", session_id=conn.session_id, result=str(result))
         except Exception as e:
             logger.error("session reset failed",
@@ -1491,78 +1371,21 @@ class WSProxyPlugin(Plugin):
         # Delete session memory files (facts.md, plan.md, etc.)
         try:
             from march.core.compaction import delete_session_memory
-            if delete_session_memory(session.id):
+            if delete_session_memory(conn.session_id):
                 logger.info("session memory files deleted", session_id=conn.session_id)
         except Exception as e:
             logger.warning("failed to delete session memory files",
                            session_id=conn.session_id, error=str(e))
 
-        # Clear cached session again after reset
-        self._march_sessions.pop(conn.session_id, None)
-
         await _try_send(conn.ws, {"type": "session.reset"})
 
     # ── Session Management ────────────────────────────────────────────────
 
-    def _get_stream_buffer(self, session_id: str) -> _StreamBuffer:
+    def _get_stream_buffer(self, session_id: str) -> "_StreamBuffer":
         """Get or create a stream buffer for a session."""
         if session_id not in self._stream_buffers:
             self._stream_buffers[session_id] = _StreamBuffer()
         return self._stream_buffers[session_id]
-
-    async def _resolve_march_session(self, session_id: str) -> Any:
-        """Get or create a March Session for a chat session ID.
-
-        Sessions are cached in memory for the process lifetime.
-        DB is only used to bootstrap a session on first access (e.g. after restart).
-        The agent's own compaction handles context growth — we don't truncate here.
-
-        On cold start, distinguishes between:
-        - Completed turns (user+assistant pairs) → loaded as context history
-        - Unprocessed user messages (trailing user msgs with no assistant reply)
-          → returned separately so the caller can re-trigger the agent
-        """
-        from march.core.session import Session
-        from march.core.message import Message
-
-        # Return cached session if available (preserves full tool call context)
-        if session_id in self._march_sessions:
-            return self._march_sessions[session_id]
-
-        # First access: bootstrap from DB
-        session = Session(
-            id=session_id,
-            source_type="ws_proxy",
-            source_id=session_id,
-        )
-
-        # Load recent messages to give the LLM some context on restart
-        keep_recent = self._keep_recent
-        recent = await self._db.get_recent_messages(session_id, limit=keep_recent)
-
-        # Split into context (completed turns) and unprocessed user messages.
-        # Walk backwards from the end: any trailing user messages that have
-        # no assistant reply after them are "unprocessed".
-        context_msgs = list(recent)
-        unprocessed: list[dict] = []
-        while context_msgs and context_msgs[-1].get("role") == "user":
-            unprocessed.insert(0, context_msgs.pop())
-
-        # Load context (completed turns) into session history
-        for msg in context_msgs:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if content:
-                session.add_message(Message(role=role, content=content))
-
-        # Store unprocessed messages for the caller to handle
-        session.metadata["_unprocessed_messages"] = [
-            m.get("content", "") for m in unprocessed if m.get("content")
-        ]
-
-        self._march_sessions[session_id] = session
-        return session
-
 
 
 # ── Internal Helpers ──────────────────────────────────────────────────────────
@@ -1586,7 +1409,6 @@ class _StreamBuffer:
 
     Stores chunks with sequential IDs. On reconnect, client sends
     last_chunk_id and server replays the gap.
-    Also tracks draft_id for periodic SQLite saves.
     """
 
     def __init__(self, max_chunks: int = 2000) -> None:
@@ -1596,9 +1418,6 @@ class _StreamBuffer:
         self.streaming: bool = False
         self.collected: str = ""  # Full text accumulated so far
         self.done: bool = False  # True when stream finished
-        self.draft_id: str = ""  # DB message ID for draft saves
-        self.last_draft_save_chunks: int = 0  # Chunk count at last draft save
-        self.last_draft_save_time: float = 0.0  # Timestamp of last draft save
 
     def add_chunk(self, msg: dict) -> dict:
         """Add a chunk to the buffer, returns the chunk with id."""
@@ -1618,19 +1437,6 @@ class _StreamBuffer:
                 result.append(chunk)
         return result
 
-    def needs_draft_save(self, chunk_interval: int = 10, time_interval: float = 60.0) -> bool:
-        """Check if we should save a draft to SQLite."""
-        if not self.collected:
-            return False
-        chunks_since = self.next_id - self.last_draft_save_chunks
-        time_since = time.monotonic() - self.last_draft_save_time
-        return chunks_since >= chunk_interval or time_since >= time_interval
-
-    def mark_draft_saved(self) -> None:
-        """Mark that a draft save just happened."""
-        self.last_draft_save_chunks = self.next_id
-        self.last_draft_save_time = time.monotonic()
-
     def reset(self) -> None:
         """Reset buffer for a new stream."""
         self.chunks.clear()
@@ -1638,9 +1444,6 @@ class _StreamBuffer:
         self.streaming = False
         self.collected = ""
         self.done = False
-        self.draft_id = ""
-        self.last_draft_save_chunks = 0
-        self.last_draft_save_time = 0.0
 
 
 async def _try_send(ws: Any, msg: dict) -> None:

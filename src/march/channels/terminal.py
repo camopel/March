@@ -1,8 +1,7 @@
 """Terminal channel for the March agent framework.
 
-Interactive terminal interface using Rich for formatted output.
-Reads user input, sends to the agent, and displays streaming responses
-with tool execution indicators.
+Pure I/O adapter: reads stdin, writes stdout, delegates all agent logic
+to the Orchestrator.  Never touches Agent or SessionStore directly.
 """
 
 from __future__ import annotations
@@ -18,22 +17,43 @@ from rich.panel import Panel
 from rich.text import Text
 
 from march.channels.base import Channel
-from march.core.agent import Agent, AgentResponse
-from march.core.session import Session
-from march.llm.base import StreamChunk
+from march.core.orchestrator import (
+    Cancelled,
+    Error,
+    FinalResponse,
+    Orchestrator,
+    OrchestratorEvent,
+    TextDelta,
+    ToolProgress,
+)
 from march.logging import get_logger
 
+if TYPE_CHECKING:
+    from march.core.agent import Agent
+    from march.core.session import SessionStore
+
 logger = get_logger("march.terminal")
+
+# Deterministic session id for the interactive terminal.
+_TERMINAL_SESSION_ID = "terminal-interactive"
 
 
 class TerminalChannel(Channel):
     """Interactive terminal channel using Rich.
 
+    Acts as a pure I/O adapter — all agent interaction flows through the
+    Orchestrator.  The channel is responsible only for:
+
+    - Reading user input (readline via Rich)
+    - Converting user text → ``Orchestrator.handle_message()``
+    - Rendering ``OrchestratorEvent`` objects to the terminal
+    - Handling slash commands (/stop, /reset, /quit, etc.)
+
     Features:
-    - Formatted markdown output
-    - Streaming response display
-    - Tool execution indicators
-    - Ctrl+C handling (cancel current, double to quit)
+    - Formatted markdown output via Rich
+    - Streaming response display (TextDelta → incremental render)
+    - Tool execution indicators (ToolProgress → status lines)
+    - Ctrl+C / /stop handling via cancel_event
     """
 
     name: str = "terminal"
@@ -46,30 +66,25 @@ class TerminalChannel(Channel):
         self.streaming = streaming
         self.theme = theme
         self.console = Console()
-        self._agent: Agent | None = None
-        self._session: Session | None = None
+        self._orchestrator: Orchestrator | None = None
         self._running = False
         self._cancel_event: asyncio.Event = asyncio.Event()
 
-    async def start(self, agent: Agent, **kwargs: Any) -> None:
+    async def start(self, agent: "Agent", **kwargs: Any) -> None:
         """Start the interactive terminal loop.
 
-        Reads user input, sends to agent, displays response.
-        Handles Ctrl+C gracefully.
+        Creates an Orchestrator from the provided agent + session_store,
+        then enters the read-eval-print loop.
         """
-        self._agent = agent
-        session_store = kwargs.get("session_store")
+        session_store: SessionStore | None = kwargs.get("session_store")
+        if session_store is None:
+            # Fallback: create an in-memory session store so the orchestrator
+            # can still function (useful for quick testing).
+            from march.core.session import SessionStore
+            session_store = SessionStore(":memory:")
+            await session_store.initialize()
 
-        # Use session store for persistence if available
-        if session_store:
-            self._session = await session_store.get_or_create_session(
-                "terminal", "terminal-interactive", name="Terminal"
-            )
-        else:
-            self._session = kwargs.get("session") or Session(
-                source_type="terminal",
-                source_id="terminal-interactive",
-            )
+        self._orchestrator = Orchestrator(agent=agent, session_store=session_store)
         self._running = True
 
         # Display welcome banner
@@ -87,15 +102,13 @@ class TerminalChannel(Channel):
                     continue
 
                 # Handle special commands
-                if self._handle_command(user_input):
+                if await self._handle_command(user_input):
                     continue
 
-                # Process message
+                # Process message through the Orchestrator
                 self.console.print()
-                if self.streaming:
-                    await self._process_streaming(user_input)
-                else:
-                    await self._process_blocking(user_input)
+                self._cancel_event.clear()
+                await self._process_message(user_input)
                 self.console.print()
 
             except KeyboardInterrupt:
@@ -104,7 +117,7 @@ class TerminalChannel(Channel):
                     self.console.print("\n[dim]Goodbye![/dim]")
                     break
                 self._cancel_event.set()
-                self.console.print("\n[dim]Press Ctrl+C again to quit[/dim]")
+                self.console.print("\n[yellow]⏹ Stopping...[/yellow] [dim](Ctrl+C again to quit)[/dim]")
                 # Reset after a short delay
                 asyncio.get_event_loop().call_later(
                     2.0, self._cancel_event.clear
@@ -127,43 +140,18 @@ class TerminalChannel(Channel):
         )
 
     async def send_stream(
-        self, chunks: AsyncIterator[StreamChunk], **kwargs: Any
+        self, chunks: AsyncIterator, **kwargs: Any
     ) -> None:
-        """Send a streaming response to the terminal."""
-        collected = ""
-        with Live(
-            Text("", style="dim"),
-            console=self.console,
-            refresh_per_second=15,
-            transient=True,
-        ) as live:
-            async for chunk in chunks:
-                if isinstance(chunk, AgentResponse):
-                    # Final response metadata — don't display in stream
-                    break
+        """Legacy send_stream — kept for Channel ABC compliance.
 
-                if chunk.tool_call_delta:
-                    name = chunk.tool_call_delta.get("name", "")
-                    status = chunk.tool_call_delta.get("status", "")
-                    duration = chunk.tool_call_delta.get("duration_ms", 0)
-                    self.console.print(
-                        f"  [dim]⚙ {name}[/dim] {status} [dim]({duration:.0f}ms)[/dim]"
-                    )
+        The refactored terminal processes OrchestratorEvents directly in
+        ``_process_message`` rather than consuming raw StreamChunks.
+        """
+        # Drain the iterator so callers don't hang.
+        async for _ in chunks:
+            pass
 
-                if chunk.delta:
-                    collected += chunk.delta
-                    live.update(Markdown(collected))
-
-        # Final render
-        if collected:
-            self.console.print(
-                Panel(
-                    Markdown(collected),
-                    title="[bold blue]March[/bold blue]",
-                    border_style="blue",
-                    expand=True,
-                )
-            )
+    # ── Input ────────────────────────────────────────────────────────────
 
     async def _get_input(self) -> str | None:
         """Get user input asynchronously."""
@@ -178,13 +166,13 @@ class TerminalChannel(Channel):
         except KeyboardInterrupt:
             raise
 
-    async def _process_streaming(self, user_input: str) -> None:
-        """Process a message with streaming output."""
-        assert self._agent is not None
-        assert self._session is not None
+    # ── Message processing (Orchestrator) ────────────────────────────────
+
+    async def _process_message(self, user_input: str) -> None:
+        """Send user_input through the Orchestrator and render events."""
+        assert self._orchestrator is not None
 
         collected = ""
-        tool_notifications: list[str] = []
 
         with Live(
             Text("Thinking...", style="dim italic"),
@@ -192,75 +180,90 @@ class TerminalChannel(Channel):
             refresh_per_second=15,
             transient=True,
         ) as live:
-            final_response: AgentResponse | None = None
-
-            async for item in self._agent.run_stream(user_input, self._session):
-                if isinstance(item, AgentResponse):
-                    final_response = item
-                    break
-
-                chunk: StreamChunk = item
-
-                if chunk.tool_call_delta:
-                    name = chunk.tool_call_delta.get("name", "")
-                    status = chunk.tool_call_delta.get("status", "")
-                    duration = chunk.tool_call_delta.get("duration_ms", 0)
-                    tool_notifications.append(
-                        f"  ⚙ {name} {status} ({duration:.0f}ms)"
-                    )
-                    # Show tool notification above the streaming text
-                    for tn in tool_notifications:
-                        self.console.print(f"[dim]{tn}[/dim]")
-                    tool_notifications.clear()
-
-                if chunk.delta:
-                    collected += chunk.delta
+            async for event in self._orchestrator.handle_message(
+                session_id=_TERMINAL_SESSION_ID,
+                content=user_input,
+                source="terminal",
+                cancel_event=self._cancel_event,
+            ):
+                if isinstance(event, TextDelta):
+                    collected += event.delta
                     live.update(Markdown(collected))
 
-        # Final render
-        if collected:
+                elif isinstance(event, ToolProgress):
+                    self._render_tool_progress(event)
+
+                elif isinstance(event, FinalResponse):
+                    # Stop the Live context before final render
+                    break
+
+                elif isinstance(event, Cancelled):
+                    live.update(Text(""))
+                    self.console.print("[yellow]⏹ Stopped[/yellow]")
+                    if event.partial_content:
+                        # Show whatever was collected before cancellation
+                        self.console.print(
+                            Panel(
+                                Markdown(event.partial_content),
+                                title="[bold blue]March[/bold blue] [dim](partial)[/dim]",
+                                border_style="yellow",
+                                expand=True,
+                            )
+                        )
+                    return
+
+                elif isinstance(event, Error):
+                    live.update(Text(""))
+                    self.console.print(f"[bold red]Error:[/bold red] {event.message}")
+                    return
+
+        # Final render of the complete response
+        display_content = collected
+        final_event: FinalResponse | None = None
+
+        # Check if the last event was a FinalResponse (we broke out of the loop)
+        if isinstance(event, FinalResponse):  # type: ignore[possibly-undefined]
+            final_event = event
+            # Use the FinalResponse content if we didn't collect any streaming text
+            if not display_content and final_event.content:
+                display_content = final_event.content
+
+        if display_content:
             self.console.print(
                 Panel(
-                    Markdown(collected),
+                    Markdown(display_content),
                     title="[bold blue]March[/bold blue]",
                     border_style="blue",
                     expand=True,
                 )
             )
 
-        # Show usage info if available
-        if final_response and final_response.total_tokens > 0:
+        # Show usage info
+        if final_event and final_event.total_tokens > 0:
             self.console.print(
-                f"[dim]tokens: {final_response.total_tokens} | "
-                f"cost: ${final_response.total_cost:.4f} | "
-                f"time: {final_response.duration_ms:.0f}ms | "
-                f"tools: {final_response.tool_calls_made}[/dim]"
+                f"[dim]tokens: {final_event.total_tokens} | "
+                f"cost: ${final_event.total_cost:.4f} | "
+                f"tools: {final_event.tool_calls_made}[/dim]"
             )
 
-    async def _process_blocking(self, user_input: str) -> None:
-        """Process a message without streaming."""
-        assert self._agent is not None
-        assert self._session is not None
+    def _render_tool_progress(self, event: ToolProgress) -> None:
+        """Render a tool progress event as a status line."""
+        if event.status == "complete":
+            icon = "[green]✓[/green]"
+            detail = f"[dim]({event.duration_ms:.0f}ms)[/dim]"
+        elif event.status == "error":
+            icon = "[red]✗[/red]"
+            detail = f"[red]{event.summary}[/red]" if event.summary else ""
+        elif event.status == "started":
+            icon = "[dim]⚙[/dim]"
+            detail = ""
+        else:
+            icon = "[dim]·[/dim]"
+            detail = event.summary or ""
 
-        with self.console.status("[bold blue]Thinking...[/bold blue]"):
-            response = await self._agent.run(user_input, self._session)
+        self.console.print(f"  {icon} {event.name} {detail}")
 
-        self.console.print(
-            Panel(
-                Markdown(response.content),
-                title="[bold blue]March[/bold blue]",
-                border_style="blue",
-                expand=True,
-            )
-        )
-
-        if response.total_tokens > 0:
-            self.console.print(
-                f"[dim]tokens: {response.total_tokens} | "
-                f"cost: ${response.total_cost:.4f} | "
-                f"time: {response.duration_ms:.0f}ms | "
-                f"tools: {response.tool_calls_made}[/dim]"
-            )
+    # ── Banner & commands ────────────────────────────────────────────────
 
     def _show_banner(self) -> None:
         """Display the welcome banner."""
@@ -275,7 +278,7 @@ class TerminalChannel(Channel):
         )
         self.console.print()
 
-    def _handle_command(self, text: str) -> bool:
+    async def _handle_command(self, text: str) -> bool:
         """Handle slash commands. Returns True if the input was a command."""
         if not text.startswith("/"):
             return False
@@ -286,9 +289,10 @@ class TerminalChannel(Channel):
             self.console.print(
                 Panel(
                     "[bold]/help[/bold]  — Show this help\n"
+                    "[bold]/stop[/bold]  — Cancel current generation\n"
                     "[bold]/reset[/bold] — Clear session history\n"
                     "[bold]/history[/bold] — Show conversation history\n"
-                    "[bold]/status[/bold] — Show agent status\n"
+                    "[bold]/status[/bold] — Show session status\n"
                     "[bold]/quit[/bold]  — Exit",
                     title="Commands",
                     border_style="dim",
@@ -302,38 +306,54 @@ class TerminalChannel(Channel):
             self.console.print("[dim]Goodbye![/dim]")
             return True
 
-        if cmd == "/reset":
-            # Delegate to agent for full memory cleanup
-            return False
+        if cmd == "/stop":
+            self._cancel_event.set()
+            self.console.print("[yellow]⏹ Stopped[/yellow]")
+            return True
 
-        if cmd == "/rmb":
-            # Delegate to agent for global memory storage
-            return False
+        if cmd == "/reset":
+            assert self._orchestrator is not None
+            try:
+                await self._orchestrator.reset_session(_TERMINAL_SESSION_ID)
+                self.console.print("[dim]Session reset.[/dim]")
+            except Exception as exc:
+                self.console.print(f"[red]Reset failed: {exc}[/red]")
+            return True
 
         if cmd == "/history":
-            assert self._session is not None
-            if not self._session.history:
+            assert self._orchestrator is not None
+            session = self._orchestrator.get_cached_session(_TERMINAL_SESSION_ID)
+            if session is None or not session.history:
                 self.console.print("[dim]No history yet.[/dim]")
             else:
-                for msg in self._session.history:
+                for msg in session.history:
                     role = msg.role.value if hasattr(msg.role, "value") else msg.role
-                    preview = (msg.content[:100] + "...") if len(msg.content) > 100 else msg.content
+                    content_str = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    preview = (content_str[:100] + "...") if len(content_str) > 100 else content_str
                     self.console.print(f"[bold]{role}[/bold]: {preview}")
             return True
 
         if cmd == "/status":
+            assert self._orchestrator is not None
+            session = self._orchestrator.get_cached_session(_TERMINAL_SESSION_ID)
+            msg_count = len(session.history) if session else 0
+            tool_count = self._orchestrator.agent.tools.tool_count if self._orchestrator.agent.tools else 0
             self.console.print(
                 Panel(
-                    f"Session: {self._session.id if self._session else 'none'}\n"
-                    f"Messages: {len(self._session.history) if self._session else 0}\n"
+                    f"Session: {_TERMINAL_SESSION_ID}\n"
+                    f"Messages: {msg_count}\n"
                     f"Streaming: {self.streaming}\n"
-                    f"Tools: {self._agent.tools.tool_count if self._agent else 0}",
+                    f"Tools: {tool_count}",
                     title="Status",
                     border_style="dim",
                     expand=False,
                 )
             )
             return True
+
+        # /rmb — delegate to agent (not a terminal-level command)
+        if cmd == "/rmb":
+            return False
 
         self.console.print(f"[dim]Unknown command: {cmd}. Type /help for available commands.[/dim]")
         return True
