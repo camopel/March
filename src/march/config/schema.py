@@ -212,20 +212,35 @@ class PluginsConfig(BaseModel):
 # ─── Agent / Sub-Agent Config ───
 
 
-class SubagentConfig(BaseModel):
-    """Sub-agent configuration."""
+class MtConfig(BaseModel):
+    """mtAgent (multi-thread, asyncio) configuration."""
 
     max_concurrent: int = 8
+
+
+class MpConfig(BaseModel):
+    """mpAgent (multi-process, isolated) configuration."""
+
+    max_concurrent: int = 8
+    heartbeat_interval_seconds: int = 60
+    heartbeat_timeout_seconds: int = 300
+    kill_grace_seconds: int = 10
+    spawn_method: str = "spawn"  # "spawn" | "forkserver"
+
+
+class SubagentsCommonConfig(BaseModel):
+    """Common sub-agent configuration shared by mt and mp."""
+
     max_spawn_depth: int = 1
-    reset_after_complete_minutes: int = 60
-    announce_timeout_seconds: int = 60
 
 
 class AgentsConfig(BaseModel):
     """Agent manager configuration."""
 
     max_concurrent: int = 4
-    subagents: SubagentConfig = Field(default_factory=SubagentConfig)
+    mt: MtConfig = Field(default_factory=MtConfig)
+    mp: MpConfig = Field(default_factory=MpConfig)
+    subagents: SubagentsCommonConfig = Field(default_factory=SubagentsCommonConfig)
 
 
 # ─── Dashboard Config ───

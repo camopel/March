@@ -505,7 +505,8 @@ class TestTurnLogger:
     def test_turn_start_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_start(turn_id="t1", session_id="s1", user_msg="hello", source="test")
-        lines = logger._path.read_text().strip().split("\n")
+        log_file = logger._resolve_path("s1")
+        lines = log_file.read_text().strip().split("\n")
         data = json.loads(lines[0])
         assert data["event"] == "turn_start"
         assert data["turn_id"] == "t1"
@@ -514,44 +515,51 @@ class TestTurnLogger:
     def test_turn_complete_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_complete(turn_id="t2", session_id="s2", tool_calls=3, total_tokens=500, total_cost=0.01, duration_ms=1234.5, final_reply_length=100)
-        data = json.loads(logger._path.read_text().strip())
+        log_file = logger._resolve_path("s2")
+        data = json.loads(log_file.read_text().strip())
         assert data["event"] == "turn_complete"
         assert data["tool_calls"] == 3
 
     def test_tool_call_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.tool_call(turn_id="t3", session_id="s3", name="web_search", args={"query": "cats"}, duration_ms=200.0, status="complete", summary="Found 5 results")
-        data = json.loads(logger._path.read_text().strip())
+        log_file = logger._resolve_path("s3")
+        data = json.loads(log_file.read_text().strip())
         assert data["event"] == "tool_call"
         assert data["name"] == "web_search"
 
     def test_turn_cancelled_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_cancelled(turn_id="t4", session_id="s4", partial_content_length=42)
-        data = json.loads(logger._path.read_text().strip())
+        log_file = logger._resolve_path("s4")
+        data = json.loads(log_file.read_text().strip())
         assert data["event"] == "turn_cancelled"
 
     def test_turn_error_writes_jsonl(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
         logger.turn_error(turn_id="t5", session_id="s5", error="kaboom")
-        data = json.loads(logger._path.read_text().strip())
+        log_file = logger._resolve_path("s5")
+        data = json.loads(log_file.read_text().strip())
         assert data["event"] == "turn_error"
 
     def test_log_rotation(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
-        log_file = logger._path
+        session_id = "s-rot"
+        log_file = logger._resolve_path(session_id)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.write_text("x" * (_MAX_FILE_BYTES + 1))
-        logger.turn_start(turn_id="t-rot", session_id="s-rot", user_msg="rotate", source="test")
+        logger.turn_start(turn_id="t-rot", session_id=session_id, user_msg="rotate", source="test")
         assert log_file.with_suffix(".jsonl.1").exists()
         assert "t-rot" in log_file.read_text()
 
     def test_thread_safety(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
+        session_id = "s-thread"
         num_threads, writes_per = 10, 50
 
         def writer(tid: int):
             for i in range(writes_per):
-                logger.turn_start(turn_id=f"t-{tid}-{i}", session_id=f"s-{tid}", user_msg=f"msg-{i}", source="test")
+                logger.turn_start(turn_id=f"t-{tid}-{i}", session_id=session_id, user_msg=f"msg-{i}", source="test")
 
         threads = [threading.Thread(target=writer, args=(tid,)) for tid in range(num_threads)]
         for t in threads:
@@ -559,27 +567,33 @@ class TestTurnLogger:
         for t in threads:
             t.join()
 
-        lines = logger._path.read_text().strip().split("\n")
+        log_file = logger._resolve_path(session_id)
+        lines = log_file.read_text().strip().split("\n")
         assert len(lines) == num_threads * writes_per
         for line in lines:
             json.loads(line)  # Should not raise
 
     def test_json_serialization_non_serializable(self, tmp_path: Path):
         logger = TurnLogger(log_dir=tmp_path)
+        session_id = "s-weird"
 
         class Weird:
             pass
 
-        logger.tool_call(turn_id="t-weird", session_id="s-weird", name="test_tool", args={"obj": Weird()}, duration_ms=10.0, status="complete", summary="ok")
-        data = json.loads(logger._path.read_text().strip())
+        logger.tool_call(turn_id="t-weird", session_id=session_id, name="test_tool", args={"obj": Weird()}, duration_ms=10.0, status="complete", summary="ok")
+        log_file = logger._resolve_path(session_id)
+        data = json.loads(log_file.read_text().strip())
         assert "Weird" in data["args"]["obj"]
 
     def test_creates_log_dir(self, tmp_path: Path):
         log_dir = tmp_path / "nested" / "logs"
         logger = TurnLogger(log_dir=log_dir)
-        logger.turn_start(turn_id="t-dir", session_id="s-dir", user_msg="hi", source="test")
-        assert logger._path.exists()
-        assert (log_dir / "turns").is_dir()
+        session_id = "s-dir"
+        logger.turn_start(turn_id="t-dir", session_id=session_id, user_msg="hi", source="test")
+        log_file = logger._resolve_path(session_id)
+        assert log_file.exists()
+        # Session dir should exist under log_dir
+        assert (log_dir / session_id).is_dir()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2160,12 +2174,12 @@ class TestLogDirectoryStructure:
     """Verify the log subdirectory layout is created on startup."""
 
     def test_ensure_log_subdirectories(self, tmp_path: Path):
-        """ensure_log_subdirectories creates all canonical subdirs."""
-        from march.core.log_maintenance import ensure_log_subdirectories, LOG_SUBDIRS
+        """ensure_log_subdirectories creates shared subdirs (metrics, dashboard)."""
+        from march.core.log_maintenance import ensure_log_subdirectories, SHARED_SUBDIRS
 
         result = ensure_log_subdirectories(tmp_path)
         assert result == tmp_path
-        for name in LOG_SUBDIRS:
+        for name in SHARED_SUBDIRS:
             assert (tmp_path / name).is_dir(), f"Missing subdir: {name}"
 
     def test_subdirectories_are_idempotent(self, tmp_path: Path):
@@ -2174,28 +2188,30 @@ class TestLogDirectoryStructure:
 
         ensure_log_subdirectories(tmp_path)
         ensure_log_subdirectories(tmp_path)  # second call — no error
-        assert (tmp_path / "agent").is_dir()
+        assert (tmp_path / "metrics").is_dir()
 
     def test_canonical_subdirs_list(self):
-        """The canonical subdirectory list includes all expected names."""
-        from march.core.log_maintenance import LOG_SUBDIRS
+        """The shared subdirectory list includes all expected names."""
+        from march.core.log_maintenance import SHARED_SUBDIRS
 
-        expected = {"agent", "turns", "metrics", "dashboard"}
-        assert set(LOG_SUBDIRS) == expected
+        expected = {"metrics", "dashboard"}
+        assert set(SHARED_SUBDIRS) == expected
 
-    def test_configure_logging_creates_agent_dir(self, tmp_path: Path):
-        """configure_logging() creates the agent/ subdir and a DateBasedFileHandler."""
+    def test_configure_logging_creates_session_dir(self, tmp_path: Path):
+        """A DateBasedFileHandler creates its log directory."""
         from march.logging.handlers import DateBasedFileHandler
 
-        agent_dir = tmp_path / "agent"
-        handler = DateBasedFileHandler(log_dir=agent_dir, ext=".log")
-        assert agent_dir.is_dir()
+        session_dir = tmp_path / "test-session"
+        handler = DateBasedFileHandler(log_dir=session_dir, ext=".log")
+        assert session_dir.is_dir()
         handler.close()
 
-    def test_turn_logger_creates_turns_subdir(self, tmp_path: Path):
-        """TurnLogger creates turns/ subdir under its log_dir."""
+    def test_turn_logger_creates_session_subdir(self, tmp_path: Path):
+        """TurnLogger creates {session_id}/ subdir under its log_dir."""
         logger = TurnLogger(log_dir=tmp_path)
-        assert (tmp_path / "turns").is_dir()
+        session_id = "test-sess"
+        logger.turn_start(turn_id="t1", session_id=session_id, user_msg="hi", source="test")
+        assert (tmp_path / session_id).is_dir()
 
     def test_metrics_logger_creates_metrics_dir(self, tmp_path: Path):
         """MetricsLogger creates its metrics directory."""
@@ -2212,14 +2228,15 @@ class TestLogDateRotation:
     """Verify that logs rotate by date (each day → new file)."""
 
     def test_turn_logger_uses_date_filename(self, tmp_path: Path):
-        """TurnLogger writes to turns/YYYY-MM-DD.jsonl."""
+        """TurnLogger writes to {session_id}/YYYY-MM-DD.jsonl."""
         from datetime import datetime, timezone
 
         logger = TurnLogger(log_dir=tmp_path)
-        logger.turn_start(turn_id="t1", session_id="s1", user_msg="hi", source="test")
+        session_id = "s1"
+        logger.turn_start(turn_id="t1", session_id=session_id, user_msg="hi", source="test")
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        expected = tmp_path / "turns" / f"{today}.jsonl"
+        expected = tmp_path / session_id / f"{today}.jsonl"
         assert expected.exists()
         data = json.loads(expected.read_text().strip())
         assert data["event"] == "turn_start"
@@ -2271,21 +2288,19 @@ class TestLogDateRotation:
         from unittest.mock import patch as _patch
 
         logger = TurnLogger(log_dir=tmp_path)
-        logger.turn_start(turn_id="t1", session_id="s1", user_msg="day1", source="test")
+        session_id = "s1"
+        logger.turn_start(turn_id="t1", session_id=session_id, user_msg="day1", source="test")
 
-        old_path = logger._path
+        old_path = logger._resolve_path(session_id)
         assert old_path.exists()
 
         # Simulate date change by patching datetime in the turn_log module
         with _patch("march.core.turn_log.datetime") as mock_dt:
             mock_dt.now.return_value.isoformat.return_value = "2099-12-31T00:00:00+00:00"
             mock_dt.now.return_value.strftime.return_value = "2099-12-31"
-            # Force the date check to see a new date
-            logger._current_date = "2099-12-31"
-            logger._path = tmp_path / "turns" / "2099-12-31.jsonl"
-            logger.turn_start(turn_id="t2", session_id="s1", user_msg="day2", source="test")
+            logger.turn_start(turn_id="t2", session_id=session_id, user_msg="day2", source="test")
 
-        new_path = tmp_path / "turns" / "2099-12-31.jsonl"
+        new_path = tmp_path / session_id / "2099-12-31.jsonl"
         assert old_path.exists()
         assert new_path.exists()
         assert "day1" in old_path.read_text()
@@ -2293,22 +2308,24 @@ class TestLogDateRotation:
 
 
 class TestTurnLogPerDate:
-    """Verify turn logs are split by date."""
+    """Verify turn logs are split by date and by session."""
 
     def test_turn_log_writes_to_dated_file(self, tmp_path: Path):
-        """Each turn event goes to turns/YYYY-MM-DD.jsonl."""
+        """Each turn event goes to {session_id}/YYYY-MM-DD.jsonl."""
         from datetime import datetime, timezone
 
         logger = TurnLogger(log_dir=tmp_path)
-        logger.turn_start(turn_id="t1", session_id="s1", user_msg="hello", source="test")
+        session_id = "s1"
+
+        logger.turn_start(turn_id="t1", session_id=session_id, user_msg="hello", source="test")
         logger.turn_complete(
-            turn_id="t1", session_id="s1", tool_calls=0,
+            turn_id="t1", session_id=session_id, tool_calls=0,
             total_tokens=100, total_cost=0.001, duration_ms=500,
             final_reply_length=50,
         )
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        log_file = tmp_path / "turns" / f"{today}.jsonl"
+        log_file = tmp_path / session_id / f"{today}.jsonl"
         assert log_file.exists()
 
         lines = log_file.read_text().strip().split("\n")
@@ -2316,8 +2333,8 @@ class TestTurnLogPerDate:
         assert json.loads(lines[0])["event"] == "turn_start"
         assert json.loads(lines[1])["event"] == "turn_complete"
 
-    def test_turn_log_multiple_sessions_same_file(self, tmp_path: Path):
-        """Multiple sessions on the same day write to the same dated file."""
+    def test_turn_log_multiple_sessions_separate_files(self, tmp_path: Path):
+        """Different sessions on the same day write to separate session directories."""
         from datetime import datetime, timezone
 
         logger = TurnLogger(log_dir=tmp_path)
@@ -2325,28 +2342,32 @@ class TestTurnLogPerDate:
         logger.turn_start(turn_id="t2", session_id="sess-B", user_msg="B", source="matrix")
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        log_file = tmp_path / "turns" / f"{today}.jsonl"
-        lines = log_file.read_text().strip().split("\n")
-        assert len(lines) == 2
+        log_file_a = tmp_path / "sess-A" / f"{today}.jsonl"
+        log_file_b = tmp_path / "sess-B" / f"{today}.jsonl"
+        assert log_file_a.exists()
+        assert log_file_b.exists()
 
-        sessions = {json.loads(l)["session_id"] for l in lines}
-        assert sessions == {"sess-A", "sess-B"}
+        data_a = json.loads(log_file_a.read_text().strip())
+        data_b = json.loads(log_file_b.read_text().strip())
+        assert data_a["session_id"] == "sess-A"
+        assert data_b["session_id"] == "sess-B"
 
     def test_turn_log_all_event_types_in_one_file(self, tmp_path: Path):
         """All event types (start, complete, tool, cancel, error, llm) land in the same dated file."""
         logger = TurnLogger(log_dir=tmp_path)
-        logger.turn_start(turn_id="t1", session_id="s1", user_msg="hi", source="test")
-        logger.llm_call(turn_id="t1", session_id="s1", provider="openai", model="gpt-4o",
+        session_id = "s1"
+        logger.turn_start(turn_id="t1", session_id=session_id, user_msg="hi", source="test")
+        logger.llm_call(turn_id="t1", session_id=session_id, provider="openai", model="gpt-4o",
                         input_tokens=100, output_tokens=50, cost=0.005, duration_ms=800)
-        logger.tool_call(turn_id="t1", session_id="s1", name="exec", args={"cmd": "ls"},
+        logger.tool_call(turn_id="t1", session_id=session_id, name="exec", args={"cmd": "ls"},
                          duration_ms=50, status="complete", summary="listed files")
-        logger.turn_complete(turn_id="t1", session_id="s1", tool_calls=1,
+        logger.turn_complete(turn_id="t1", session_id=session_id, tool_calls=1,
                              total_tokens=150, total_cost=0.005, duration_ms=1200,
                              final_reply_length=100)
-        logger.turn_cancelled(turn_id="t2", session_id="s1", partial_content_length=42)
-        logger.turn_error(turn_id="t3", session_id="s1", error="boom")
+        logger.turn_cancelled(turn_id="t2", session_id=session_id, partial_content_length=42)
+        logger.turn_error(turn_id="t3", session_id=session_id, error="boom")
 
-        log_file = logger._path
+        log_file = logger._resolve_path(session_id)
         lines = log_file.read_text().strip().split("\n")
         assert len(lines) == 6
 

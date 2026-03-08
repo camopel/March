@@ -30,7 +30,7 @@ LOG_RETENTION_DAYS = 7
 _configured = False
 
 
-def configure_logging(level: str = "INFO") -> None:
+def configure_logging(level: str = "INFO", session_id: str = "system") -> None:
     """Configure structlog with subsystem-tagged output.
 
     Sets up:
@@ -40,6 +40,9 @@ def configure_logging(level: str = "INFO") -> None:
 
     Args:
         level: Log level override (default: INFO).
+        session_id: Session identifier for per-session log directory.
+            Logs are written to ``~/.march/logs/{session_id}/YYYY-MM-DD.log``.
+            Defaults to ``"system"`` for startup / pre-session logging.
 
     Safe to call multiple times — only configures on first call.
     """
@@ -64,10 +67,12 @@ def configure_logging(level: str = "INFO") -> None:
     root_logger.setLevel(log_level)
     root_logger.handlers.clear()
 
-    # Date-based file handler → agent/YYYY-MM-DD.log
-    agent_log_dir = LOG_DIR / "agent"
-    agent_log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = DateBasedFileHandler(log_dir=agent_log_dir, ext=".log")
+    # Date-based file handler → {session_id}/YYYY-MM-DD.log
+    # Sanitize session_id for safe directory names
+    safe_session_id = session_id.replace("/", "_").replace("\\", "_").replace("\0", "_")
+    session_log_dir = LOG_DIR / safe_session_id
+    session_log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = DateBasedFileHandler(log_dir=session_log_dir, ext=".log")
     file_handler.setLevel(log_level)
     root_logger.addHandler(file_handler)
 

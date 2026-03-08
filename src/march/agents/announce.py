@@ -1,4 +1,4 @@
-"""Push-based completion announcer for March sub-agents.
+"""Push-based completion announcer for March agents.
 
 When a child finishes, reads the child output and delivers the result
 to the parent session using one of three strategies (in priority order):
@@ -6,7 +6,7 @@ to the parent session using one of three strategies (in priority order):
   2. Queue: Deliver after parent's current turn ends
   3. Direct: Start a new agent turn if parent is idle
 
-This is push-based — the parent never polls for sub-agent completion.
+This is push-based — the parent never polls for agent completion.
 """
 
 from __future__ import annotations
@@ -18,9 +18,20 @@ from march.logging import get_logger
 
 logger = get_logger("march.announce")
 
+# Display name mapping for execution modes
+_EXECUTION_DISPLAY = {
+    "mt": "mtAgent",
+    "mp": "mpAgent",
+}
 
-class SubagentAnnouncer:
-    """Announces sub-agent completion to parent sessions.
+
+def _agent_display_name(record: RunRecord) -> str:
+    """Return the display name based on execution mode."""
+    return _EXECUTION_DISPLAY.get(record.execution, "Agent")
+
+
+class AgentAnnouncer:
+    """Announces agent completion to parent sessions.
 
     Delivery strategies (tried in order):
     1. Steer — inject result into parent's active turn
@@ -50,7 +61,7 @@ class SubagentAnnouncer:
         """Push result back to parent session.
 
         Args:
-            record: The run record of the completed sub-agent.
+            record: The run record of the completed agent.
             outcome: The outcome of the run.
 
         Returns:
@@ -65,13 +76,15 @@ class SubagentAnnouncer:
                 logger.warning("announce: failed to read child output: %s", e)
                 output = f"(failed to read output: {e})"
 
-        # Build completion message
+        # Build completion message with execution-aware display name
+        display = _agent_display_name(record)
+
         status_header = {
-            "ok": f"✅ Subagent `{record.child_key}` finished",
-            "error": f"❌ Subagent `{record.child_key}` failed",
-            "timeout": f"⏱️ Subagent `{record.child_key}` timed out",
-            "cancelled": f"🚫 Subagent `{record.child_key}` was cancelled",
-        }.get(outcome.status, f"Subagent `{record.child_key}` ended ({outcome.status})")
+            "ok": f"✅ {display} `{record.child_key}` finished",
+            "error": f"❌ {display} `{record.child_key}` failed",
+            "timeout": f"⏱️ {display} `{record.child_key}` timed out",
+            "cancelled": f"🚫 {display} `{record.child_key}` was cancelled",
+        }.get(outcome.status, f"{display} `{record.child_key}` ended ({outcome.status})")
 
         parts = [status_header]
         if outcome.error:
@@ -125,9 +138,9 @@ class SubagentAnnouncer:
                 record.requester_key,
             )
 
-        # Sub-agent sessions are NOT deleted on completion.
+        # Agent sessions are NOT deleted on completion.
         # They persist until the parent session does /reset,
-        # so the parent can reference sub-agent context/history.
+        # so the parent can reference agent context/history.
         # Cleanup is handled by AgentManager.reset_children().
 
         return delivered
@@ -144,3 +157,7 @@ class SubagentAnnouncer:
     def pending_count(self) -> int:
         """Total number of pending announcements across all requesters."""
         return sum(len(msgs) for msgs in self._pending_queue.values())
+
+
+# Backward compatibility
+SubagentAnnouncer = AgentAnnouncer

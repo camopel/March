@@ -12,6 +12,9 @@ import pytest
 
 from march.core.turn_log import TurnLogger, _MAX_FILE_BYTES, _MAX_ROTATED
 
+# Default session_id used by most tests
+_TEST_SESSION = "test-session"
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -26,6 +29,11 @@ def _make_logger(tmp_path: Path) -> TurnLogger:
     return TurnLogger(log_dir=log_dir)
 
 
+def _log_path(logger: TurnLogger, session_id: str = _TEST_SESSION) -> Path:
+    """Return the resolved log file path for a given session_id."""
+    return logger._resolve_path(session_id)
+
+
 # ── TestTurnLogger ───────────────────────────────────────────────────
 
 class TestTurnLogger:
@@ -38,7 +46,8 @@ class TestTurnLogger:
             user_msg="hello",
             source="cli",
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, "s1")
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         assert entry["event"] == "turn_start"
@@ -59,7 +68,8 @@ class TestTurnLogger:
             duration_ms=1234.5,
             final_reply_length=200,
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, "s2")
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         assert entry["event"] == "turn_complete"
@@ -81,7 +91,8 @@ class TestTurnLogger:
             cost=0.01,
             duration_ms=500.0,
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, "s3")
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         assert entry["event"] == "llm_call"
@@ -103,7 +114,8 @@ class TestTurnLogger:
             status="ok",
             summary="Found 10 results",
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, "s4")
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         assert entry["event"] == "tool_call"
@@ -120,7 +132,8 @@ class TestTurnLogger:
             session_id="s5",
             partial_content_length=42,
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, "s5")
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         assert entry["event"] == "turn_cancelled"
@@ -133,7 +146,8 @@ class TestTurnLogger:
             session_id="s6",
             error="Connection timeout",
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, "s6")
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         assert entry["event"] == "turn_error"
@@ -142,9 +156,11 @@ class TestTurnLogger:
     def test_log_rotation_50mb(self, tmp_path: Path) -> None:
         """Create file >50MB, verify rotation to .jsonl.1 (keep max 3)."""
         logger = _make_logger(tmp_path)
-        log_path = logger._path
+        session_id = "srot"
+        log_path = _log_path(logger, session_id)
 
         # Pre-fill the log file to just over 50 MB
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as fh:
             # Write ~51 MB of data
             chunk = "x" * (1024 * 1024) + "\n"  # ~1 MB per line
@@ -156,7 +172,7 @@ class TestTurnLogger:
         # Next write should trigger rotation
         logger.turn_start(
             turn_id="rot1",
-            session_id="srot",
+            session_id=session_id,
             user_msg="after rotation",
             source="test",
         )
@@ -179,7 +195,7 @@ class TestTurnLogger:
                     fh.write(chunk)
             logger.turn_start(
                 turn_id=f"rot{i}",
-                session_id="srot",
+                session_id=session_id,
                 user_msg="rotation",
                 source="test",
             )
@@ -194,6 +210,7 @@ class TestTurnLogger:
     def test_thread_safety(self, tmp_path: Path) -> None:
         """Concurrent writes from 10 threads, verify no corruption."""
         logger = _make_logger(tmp_path)
+        session_id = "s-thread"
         n_threads = 10
         writes_per_thread = 50
         barrier = threading.Barrier(n_threads)
@@ -203,7 +220,7 @@ class TestTurnLogger:
             for i in range(writes_per_thread):
                 logger.turn_start(
                     turn_id=f"t-{tid}-{i}",
-                    session_id=f"s-{tid}",
+                    session_id=session_id,
                     user_msg=f"msg-{tid}-{i}",
                     source="thread",
                 )
@@ -214,7 +231,8 @@ class TestTurnLogger:
         for t in threads:
             t.join()
 
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, session_id)
+        lines = _read_lines(log_file)
         assert len(lines) == n_threads * writes_per_thread
 
         # Every line should be valid JSON (no corruption / interleaving)
@@ -225,6 +243,7 @@ class TestTurnLogger:
     def test_json_serialization_non_serializable(self, tmp_path: Path) -> None:
         """Pass non-serializable args, verify graceful handling."""
         logger = _make_logger(tmp_path)
+        session_id = "s-ns"
 
         class Custom:
             pass
@@ -232,14 +251,15 @@ class TestTurnLogger:
         obj = Custom()
         logger.tool_call(
             turn_id="t-ns",
-            session_id="s-ns",
+            session_id=session_id,
             name="custom_tool",
             args={"obj": obj, "normal": 42},
             duration_ms=10.0,
             status="ok",
             summary="handled",
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, session_id)
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         entry = lines[0]
         # The non-serializable value should have been converted via repr()
@@ -249,31 +269,35 @@ class TestTurnLogger:
     def test_user_msg_truncation(self, tmp_path: Path) -> None:
         """Long user msg (>2000 chars) truncated in log."""
         logger = _make_logger(tmp_path)
+        session_id = "s-trunc"
         long_msg = "A" * 5000
         logger.turn_start(
             turn_id="t-trunc",
-            session_id="s-trunc",
+            session_id=session_id,
             user_msg=long_msg,
             source="test",
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, session_id)
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         assert len(lines[0]["user_msg"]) == 2000
 
     def test_summary_truncation(self, tmp_path: Path) -> None:
         """Long summary (>500 chars) truncated."""
         logger = _make_logger(tmp_path)
+        session_id = "s-sum"
         long_summary = "B" * 1000
         logger.tool_call(
             turn_id="t-sum",
-            session_id="s-sum",
+            session_id=session_id,
             name="tool",
             args={},
             duration_ms=1.0,
             status="ok",
             summary=long_summary,
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, session_id)
+        lines = _read_lines(log_file)
         assert len(lines) == 1
         assert len(lines[0]["summary"]) == 500
 
@@ -288,14 +312,16 @@ class TestTurnLogger:
     def test_multiple_turns_sequential(self, tmp_path: Path) -> None:
         """Write 5 turns, verify all 5 in file."""
         logger = _make_logger(tmp_path)
+        session_id = "s-seq"
         for i in range(5):
             logger.turn_start(
                 turn_id=f"seq-{i}",
-                session_id="s-seq",
+                session_id=session_id,
                 user_msg=f"msg {i}",
                 source="test",
             )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, session_id)
+        lines = _read_lines(log_file)
         assert len(lines) == 5
         for i, entry in enumerate(lines):
             assert entry["turn_id"] == f"seq-{i}"
@@ -304,13 +330,15 @@ class TestTurnLogger:
     def test_iso_timestamp_format(self, tmp_path: Path) -> None:
         """Verify ts field is valid ISO 8601."""
         logger = _make_logger(tmp_path)
+        session_id = "s-ts"
         logger.turn_start(
             turn_id="t-ts",
-            session_id="s-ts",
+            session_id=session_id,
             user_msg="timestamp check",
             source="test",
         )
-        lines = _read_lines(logger._path)
+        log_file = _log_path(logger, session_id)
+        lines = _read_lines(log_file)
         ts_str = lines[0]["ts"]
         # Should parse without error
         parsed = datetime.fromisoformat(ts_str)
@@ -323,16 +351,17 @@ class TestTurnLogger:
 class TestLogDateRotation:
 
     def test_log_per_date_file(self, tmp_path: Path) -> None:
-        """Each date should get its own log file under turns/ subdirectory."""
+        """Each date should get its own log file under {session_id}/ subdirectory."""
         logger = _make_logger(tmp_path)
+        session_id = "sd"
         logger.turn_start(
             turn_id="d1",
-            session_id="sd",
+            session_id=session_id,
             user_msg="date test",
             source="test",
         )
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        date_file = logger._dir / "turns" / f"{today}.jsonl"
+        date_file = logger._dir / session_id / f"{today}.jsonl"
         assert date_file.exists(), f"Expected per-date log file at {date_file}"
         lines = _read_lines(date_file)
         assert len(lines) == 1

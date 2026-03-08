@@ -2,7 +2,7 @@
 
 Provides:
   - ``cleanup_old_logs()`` — delete log files older than ``LOG_TTL_DAYS``
-  - ``ensure_log_subdirectories()`` — create the categorised log layout
+  - ``ensure_log_subdirectories()`` — create the shared log layout (metrics, dashboard)
   - ``migrate_flat_logs()`` — move legacy flat files into the new structure
 """
 
@@ -17,18 +17,27 @@ logger = logging.getLogger("march.log_maintenance")
 
 LOG_TTL_DAYS: int = 30
 
-# Canonical subdirectories under ~/.march/logs/
-LOG_SUBDIRS = ("agent", "turns", "metrics", "dashboard")
+# Shared subdirectories that are NOT per-session.
+# Session directories (logs/{session_id}/) are created on demand by
+# TurnLogger and the logging handlers — no need to pre-create them.
+SHARED_SUBDIRS = ("metrics", "dashboard")
+
+# Legacy subdirectories that existed before the per-session layout.
+# Kept here so ``migrate_flat_logs`` knows where old files lived.
+_LEGACY_SUBDIRS = ("agent", "turns")
 
 
 def ensure_log_subdirectories(log_dir: Path | None = None) -> Path:
-    """Create the categorised log directory tree.
+    """Create the shared log directory tree (metrics, dashboard).
+
+    Session-specific directories are created on demand by the loggers
+    themselves — this function only ensures the shared infrastructure.
 
     Returns the resolved *log_dir* for convenience.
     """
     log_dir = (log_dir or Path.home() / ".march" / "logs").expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
-    for name in LOG_SUBDIRS:
+    for name in SHARED_SUBDIRS:
         (log_dir / name).mkdir(exist_ok=True)
     return log_dir
 
@@ -36,9 +45,12 @@ def ensure_log_subdirectories(log_dir: Path | None = None) -> Path:
 def cleanup_old_logs(log_dir: Path | None = None, ttl_days: int = LOG_TTL_DAYS) -> int:
     """Delete log files older than *ttl_days*.
 
-    Scans every immediate subdirectory of *log_dir* and removes regular files
-    whose **mtime** is older than the cutoff.  Returns the number of files
-    deleted.
+    Walks every immediate subdirectory of *log_dir* (session dirs, metrics,
+    dashboard, and any legacy dirs) and removes regular files whose **mtime**
+    is older than the cutoff.  Empty session directories are pruned after
+    cleanup.
+
+    Returns the number of files deleted.
     """
     log_dir = (log_dir or Path.home() / ".march" / "logs").expanduser()
     if not log_dir.is_dir():
@@ -60,6 +72,15 @@ def cleanup_old_logs(log_dir: Path | None = None, ttl_days: int = LOG_TTL_DAYS) 
                 except OSError as exc:
                     logger.warning("Failed to delete %s: %s", f, exc)
 
+        # Prune empty session directories (but never remove shared dirs)
+        if subdir.name not in SHARED_SUBDIRS:
+            try:
+                if subdir.is_dir() and not any(subdir.iterdir()):
+                    subdir.rmdir()
+                    logger.info("Removed empty session log dir: %s", subdir)
+            except OSError:
+                pass
+
     return deleted
 
 
@@ -75,11 +96,17 @@ _MIGRATION_MAP = {
 
 
 def migrate_flat_logs(log_dir: Path | None = None) -> int:
-    """Move legacy flat log files into the new subdirectory layout.
+    """Move legacy flat log files into appropriate locations.
 
-    Old files are renamed into their respective subdirectory with a
-    ``migrated-YYYY-MM-DD`` prefix so they don't collide with fresh
-    date-based files.  Returns the number of files migrated.
+    Flat files at the top level of *log_dir* are moved into their respective
+    subdirectory with a ``migrated-YYYY-MM-DD`` prefix so they don't collide
+    with fresh date-based files.
+
+    Legacy ``agent/`` and ``turns/`` subdirectories are left in place (backward
+    compatible) — they are not deleted, but new logs will no longer be written
+    there.
+
+    Returns the number of files migrated.
     """
     log_dir = (log_dir or Path.home() / ".march" / "logs").expanduser()
     if not log_dir.is_dir():

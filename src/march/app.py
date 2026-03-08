@@ -154,18 +154,15 @@ class MarchApp:
 
         # Initialize agent manager with task queue, announcer, and agent factory
         from march.agents.manager import AgentManager, AgentManagerConfig
-        from march.agents.announce import SubagentAnnouncer
+        from march.agents.announce import AgentAnnouncer
         from march.agents.task_queue import TaskQueue
 
         agent_mgr_config = AgentManagerConfig(
             max_spawn_depth=self.config.agents.subagents.max_spawn_depth,
-            max_concurrent_subagents=self.config.agents.subagents.max_concurrent,
-            reset_after_complete_minutes=self.config.agents.subagents.reset_after_complete_minutes,
-            announce_timeout_seconds=self.config.agents.subagents.announce_timeout_seconds,
         )
         self.task_queue = TaskQueue()
 
-        # --- SubagentAnnouncer callbacks ---
+        # --- AgentAnnouncer callbacks ---
 
         async def _read_child_output(child_key: str) -> str:
             """Read the last assistant message from a child session."""
@@ -199,7 +196,7 @@ class MarchApp:
                     return
             raise RuntimeError("No orchestrator available for direct delivery")
 
-        announcer = SubagentAnnouncer(
+        announcer = AgentAnnouncer(
             read_child_output=_read_child_output,
             try_steer=_try_steer,
             try_queue=_try_queue,
@@ -231,6 +228,8 @@ class MarchApp:
 
         self.agent_manager = AgentManager(
             config=agent_mgr_config,
+            mt_config=self.config.agents.mt,
+            mp_config=self.config.agents.mp,
             task_queue=self.task_queue,
             session_store=self.session_store,
             agent_factory=_create_child_agent,

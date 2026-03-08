@@ -1,6 +1,6 @@
 """Structured JSONL turn logger for debugging agent turns.
 
-Writes one JSON line per event to ``~/.march/logs/turns/YYYY-MM-DD.jsonl``.
+Writes one JSON line per event to ``~/.march/logs/{session_id}/YYYY-MM-DD.jsonl``.
 Thread-safe, with automatic log rotation when a daily file exceeds 50 MB
 (keeps up to 3 rotated files per day).
 
@@ -27,6 +27,17 @@ _MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
 _MAX_ROTATED = 3
 
 
+def _sanitize_session_id(session_id: str) -> str:
+    """Sanitize session_id for safe use as a directory name.
+
+    Replaces path separators and other problematic characters with underscores.
+    """
+    # Replace characters that are unsafe in directory names
+    for ch in ("/", "\\", "\0"):
+        session_id = session_id.replace(ch, "_")
+    return session_id
+
+
 class TurnLogger:
     """Append-only JSONL logger for agent turn events.
 
@@ -34,32 +45,27 @@ class TurnLogger:
     ----------
     log_dir:
         Parent directory for logs.  Defaults to ``~/.march/logs``.
-        Turn logs are written to ``<log_dir>/turns/YYYY-MM-DD.jsonl``.
+        Turn logs are written to ``<log_dir>/{session_id}/YYYY-MM-DD.jsonl``.
     """
 
     def __init__(self, log_dir: Path | None = None) -> None:
         self._dir = log_dir or Path.home() / ".march" / "logs"
         self._dir.mkdir(parents=True, exist_ok=True)
-        # Create turns/ subdirectory
-        self._turns_dir = self._dir / "turns"
-        self._turns_dir.mkdir(parents=True, exist_ok=True)
-        # Track current date for file rotation
-        self._current_date: str | None = None
-        self._path: Path = self._resolve_path()
         self._lock = threading.Lock()
 
-    def _resolve_path(self) -> Path:
-        """Return the log file path for today's date."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        self._current_date = today
-        return self._turns_dir / f"{today}.jsonl"
+    # ── path resolution ─────────────────────────────────────────────
 
-    def _ensure_current_date(self) -> None:
-        """Check if the date has changed and update the path if needed."""
+    def _session_dir(self, session_id: str) -> Path:
+        """Return the session log directory, creating it if needed."""
+        safe_id = _sanitize_session_id(session_id)
+        session_dir = self._dir / safe_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir
+
+    def _resolve_path(self, session_id: str) -> Path:
+        """Return the log file path for today's date under the session dir."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self._current_date:
-            self._current_date = today
-            self._path = self._turns_dir / f"{today}.jsonl"
+        return self._session_dir(session_id) / f"{today}.jsonl"
 
     # ── public event methods ─────────────────────────────────────────
 
@@ -71,8 +77,8 @@ class TurnLogger:
         source: str,
     ) -> None:
         self._write(
-            turn_id=turn_id,
             session_id=session_id,
+            turn_id=turn_id,
             event="turn_start",
             user_msg=user_msg[:2000],  # cap to avoid huge log lines
             source=source,
@@ -90,8 +96,8 @@ class TurnLogger:
         duration_ms: float,
     ) -> None:
         self._write(
-            turn_id=turn_id,
             session_id=session_id,
+            turn_id=turn_id,
             event="llm_call",
             provider=provider,
             model=model,
@@ -113,8 +119,8 @@ class TurnLogger:
         error: str = "",
     ) -> None:
         self._write(
-            turn_id=turn_id,
             session_id=session_id,
+            turn_id=turn_id,
             event="tool_call",
             name=name,
             args=args,
@@ -135,8 +141,8 @@ class TurnLogger:
         final_reply_length: int,
     ) -> None:
         self._write(
-            turn_id=turn_id,
             session_id=session_id,
+            turn_id=turn_id,
             event="turn_complete",
             tool_calls=tool_calls,
             total_tokens=total_tokens,
@@ -152,8 +158,8 @@ class TurnLogger:
         partial_content_length: int,
     ) -> None:
         self._write(
-            turn_id=turn_id,
             session_id=session_id,
+            turn_id=turn_id,
             event="turn_cancelled",
             partial_content_length=partial_content_length,
         )
@@ -165,8 +171,8 @@ class TurnLogger:
         error: str,
     ) -> None:
         self._write(
-            turn_id=turn_id,
             session_id=session_id,
+            turn_id=turn_id,
             event="turn_error",
             error=error,
         )
@@ -174,7 +180,13 @@ class TurnLogger:
     # ── internal helpers ─────────────────────────────────────────────
 
     def _write(self, **fields: Any) -> None:
-        """Serialize *fields* as a single JSON line and append to the log."""
+        """Serialize *fields* as a single JSON line and append to the log.
+
+        The ``session_id`` field is used to determine the target directory;
+        it is also kept in the JSON payload for grep-ability.
+        """
+        session_id: str = fields.get("session_id", "system")
+
         entry: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
         }
@@ -184,36 +196,37 @@ class TurnLogger:
         # values to their repr).
         line = self._safe_dumps(entry) + "\n"
 
+        path = self._resolve_path(session_id)
+
         with self._lock:
-            self._ensure_current_date()
-            self._maybe_rotate()
-            with open(self._path, "a", encoding="utf-8") as fh:
+            self._maybe_rotate(path)
+            with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line)
 
-    def _maybe_rotate(self) -> None:
+    def _maybe_rotate(self, path: Path) -> None:
         """Rotate the log file if it exceeds ``_MAX_FILE_BYTES``."""
         try:
-            if not self._path.exists():
+            if not path.exists():
                 return
-            if self._path.stat().st_size < _MAX_FILE_BYTES:
+            if path.stat().st_size < _MAX_FILE_BYTES:
                 return
         except OSError:
             return
 
         # Shift existing rotated files: .3 → delete, .2 → .3, .1 → .2
         for i in range(_MAX_ROTATED, 0, -1):
-            src = self._path.with_suffix(f".jsonl.{i}")
+            src = path.with_suffix(f".jsonl.{i}")
             if i == _MAX_ROTATED:
                 src.unlink(missing_ok=True)
             else:
-                dst = self._path.with_suffix(f".jsonl.{i + 1}")
+                dst = path.with_suffix(f".jsonl.{i + 1}")
                 if src.exists():
                     src.rename(dst)
 
         # Current → .1
-        rotated = self._path.with_suffix(".jsonl.1")
+        rotated = path.with_suffix(".jsonl.1")
         try:
-            self._path.rename(rotated)
+            path.rename(rotated)
         except OSError:
             pass
 

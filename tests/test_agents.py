@@ -1,4 +1,4 @@
-"""Tests for March agents: task queue, registry, manager, announcer, protocol."""
+"""Tests for March agents: task queue, registry, manager, announcer."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from march.agents.task_queue import TaskQueue
 from march.agents.registry import SubagentRegistry, RunRecord, RunOutcome
 from march.agents.manager import AgentManager, AgentManagerConfig, SpawnParams, SpawnContext, SpawnResult
 from march.agents.announce import SubagentAnnouncer
-from march.agents.protocol import IPCMessage, MessageType
+from march.config.schema import MtConfig, MpConfig
 
 
 # ── Task Queue Tests ─────────────────────────────────────────────────────
@@ -28,15 +28,18 @@ class TestTaskQueue:
         tq = TaskQueue()
         stats = tq.all_stats()
         assert "main" in stats
-        assert "subagent" in stats
+        assert "mt" in stats
+        assert "mp" in stats
         assert "cron" in stats
-        assert stats["subagent"]["max_concurrent"] == 8
+        assert "subagent" not in stats
+        assert stats["mt"]["max_concurrent"] == 8
+        assert stats["mp"]["max_concurrent"] == 8
         assert stats["cron"]["max_concurrent"] == 1
 
     def test_configure_lane(self):
         tq = TaskQueue()
-        tq.configure_lane("subagent", max_concurrent=16)
-        assert tq.lane_stats("subagent")["max_concurrent"] == 16
+        tq.configure_lane("mt", max_concurrent=16)
+        assert tq.lane_stats("mt")["max_concurrent"] == 16
 
     @pytest.mark.asyncio
     async def test_enqueue_basic(self):
@@ -87,7 +90,7 @@ class TestTaskQueue:
         async def bg_task():
             completed.set()
 
-        task_id = tq.enqueue_fire_and_forget("subagent", bg_task)
+        task_id = tq.enqueue_fire_and_forget("mt", bg_task)
         assert task_id.startswith("task-")
         await asyncio.wait_for(completed.wait(), timeout=2.0)
 
@@ -100,15 +103,11 @@ class TestTaskQueue:
 # ── Registry Tests ───────────────────────────────────────────────────────
 
 class TestSubagentRegistry:
-    """Tests for the sub-agent registry."""
+    """Tests for the sub-agent registry (now pure in-memory)."""
 
     @pytest.fixture
-    def tmp_persist_dir(self, tmp_path):
-        return tmp_path / "agents"
-
-    @pytest.fixture
-    def registry(self, tmp_persist_dir):
-        return SubagentRegistry(persist_dir=tmp_persist_dir)
+    def registry(self):
+        return SubagentRegistry()
 
     def test_register_and_get(self, registry):
         record = RunRecord(
@@ -173,25 +172,6 @@ class TestSubagentRegistry:
         assert len(active) == 1
         assert active[0].run_id == "b"
 
-    def test_persist_and_restore(self, tmp_persist_dir):
-        reg1 = SubagentRegistry(persist_dir=tmp_persist_dir)
-        reg1.register(RunRecord(
-            run_id="persist-1",
-            child_key="child-p",
-            requester_key="parent-p",
-            task="persist test",
-            started_at=time.time(),
-        ))
-
-        # New instance should restore
-        reg2 = SubagentRegistry(persist_dir=tmp_persist_dir)
-        needs_attention = reg2.restore_on_startup()
-
-        # Active run interrupted by restart → needs attention
-        assert len(needs_attention) == 1
-        assert needs_attention[0].run_id == "persist-1"
-        assert needs_attention[0].outcome.status == "error"
-
     def test_cleanup_old(self, registry):
         record = RunRecord(
             run_id="old-1",
@@ -206,13 +186,12 @@ class TestSubagentRegistry:
 
         # Manually set ended_at in the past so cleanup considers it old
         record.ended_at = time.time() - 7200
-        registry._persist_record(record)
 
         removed = registry.cleanup_old(max_age_seconds=60)
         assert removed == 1
         assert registry.get("old-1") is None
 
-    def test_remove(self, registry, tmp_persist_dir):
+    def test_remove(self, registry):
         registry.register(RunRecord(
             run_id="rm-1",
             child_key="c-rm",
@@ -220,11 +199,9 @@ class TestSubagentRegistry:
             task="remove me",
             started_at=time.time(),
         ))
-        assert (tmp_persist_dir / "rm-1.json").exists()
 
         registry.remove("rm-1")
         assert registry.get("rm-1") is None
-        assert not (tmp_persist_dir / "rm-1.json").exists()
 
 
 # ── Announcer Tests ──────────────────────────────────────────────────────
@@ -301,58 +278,6 @@ class TestSubagentAnnouncer:
         assert announcer.pending_count == 0
 
 
-# ── Protocol Tests ───────────────────────────────────────────────────────
-
-class TestIPCProtocol:
-    """Tests for parent-child IPC protocol."""
-
-    def test_task_message(self):
-        msg = IPCMessage.task("Build feature X", model="claude-3", timeout=300)
-        assert msg.type == MessageType.TASK
-        assert msg.payload["task"] == "Build feature X"
-        assert msg.payload["model"] == "claude-3"
-        assert msg.payload["timeout"] == 300
-
-    def test_steer_message(self):
-        msg = IPCMessage.steer("Focus on the tests")
-        assert msg.type == MessageType.STEER
-        assert msg.payload["message"] == "Focus on the tests"
-
-    def test_cancel_message(self):
-        msg = IPCMessage.cancel("user requested")
-        assert msg.type == MessageType.CANCEL
-        assert msg.payload["reason"] == "user requested"
-
-    def test_result_message(self):
-        msg = IPCMessage.result("Task completed", metadata={"tokens": 1000})
-        assert msg.type == MessageType.RESULT
-        assert msg.payload["content"] == "Task completed"
-        assert msg.payload["metadata"]["tokens"] == 1000
-
-    def test_error_message(self):
-        msg = IPCMessage.error("Something broke", traceback="Traceback...")
-        assert msg.type == MessageType.ERROR
-        assert msg.payload["error"] == "Something broke"
-
-    def test_json_roundtrip(self):
-        original = IPCMessage.task("Test task", model="test-model")
-        json_str = original.to_json()
-        restored = IPCMessage.from_json(json_str)
-        assert restored.type == MessageType.TASK
-        assert restored.payload["task"] == "Test task"
-        assert restored.payload["model"] == "test-model"
-
-    def test_progress_message(self):
-        msg = IPCMessage.progress("running", detail="50% done", percent=50.0)
-        assert msg.type == MessageType.PROGRESS
-        assert msg.payload["percent"] == 50.0
-
-    def test_tool_use_message(self):
-        msg = IPCMessage.tool_use("web_search", args={"query": "test"}, result_summary="3 results")
-        assert msg.type == MessageType.TOOL_USE
-        assert msg.payload["tool"] == "web_search"
-
-
 # ── Manager Tests ────────────────────────────────────────────────────────
 
 class TestAgentManager:
@@ -362,9 +287,8 @@ class TestAgentManager:
     def manager(self, tmp_path):
         config = AgentManagerConfig(
             max_spawn_depth=2,
-            max_concurrent_subagents=4,
         )
-        registry = SubagentRegistry(persist_dir=tmp_path / "agents")
+        registry = SubagentRegistry()
         tq = TaskQueue()
         return AgentManager(config=config, task_queue=tq, registry=registry)
 
@@ -451,9 +375,8 @@ class TestSubagentSessionPersistence:
     def manager(self, tmp_path):
         config = AgentManagerConfig(
             max_spawn_depth=2,
-            max_concurrent_subagents=8,
         )
-        registry = SubagentRegistry(persist_dir=tmp_path / "agents")
+        registry = SubagentRegistry()
         tq = TaskQueue()
         return AgentManager(config=config, task_queue=tq, registry=registry)
 
@@ -645,27 +568,21 @@ class TestSubagentSessionPersistence:
         assert deleted_keys == []
 
     @pytest.mark.asyncio
-    async def test_completed_children_persist_on_disk(self, tmp_path):
-        """Completed sub-agent records persist on disk until parent resets."""
-        persist_dir = tmp_path / "agents"
-        registry = SubagentRegistry(persist_dir=persist_dir)
+    async def test_completed_children_in_memory_only(self):
+        """Completed sub-agent records stay in memory (no disk persistence)."""
+        registry = SubagentRegistry()
 
         registry.register(RunRecord(
-            run_id="disk-persist-1",
-            child_key="child-dp1",
-            requester_key="parent-dp",
-            task="persist on disk",
+            run_id="mem-persist-1",
+            child_key="child-mp1",
+            requester_key="parent-mp",
+            task="persist in memory",
             started_at=time.time(),
         ))
-        registry.complete("disk-persist-1", RunOutcome(status="ok", output="result"))
-        registry.mark_cleanup_done("disk-persist-1")
+        registry.complete("mem-persist-1", RunOutcome(status="ok", output="result"))
+        registry.mark_cleanup_done("mem-persist-1")
 
-        # File should still exist on disk
-        assert (persist_dir / "disk-persist-1.json").exists()
-
-        # Load from a fresh registry instance — record should be there
-        reg2 = SubagentRegistry(persist_dir=persist_dir)
-        reg2.restore_on_startup()
-        record = reg2.get("disk-persist-1")
+        # Record should still be in memory
+        record = registry.get("mem-persist-1")
         assert record is not None
         assert record.outcome.status == "ok"

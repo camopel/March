@@ -27,8 +27,10 @@ from march.config.schema import (
     LLMProviderConfig,
     MarchConfig,
     MemoryConfig,
+    MtConfig,
+    MpConfig,
     PluginsConfig,
-    SubagentConfig,
+    SubagentsCommonConfig,
     ToolsConfig,
     WSProxyChannelConfig,
     WSProxyPluginConfig,
@@ -166,10 +168,12 @@ class TestSchemaDefaults:
     def test_agents_config_defaults(self):
         config = AgentsConfig()
         assert config.max_concurrent == 4
-        assert config.subagents.max_concurrent == 8
+        assert config.mt.max_concurrent == 8
+        assert config.mp.max_concurrent == 8
+        assert config.mp.heartbeat_interval_seconds == 60
+        assert config.mp.heartbeat_timeout_seconds == 300
+        assert config.mp.kill_grace_seconds == 10
         assert config.subagents.max_spawn_depth == 1
-        assert config.subagents.reset_after_complete_minutes == 60
-        assert config.subagents.announce_timeout_seconds == 60
 
     def test_dashboard_config_defaults(self):
         config = DashboardConfig()

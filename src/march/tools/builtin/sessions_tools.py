@@ -102,31 +102,36 @@ async def sessions_send(
     return f"Message {'delivered' if ok else 'failed'}: {session_id}"
 
 
-@tool(name="sessions_spawn", description="Spawn a new sub-agent session for a task.")
+@tool(name="sessions_spawn", description="Spawn a new agent session for a task.")
 async def sessions_spawn(
     task: str,
     label: str = "",
     model: str = "",
     tool_profile: str = "coding",
+    execution: str = "mt",
 ) -> str:
-    """Spawn a sub-agent to handle a task.
+    """Spawn an agent to handle a task.
 
     Args:
-        task: Task description / instructions for the sub-agent.
+        task: Task description / instructions for the agent.
         label: Optional label for the session.
         model: LLM model to use (empty for default).
-        tool_profile: Tool profile for the sub-agent.
+        tool_profile: Tool profile for the agent.
+        execution: Execution mode — "mt" (asyncio, default) or "mp" (isolated process).
     """
     if not task:
         return "Error: task is required"
+    if execution not in ("mt", "mp"):
+        return f"Error: execution must be 'mt' or 'mp', got '{execution}'"
     if _agent_manager is None:
         import uuid as _uuid
-        session_id = f"subagent_{_uuid.uuid4().hex[:12]}"
+        session_id = f"agent_{_uuid.uuid4().hex[:12]}"
         return (
-            f"Sub-agent spawned (queued): {session_id}\n"
+            f"Agent spawned (queued): {session_id}\n"
             f"Label: {label or 'unlabeled'}\n"
+            f"Execution: {execution}\n"
             f"Task: {task[:200]}\n\n"
-            "Agent manager not yet initialized. Sub-agent will run when ready."
+            "Agent manager not yet initialized. Agent will run when ready."
         )
 
     # Import here to avoid circular imports
@@ -134,17 +139,19 @@ async def sessions_spawn(
 
     parent_session = current_session_id.get("")
     result = await _agent_manager.spawn(
-        SpawnParams(task=task, label=label, model=model),
+        SpawnParams(task=task, label=label, model=model, execution=execution),
         SpawnContext(requester_session=parent_session),
     )
 
     if result.status != "accepted":
         return f"Error: {result.error}"
 
+    exec_display = "mtAgent" if execution == "mt" else "mpAgent"
     return (
-        f"Sub-agent spawned: {result.child_key}\n"
+        f"{exec_display} spawned: {result.child_key}\n"
         f"Run ID: {result.run_id}\n"
         f"Label: {label or 'unlabeled'}\n"
+        f"Execution: {execution}\n"
         f"Task: {task[:200]}\n\n"
         "Auto-announces on completion, do not poll."
     )
@@ -165,16 +172,22 @@ async def subagents_tool(
     """
     if _agent_manager is None:
         if action == "list":
-            return "No active or recent sub-agents (agent manager not initialized)."
+            return "No active or recent agents (agent manager not initialized)."
         return "Error: agent manager not initialized"
 
     if action == "list":
         statuses = await _agent_manager.list()
         if not statuses:
-            return "No active or recent sub-agents."
+            return "No active or recent agents."
         lines = []
         for s in statuses:
-            lines.append(f"- {s.child_key} ({s.status}) task={s.task[:80]}")
+            exec_tag = "mt" if s.execution == "mt" else "mp"
+            hb_info = ""
+            if s.heartbeat and s.status == "running":
+                summary = s.heartbeat.get("summary", "")
+                if summary:
+                    hb_info = f" [{summary}]"
+            lines.append(f"- [{exec_tag}] {s.child_key} ({s.status}) task={s.task[:80]}{hb_info}")
         return "\n".join(lines)
     elif action == "steer":
         if not target or not message:

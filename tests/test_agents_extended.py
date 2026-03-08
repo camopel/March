@@ -85,7 +85,8 @@ class TestTaskQueueExtended:
         tq = TaskQueue()
         stats = tq.all_stats()
         assert "main" in stats
-        assert "subagent" in stats
+        assert "mt" in stats
+        assert "mp" in stats
         assert "cron" in stats
         for lane in stats.values():
             assert "active" in lane
@@ -99,8 +100,8 @@ class TestTaskQueueExtended:
 
 class TestSubagentRegistryExtended:
     @pytest.fixture
-    def registry(self, tmp_path):
-        return SubagentRegistry(persist_dir=tmp_path / "agents")
+    def registry(self):
+        return SubagentRegistry()
 
     def test_list_all(self, registry):
         for i in range(3):
@@ -178,40 +179,42 @@ class TestSubagentRegistryExtended:
         registry.complete("no-cleanup", RunOutcome(status="ok"))
         # cleanup_done is still False
         record.ended_at = time.time() - 7200
-        registry._persist_record(record)
         removed = registry.cleanup_old(max_age_seconds=60)
         assert removed == 0  # Should NOT be removed
 
-    def test_restore_corrupted_file(self, tmp_path):
-        persist_dir = tmp_path / "agents"
-        persist_dir.mkdir()
-        (persist_dir / "bad.json").write_text("not valid json")
-        reg = SubagentRegistry(persist_dir=persist_dir)
-        needs = reg.restore_on_startup()
-        # Should handle gracefully
-        assert isinstance(needs, list)
+    def test_registry_is_pure_in_memory(self):
+        """Registry is pure in-memory, no disk persistence."""
+        reg = SubagentRegistry()
+        reg.register(RunRecord(
+            run_id="mem-1", child_key="c", requester_key="p",
+            task="t", started_at=time.time(),
+        ))
+        # No file system involved — just check it's in memory
+        assert reg.get("mem-1") is not None
 
-    def test_restore_completed_uncleanup(self, tmp_path):
-        """Completed but unannounced records need attention on restore."""
-        persist_dir = tmp_path / "agents"
-        persist_dir.mkdir()
+    def test_complete_and_get_outcome(self):
+        """Completed but unannounced records remain accessible."""
+        reg = SubagentRegistry()
         record = RunRecord(
             run_id="complete-unclean", child_key="c", requester_key="p",
-            task="t", started_at=1000.0, ended_at=1010.0,
-            outcome=RunOutcome(status="ok", output="done"),
-            cleanup_done=False,
+            task="t", started_at=time.time(),
         )
-        (persist_dir / "complete-unclean.json").write_text(json.dumps(record.to_dict()))
-        reg = SubagentRegistry(persist_dir=persist_dir)
-        needs = reg.restore_on_startup()
-        assert len(needs) == 1
-        assert needs[0].run_id == "complete-unclean"
+        reg.register(record)
+        reg.complete("complete-unclean", RunOutcome(status="ok", output="done"))
+        result = reg.get("complete-unclean")
+        assert result is not None
+        assert result.outcome.status == "ok"
+        assert not result.cleanup_done
 
-    async def test_initialize_creates_dir(self, tmp_path):
-        persist_dir = tmp_path / "new_dir" / "agents"
-        reg = SubagentRegistry(persist_dir=persist_dir)
-        await reg.initialize()
-        assert persist_dir.exists()
+    def test_registry_no_init_needed(self):
+        """Registry doesn't need async initialization — pure in-memory."""
+        reg = SubagentRegistry()
+        # Can register immediately without any init call
+        reg.register(RunRecord(
+            run_id="no-init", child_key="c", requester_key="p",
+            task="t", started_at=time.time(),
+        ))
+        assert reg.get("no-init") is not None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -377,9 +380,8 @@ class TestAgentManagerExtended:
     def manager(self, tmp_path):
         config = AgentManagerConfig(
             max_spawn_depth=2,
-            max_concurrent_subagents=4,
         )
-        registry = SubagentRegistry(persist_dir=tmp_path / "agents")
+        registry = SubagentRegistry()
         tq = TaskQueue()
         return AgentManager(config=config, task_queue=tq, registry=registry)
 
@@ -423,17 +425,17 @@ class TestAgentManagerExtended:
         # Manually set ended_at in the past
         record = manager.registry.get(result.run_id)
         record.ended_at = time.time() - 7200
-        manager.registry._persist_record(record)
 
         cleaned = await manager.cleanup()
         assert cleaned >= 1
 
     async def test_spawn_params_defaults(self):
         params = SpawnParams(task="test")
-        assert params.agent_id.startswith("subagent-")
+        assert params.agent_id.startswith("agent-")
         assert params.mode == "run"
         assert params.cleanup == "keep"
         assert params.timeout == 0
+        assert params.execution == "mt"
 
     async def test_spawn_result_fields(self, manager):
         await manager.initialize()
@@ -487,8 +489,8 @@ class TestAgentManagerExtended:
             factory_calls.append(kwargs)
             return "factory result"
 
-        config = AgentManagerConfig(max_spawn_depth=2, max_concurrent_subagents=5)
-        registry = SubagentRegistry(persist_dir=tmp_path / "agents")
+        config = AgentManagerConfig(max_spawn_depth=2)
+        registry = SubagentRegistry()
         tq = TaskQueue()
         manager = AgentManager(
             config=config, task_queue=tq, registry=registry,

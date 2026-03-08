@@ -1,8 +1,9 @@
 """Lane-based async task queue for March.
 
-Three lanes with independent concurrency:
+Four lanes with independent concurrency:
   - main: User-facing sessions (maxConcurrent: auto = CPU cores)
-  - subagent: Sub-agent runs (maxConcurrent: 8)
+  - mt: mtAgent runs — asyncio tasks (maxConcurrent: 8)
+  - mp: mpAgent runs — isolated processes (maxConcurrent: 8)
   - cron: Scheduled jobs (maxConcurrent: 1)
 
 Each lane has its own queue and active task tracking. Tasks are enqueued
@@ -58,10 +59,11 @@ class TaskQueue:
     Usage:
         tq = TaskQueue()
         tq.configure_lane("main", max_concurrent=4)
-        tq.configure_lane("subagent", max_concurrent=8)
+        tq.configure_lane("mt", max_concurrent=8)
+        tq.configure_lane("mp", max_concurrent=8)
         tq.configure_lane("cron", max_concurrent=1)
 
-        result = await tq.enqueue("subagent", my_coroutine_fn)
+        result = await tq.enqueue("mt", my_coroutine_fn)
     """
 
     def __init__(self) -> None:
@@ -72,7 +74,8 @@ class TaskQueue:
         """Set up default lanes per spec."""
         cpu_count = os.cpu_count() or 4
         self.configure_lane("main", max_concurrent=cpu_count)
-        self.configure_lane("subagent", max_concurrent=8)
+        self.configure_lane("mt", max_concurrent=8)
+        self.configure_lane("mp", max_concurrent=8)
         self.configure_lane("cron", max_concurrent=1)
 
     def configure_lane(self, name: str, max_concurrent: int) -> None:
@@ -95,7 +98,7 @@ class TaskQueue:
         """Enqueue a task in the specified lane. Returns when task completes.
 
         Args:
-            lane: Lane name (main, subagent, cron).
+            lane: Lane name (main, mt, mp, cron).
             task: An async callable (zero-arg) to execute.
 
         Returns:
