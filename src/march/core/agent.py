@@ -24,6 +24,7 @@ from march.llm.base import LLMProvider, LLMResponse, ProviderError, StreamChunk
 from march.llm.router import LLMRouter
 from march.memory.store import MemoryStore
 from march.plugins._manager import PluginManager
+from march.tools.context import current_session_id
 from march.tools.registry import ToolRegistry, ToolNotFound
 
 logger = get_logger("march.agent", subsystem="agent")
@@ -214,6 +215,9 @@ class Agent:
         total_tokens = 0
         total_cost = 0.0
         tool_calls_made = 0
+
+        # Set session ID in context var so tools can access it
+        current_session_id.set(session.id)
 
         # Bind session_id to structured logger for this turn
         mlog = self._mlogger.bind(session_id=session.id)
@@ -656,6 +660,9 @@ class Agent:
         total_cost = 0.0
         tool_calls_made = 0
 
+        # Set session ID in context var so tools can access it
+        current_session_id.set(session.id)
+
         # Bind session_id to structured logger for this streaming turn
         mlog = self._mlogger.bind(session_id=session.id)
 
@@ -991,12 +998,16 @@ class Agent:
         tool_inventory = await self.memory.load_tool_rules()
         long_term = await self.memory.load_long_term()
 
+        # Merge session.id into metadata so the LLM can see it
+        ctx = dict(session.metadata)
+        ctx.setdefault("session_id", session.id)
+
         return Context(
             system_rules=system_rules,
             agent_profile=agent_profile,
             tool_inventory=tool_inventory,
             long_term_memory=long_term,
-            session_context=session.metadata,
+            session_context=ctx,
         )
 
     async def _generate_turn_summary(

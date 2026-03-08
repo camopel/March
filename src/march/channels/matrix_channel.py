@@ -356,13 +356,13 @@ class MatrixChannel(Channel):
             except Exception as e:
                 logger.warning("matrix: reset - failed to delete session memory: %s", e)
 
-            # 4. Clean up Matrix attachments
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            # 4. Clean up attachments for THIS session only
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             if attach_dir.exists():
                 file_count = sum(1 for _ in attach_dir.iterdir())
                 if file_count > 0:
                     shutil.rmtree(str(attach_dir))
-                    attach_dir.mkdir(parents=True, exist_ok=True)
+                    cleaned.append(f"{file_count} attachments")
                     cleaned.append(f"{file_count} attachments")
 
             # 5. Remove from in-memory sessions dict so next message creates fresh
@@ -519,7 +519,7 @@ class MatrixChannel(Channel):
                 logger.warning("matrix: image resize failed: %s", e)
 
             # Save resized version to disk (not the original)
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session.id
             attach_dir.mkdir(parents=True, exist_ok=True)
             file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
             file_path.write_bytes(resized_bytes)
@@ -638,7 +638,7 @@ class MatrixChannel(Channel):
                 "audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/aac": ".aac",
             }
             ext = ext_map.get(mime_type, ".ogg")
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session.id
             attach_dir.mkdir(parents=True, exist_ok=True)
             voice_path = attach_dir / f"voice_{uuid.uuid4().hex[:8]}{ext}"
             voice_path.write_bytes(raw_bytes)
@@ -769,7 +769,7 @@ class MatrixChannel(Channel):
                         logger.warning("matrix: file decryption failed: %s", e)
 
             # Save to disk
-            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session.id
             attach_dir.mkdir(parents=True, exist_ok=True)
             file_path = attach_dir / f"{uuid.uuid4().hex[:8]}_{filename}"
             file_path.write_bytes(raw_bytes)

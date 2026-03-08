@@ -16,8 +16,22 @@ from pathlib import Path
 
 from march.logging import get_logger
 from march.tools.base import tool
+from march.tools.context import current_session_id
 
 logger = get_logger("march.tools.session_memory")
+
+
+def _resolve_session_id(session_id: str) -> str:
+    """Resolve the actual session ID.
+
+    The LLM often doesn't know the real session UUID and may pass
+    placeholders like '$SESSION_ID' or empty strings. Fall back to
+    the contextvars-based current_session_id set by the agent loop.
+    """
+    # Treat common placeholders as empty
+    if session_id and session_id not in ("$SESSION_ID", "${SESSION_ID}", ""):
+        return session_id
+    return current_session_id.get("")
 
 
 @tool(
@@ -47,8 +61,10 @@ async def session_memory_tool(
         type="facts", content="## From requirements.pdf\\n- Must support 10k concurrent users"
         type="facts", content="- [UPDATE] Deploy target changed from ECS to Lambda"
     """
-    if not session_id:
-        return "Error: session_id required"
+    # Resolve session_id: use context var if LLM passed a placeholder
+    resolved_id = _resolve_session_id(session_id)
+    if not resolved_id:
+        return "Error: session_id could not be resolved"
 
     if type not in ("facts", "plan"):
         return f"Error: type must be 'facts' or 'plan', got '{type}'"
@@ -56,7 +72,7 @@ async def session_memory_tool(
     if not content.strip():
         return "Error: empty content"
 
-    memory_dir = Path.home() / ".march" / "memory" / session_id
+    memory_dir = Path.home() / ".march" / "memory" / resolved_id
     memory_dir.mkdir(parents=True, exist_ok=True)
 
     filename = "facts.md" if type == "facts" else "plan.md"
@@ -76,5 +92,5 @@ async def session_memory_tool(
             f.write(existing + "\n\n")
         f.write(timestamped + "\n")
 
-    logger.info("session_memory saved: %s/%s (%d chars)", session_id[:8], filename, len(content))
+    logger.info("session_memory saved: %s/%s (%d chars)", resolved_id[:8], filename, len(content))
     return f"Saved to {type}: {len(content.strip())} chars"
