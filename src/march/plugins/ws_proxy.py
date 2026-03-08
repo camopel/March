@@ -1391,6 +1391,15 @@ class WSProxyPlugin(Plugin):
                          session_id=conn.session_id, error=str(e),
                          action="session may be in inconsistent state")
 
+        # Delete session memory files (facts.md, plan.md, etc.)
+        try:
+            from march.core.compaction import delete_session_memory
+            if delete_session_memory(session.id):
+                logger.info("session memory files deleted", session_id=conn.session_id)
+        except Exception as e:
+            logger.warning("failed to delete session memory files",
+                           session_id=conn.session_id, error=str(e))
+
         # Clear cached session again after reset
         self._march_sessions.pop(conn.session_id, None)
 

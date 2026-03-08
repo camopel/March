@@ -7,6 +7,9 @@ nothing important is lost.
 
 Entries are timestamped so the LLM can identify the latest decisions when
 facts evolve or get superseded.
+
+The session_id is resolved automatically from the contextvar set by the agent
+loop — the LLM never needs to know or pass it.
 """
 
 from __future__ import annotations
@@ -21,19 +24,6 @@ from march.tools.context import current_session_id
 logger = get_logger("march.tools.session_memory")
 
 
-def _resolve_session_id(session_id: str) -> str:
-    """Resolve the actual session ID.
-
-    The LLM often doesn't know the real session UUID and may pass
-    placeholders like '$SESSION_ID' or empty strings. Fall back to
-    the contextvars-based current_session_id set by the agent loop.
-    """
-    # Treat common placeholders as empty
-    if session_id and session_id not in ("$SESSION_ID", "${SESSION_ID}", ""):
-        return session_id
-    return current_session_id.get("")
-
-
 @tool(
     name="session_memory",
     description=(
@@ -44,14 +34,14 @@ def _resolve_session_id(session_id: str) -> str:
     ),
 )
 async def session_memory_tool(
-    session_id: str,
     type: str,
     content: str,
 ) -> str:
     """Save content to session memory.
 
+    The session_id is resolved automatically from the agent execution context.
+
     Args:
-        session_id: The current session ID.
         type: Type of memory: 'facts' or 'plan'.
         content: The content to save (markdown text). Will be auto-timestamped.
 
@@ -61,10 +51,10 @@ async def session_memory_tool(
         type="facts", content="## From requirements.pdf\\n- Must support 10k concurrent users"
         type="facts", content="- [UPDATE] Deploy target changed from ECS to Lambda"
     """
-    # Resolve session_id: use context var if LLM passed a placeholder
-    resolved_id = _resolve_session_id(session_id)
-    if not resolved_id:
-        return "Error: session_id could not be resolved"
+    # Resolve session_id from contextvar (set by agent loop before tool execution)
+    session_id = current_session_id.get("")
+    if not session_id:
+        return "Error: session_id not available in execution context"
 
     if type not in ("facts", "plan"):
         return f"Error: type must be 'facts' or 'plan', got '{type}'"
@@ -72,7 +62,7 @@ async def session_memory_tool(
     if not content.strip():
         return "Error: empty content"
 
-    memory_dir = Path.home() / ".march" / "memory" / resolved_id
+    memory_dir = Path.home() / ".march" / "memory" / session_id
     memory_dir.mkdir(parents=True, exist_ok=True)
 
     filename = "facts.md" if type == "facts" else "plan.md"
@@ -92,5 +82,5 @@ async def session_memory_tool(
             f.write(existing + "\n\n")
         f.write(timestamped + "\n")
 
-    logger.info("session_memory saved: %s/%s (%d chars)", resolved_id[:8], filename, len(content))
+    logger.info("session_memory saved: %s/%s (%d chars)", session_id[:8], filename, len(content))
     return f"Saved to {type}: {len(content.strip())} chars"

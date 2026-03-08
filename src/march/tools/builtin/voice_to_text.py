@@ -74,8 +74,9 @@ async def voice_to_text(
 
         return (
             f"Language: {detected_lang}\n"
-            f"Duration: {info.duration:.1f}s\n\n"
-            f"{transcript}"
+            f"Duration: {info.duration:.1f}s\n"
+            f"\n"
+            f"{transcript.strip()}"
         )
     except Exception as e:
         return f"Error transcribing: {e}"

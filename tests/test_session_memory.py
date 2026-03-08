@@ -395,15 +395,21 @@ class TestSessionMemoryTool:
     def setup_method(self):
         self.session_id = "test-session-memory-tool"
         _cleanup_session(self.session_id)
+        # Set contextvar so the tool can resolve session_id automatically
+        from march.tools.context import current_session_id
+        self._token = current_session_id.set(self.session_id)
 
     def teardown_method(self):
         _cleanup_session(self.session_id)
+        # Reset contextvar
+        from march.tools.context import current_session_id
+        current_session_id.reset(self._token)
 
     @pytest.mark.asyncio
     async def test_save_facts(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         result = await session_memory_tool(
-            session_id=self.session_id, type="facts",
+            type="facts",
             content="- Python 3.12\n- Uses Bedrock",
         )
         assert "Saved" in result
@@ -416,7 +422,7 @@ class TestSessionMemoryTool:
     async def test_save_plan(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         result = await session_memory_tool(
-            session_id=self.session_id, type="plan",
+            type="plan",
             content="1. Build API\n2. Write tests",
         )
         assert "Saved" in result
@@ -427,10 +433,10 @@ class TestSessionMemoryTool:
     async def test_append_facts(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         await session_memory_tool(
-            session_id=self.session_id, type="facts", content="- fact 1",
+            type="facts", content="- fact 1",
         )
         await session_memory_tool(
-            session_id=self.session_id, type="facts", content="- fact 2",
+            type="facts", content="- fact 2",
         )
         d = Path.home() / ".march" / "memory" / self.session_id
         content = (d / "facts.md").read_text()
@@ -441,7 +447,7 @@ class TestSessionMemoryTool:
     async def test_auto_timestamp(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         await session_memory_tool(
-            session_id=self.session_id, type="facts", content="- timestamped fact",
+            type="facts", content="- timestamped fact",
         )
         d = Path.home() / ".march" / "memory" / self.session_id
         content = (d / "facts.md").read_text()
@@ -451,7 +457,7 @@ class TestSessionMemoryTool:
     async def test_invalid_type(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         result = await session_memory_tool(
-            session_id=self.session_id, type="invalid", content="test",
+            type="invalid", content="test",
         )
         assert "Error" in result
 
@@ -459,9 +465,23 @@ class TestSessionMemoryTool:
     async def test_empty_content(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         result = await session_memory_tool(
-            session_id=self.session_id, type="facts", content="",
+            type="facts", content="",
         )
         assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_no_session_id_in_context(self):
+        """Tool should error when contextvar is not set."""
+        from march.tools.context import current_session_id
+        from march.tools.builtin.session_memory_tool import session_memory_tool
+        # Reset to empty
+        token = current_session_id.set("")
+        try:
+            result = await session_memory_tool(type="facts", content="test")
+            assert "Error" in result
+            assert "session_id" in result
+        finally:
+            current_session_id.reset(token)
 
 
 if __name__ == "__main__":

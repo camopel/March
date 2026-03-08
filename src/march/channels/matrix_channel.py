@@ -985,12 +985,34 @@ class MatrixChannel(Channel):
 
     @staticmethod
     def _markdown_to_html(text: str) -> str:
-        """Simple markdown-to-HTML conversion for Matrix messages."""
-        # Basic conversion: just use the text as-is for now
-        # A proper implementation would use a markdown parser
-        import html
-        escaped = html.escape(text)
-        # Convert basic markdown
-        lines = escaped.split("\n")
-        result = "<br>".join(lines)
-        return result
+        """Convert Markdown to HTML for Matrix formatted_body.
+
+        Uses the Python `markdown` library with extensions for
+        fenced code blocks, tables, etc. Falls back to basic
+        HTML-escaped text if the library is unavailable.
+        """
+        try:
+            import markdown
+            html_output = markdown.markdown(
+                text,
+                extensions=[
+                    "fenced_code",
+                    "codehilite",
+                    "tables",
+                    "nl2br",
+                    "sane_lists",
+                ],
+                extension_configs={
+                    "codehilite": {
+                        "noclasses": True,
+                        "css_class": "highlight",
+                    },
+                },
+            )
+            return html_output
+        except ImportError:
+            logger.warning("markdown library not installed, falling back to plain text HTML")
+            import html
+            escaped = html.escape(text)
+            lines = escaped.split("\n")
+            return "<br>".join(lines)

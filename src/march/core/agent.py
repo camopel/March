@@ -30,7 +30,7 @@ from march.tools.registry import ToolRegistry, ToolNotFound
 logger = get_logger("march.agent", subsystem="agent")
 
 
-MAX_TOOL_ITERATIONS = 25  # Safety limit on tool call loops
+MAX_TOOL_ITERATIONS_DEFAULT = 100  # Default; overridden by config agent.max_tool_iterations
 MAX_LLM_RETRIES = 3  # Maximum retries on transient LLM errors
 RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff delays in seconds
 DEFAULT_CONTEXT_WINDOW = 200000  # Default context window in tokens
@@ -334,7 +334,8 @@ class Agent:
 
         tool_definitions = self.tools.definitions() if self.tools.tool_count > 0 else None
 
-        for iteration in range(MAX_TOOL_ITERATIONS):
+        max_iterations = self._get_max_tool_iterations()
+        for iteration in range(max_iterations):
             # Call LLM with retry on transient errors
             llm_response = await self._call_llm_with_retry(
                 provider, messages, system_prompt, tool_definitions, mlog=mlog
@@ -490,7 +491,7 @@ class Agent:
         # If we hit the iteration limit, return whatever we have
         mlog.max_iterations_reached(
             session_id=session.id,
-            max_iterations=MAX_TOOL_ITERATIONS,
+            max_iterations=max_iterations,
             tool_calls_made=tool_calls_made,
         )
         return AgentResponse(
@@ -572,6 +573,13 @@ class Agent:
                 if first_provider:
                     context_window = first_provider.context_window
         return context_window
+
+    def _get_max_tool_iterations(self) -> int:
+        """Get max tool iterations from config (agent.max_tool_iterations)."""
+        if self.config:
+            return getattr(self.config.agent, 'max_tool_iterations',
+                           MAX_TOOL_ITERATIONS_DEFAULT)
+        return MAX_TOOL_ITERATIONS_DEFAULT
 
     def _truncate_messages(
         self,
@@ -777,7 +785,8 @@ class Agent:
 
         tool_definitions = self.tools.definitions() if self.tools.tool_count > 0 else None
 
-        for iteration in range(MAX_TOOL_ITERATIONS):
+        max_iterations = self._get_max_tool_iterations()
+        for iteration in range(max_iterations):
             # Stream LLM response
             collected_content = ""
             collected_tool_calls: list[dict[str, Any]] = []
@@ -998,9 +1007,9 @@ class Agent:
         tool_inventory = await self.memory.load_tool_rules()
         long_term = await self.memory.load_long_term()
 
-        # Merge session.id into metadata so the LLM can see it
+        # Session metadata for context (session_id is NOT exposed to LLM —
+        # tools that need it read from the contextvar set by the agent loop)
         ctx = dict(session.metadata)
-        ctx.setdefault("session_id", session.id)
 
         return Context(
             system_rules=system_rules,

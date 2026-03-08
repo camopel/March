@@ -158,11 +158,19 @@ class MemoryStore:
         """
         sqlite_removed = await self.sqlite.delete_by_session(session_id)
 
+        # Delete session memory files (facts.md, plan.md, etc.)
+        session_memory_deleted = False
+        try:
+            from march.core.compaction import delete_session_memory
+            session_memory_deleted = delete_session_memory(session_id)
+        except Exception as e:
+            logger.warning("Failed to delete session memory files for %s: %s", session_id, e)
+
         logger.info(
-            "Reset session %s: %d sqlite entries removed",
-            session_id, sqlite_removed,
+            "Reset session %s: %d sqlite entries removed, memory_files_deleted=%s",
+            session_id, sqlite_removed, session_memory_deleted,
         )
-        return {"sqlite_entries": sqlite_removed}
+        return {"sqlite_entries": sqlite_removed, "memory_deleted": int(session_memory_deleted)}
 
     # ── Analytics passthrough ──
 
