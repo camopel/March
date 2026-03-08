@@ -70,7 +70,10 @@ class MatrixChannel(Channel):
         self._running = True
 
         try:
-            from nio import AsyncClient, RoomMessageText, RoomMessageImage, RoomEncryptedImage, InviteMemberEvent, MegolmEvent
+            from nio import (
+                AsyncClient, RoomMessageText, RoomMessageImage, RoomEncryptedImage,
+                RoomMessageAudio, RoomEncryptedAudio, InviteMemberEvent, MegolmEvent,
+            )
         except ImportError:
             logger.error("matrix-nio not installed. Install with: pip install matrix-nio")
             return
@@ -165,6 +168,12 @@ class MatrixChannel(Channel):
         )
         self._client.add_event_callback(
             self._on_image, RoomEncryptedImage
+        )
+        self._client.add_event_callback(
+            self._on_audio, RoomMessageAudio
+        )
+        self._client.add_event_callback(
+            self._on_audio, RoomEncryptedAudio
         )
         self._client.add_event_callback(
             self._on_invite, InviteMemberEvent
@@ -485,6 +494,142 @@ class MatrixChannel(Channel):
         except Exception as e:
             logger.error("matrix: error processing image in %s: %s", room_id, e)
             await self.send(f"Error processing image: {e}", room_id=room_id)
+        finally:
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
+
+    async def _on_audio(self, room: Any, event: Any) -> None:
+        """Handle incoming audio/voice messages from Matrix rooms.
+
+        Downloads the audio, transcribes via voice_to_text tool, then
+        processes the transcribed text as a regular message.
+        """
+        if not self._agent or not self._running:
+            return
+
+        if self._client and event.sender == self._client.user_id:
+            return
+
+        room_id = room.room_id
+        logger.info("matrix: audio in %s from %s: %s", room_id, event.sender, getattr(event, "body", "audio"))
+
+        try:
+            await self._client.room_read_markers(
+                room_id,
+                fully_read_event=event.event_id,
+                read_event=event.event_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            await self._client.room_typing(room_id, typing_state=True, timeout=60000)
+        except Exception:
+            pass
+
+        asyncio.create_task(self._process_audio(room_id, event))
+
+    async def _process_audio(self, room_id: str, event: Any) -> None:
+        """Download, decrypt, transcribe, and process an audio message."""
+        session = self._get_or_create_session(room_id)
+
+        try:
+            mxc_url = event.url
+            if not mxc_url:
+                logger.warning("matrix: audio event has no URL")
+                return
+
+            from nio import DownloadError
+            response = await self._client.download(mxc_url)
+            if isinstance(response, DownloadError):
+                logger.warning("matrix: failed to download audio: %s", response)
+                return
+
+            raw_bytes = response.body
+            mime_type = getattr(event, "mimetype", None) or response.content_type or "audio/ogg"
+            filename = getattr(event, "body", "voice.ogg") or "voice.ogg"
+
+            # Decrypt if E2EE
+            enc_key = getattr(event, "key", None)
+            enc_hashes = getattr(event, "hashes", None)
+            enc_iv = getattr(event, "iv", None)
+            if enc_key and enc_hashes and enc_iv:
+                k = enc_key.get("k", "") if isinstance(enc_key, dict) else ""
+                sha256_hash = enc_hashes.get("sha256", "") if isinstance(enc_hashes, dict) else ""
+                if k and sha256_hash and enc_iv:
+                    try:
+                        from nio.crypto import decrypt_attachment
+                        raw_bytes = decrypt_attachment(raw_bytes, k, sha256_hash, enc_iv)
+                        logger.info("matrix: decrypted audio attachment (%dKB)", len(raw_bytes) // 1024)
+                    except Exception as e:
+                        logger.warning("matrix: audio decryption failed: %s", e)
+
+            # Save to disk for transcription
+            ext_map = {
+                "audio/ogg": ".ogg", "audio/webm": ".webm", "audio/mp4": ".m4a",
+                "audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/aac": ".aac",
+            }
+            ext = ext_map.get(mime_type, ".ogg")
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            attach_dir.mkdir(parents=True, exist_ok=True)
+            voice_path = attach_dir / f"voice_{uuid.uuid4().hex[:8]}{ext}"
+            voice_path.write_bytes(raw_bytes)
+
+            logger.info("matrix: audio saved %s (%dKB)", voice_path.name, len(raw_bytes) // 1024)
+
+            # Transcribe using voice_to_text tool
+            transcription = ""
+            try:
+                from march.core.message import ToolCall as MarchToolCall
+
+                vtt_args: dict[str, Any] = {"path": str(voice_path)}
+                # Read voice_to_text config if available
+                if self._agent and hasattr(self._agent, "app") and self._agent.app:
+                    app = self._agent.app
+                    if hasattr(app, "config") and app.config:
+                        vtt_cfg = getattr(app.config.tools, "voice_to_text", None)
+                        if vtt_cfg:
+                            if getattr(vtt_cfg, "model", ""):
+                                vtt_args["model_size"] = vtt_cfg.model
+                            if getattr(vtt_cfg, "language", ""):
+                                vtt_args["language"] = vtt_cfg.language
+
+                tool_call = MarchToolCall(
+                    id=f"voice-{uuid.uuid4().hex[:8]}",
+                    name="voice_to_text",
+                    args=vtt_args,
+                )
+                result = await self._agent.tools.execute(tool_call)
+                if result.is_error:
+                    logger.error("matrix: voice transcription failed: %s", result.error)
+                else:
+                    transcription = result.content.strip()
+            except Exception as e:
+                logger.error("matrix: voice transcription error: %s", e)
+
+            if not transcription:
+                await self.send("⚠️ Could not transcribe voice message", room_id=room_id)
+                return
+
+            logger.info("matrix: voice transcribed (%d chars): %s", len(transcription), transcription[:80])
+
+            # Process transcribed text as a regular message
+            from march.core.agent import AgentResponse
+            collected = ""
+            async for item in self._agent.run_stream(transcription, session):
+                if isinstance(item, AgentResponse):
+                    break
+                if hasattr(item, "delta") and item.delta:
+                    collected += item.delta
+
+            if collected:
+                await self.send(collected, room_id=room_id)
+
+        except Exception as e:
+            logger.error("matrix: error processing audio in %s: %s", room_id, e)
+            await self.send(f"Error processing voice message: {e}", room_id=room_id)
         finally:
             try:
                 await self._client.room_typing(room_id, typing_state=False)
