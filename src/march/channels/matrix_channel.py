@@ -27,6 +27,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator, TYPE_CHECKING
 
 from march.channels.base import Channel
+from march.core.orchestrator import (
+    Cancelled,
+    Error,
+    FinalResponse,
+    OrchestratorEvent,
+    TextDelta,
+    ToolProgress,
+)
 from march.logging import get_logger
 
 if TYPE_CHECKING:
@@ -283,7 +291,6 @@ class MatrixChannel(Channel):
             return
 
         try:
-            from nio import RoomSendResponse
             await self._client.room_send(
                 room_id=room_id,
                 message_type="m.room.message",
@@ -340,9 +347,10 @@ class MatrixChannel(Channel):
         stream). Sends typing indicators while processing. Handles cancel,
         error, and final response events.
         """
-        from march.core.orchestrator import (
-            TextDelta, ToolProgress, FinalResponse, Error, Cancelled,
-        )
+        if self._orchestrator is None:
+            logger.error("matrix: _process_orchestrator_events called but orchestrator is None")
+            await self.send("Error: Orchestrator not initialised", room_id=room_id)
+            return
 
         cancel_event = self._reset_cancel_event(room_id)
 
@@ -484,30 +492,27 @@ class MatrixChannel(Channel):
         """
         import shutil
 
+        if self._orchestrator is None:
+            logger.error("matrix: _handle_matrix_reset called but orchestrator is None")
+            await self.send("Error: Orchestrator not initialised", room_id=room_id)
+            return
+
         session_id = self._session_id_for_room(room_id)
         cleaned = []
 
         try:
-            # 1. Delegate session reset to Orchestrator (clears cache + DB)
-            await self._orchestrator.reset_session(session_id)
+            # 1. Delegate full session reset to Orchestrator
+            #    (clears cache + DB + memory store + session memory files)
+            result = await self._orchestrator.reset_session(session_id)
             cleaned.append("session history")
+            mem_result = result.get("memory", {})
+            db_count = mem_result.get("sqlite_entries", 0) if isinstance(mem_result, dict) else 0
+            if db_count:
+                cleaned.append(f"{db_count} DB entries")
+            if result.get("session_memory_deleted"):
+                cleaned.append("session memory")
 
-            # 2. Clear session from MemoryStore (facts, embeddings, etc.)
-            if self._agent and hasattr(self._agent, "memory"):
-                result = await self._agent.memory.reset_session(session_id)
-                db_count = result.get("sqlite_entries", 0)
-                if db_count:
-                    cleaned.append(f"{db_count} DB entries")
-
-            # 3. Delete session memory files (facts.md, plan.md, etc.)
-            try:
-                from march.core.compaction import delete_session_memory
-                if delete_session_memory(session_id):
-                    cleaned.append("session memory")
-            except Exception as e:
-                logger.warning("matrix: reset - failed to delete session memory: %s", e)
-
-            # 4. Clean up attachments for THIS session only (Matrix-specific)
+            # 2. Clean up attachments for THIS session only (Matrix-specific)
             attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             if attach_dir.exists():
                 file_count = sum(1 for _ in attach_dir.iterdir())
@@ -515,7 +520,7 @@ class MatrixChannel(Channel):
                     shutil.rmtree(str(attach_dir))
                     cleaned.append(f"{file_count} attachments")
 
-            # 5. Clear cancel event for this room
+            # 3. Clear cancel event for this room
             self._cancel_events.pop(room_id, None)
 
             msg = f"✓ Session reset. Cleaned: {', '.join(cleaned)}."

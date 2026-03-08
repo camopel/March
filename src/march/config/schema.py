@@ -167,14 +167,6 @@ class ACPChannelConfig(BaseModel):
     auto_register: bool = True
 
 
-class VSCodeChannelConfig(BaseModel):
-    """VS Code channel configuration."""
-
-    enabled: bool = False
-    use_websocket: bool = True
-    use_acp: bool = True
-
-
 class MatrixChannelConfig(BaseModel):
     """Matrix channel configuration."""
 
@@ -193,7 +185,6 @@ class ChannelsConfig(BaseModel):
 
     terminal: TerminalChannelConfig = Field(default_factory=TerminalChannelConfig)
     acp: ACPChannelConfig = Field(default_factory=ACPChannelConfig)
-    vscode: VSCodeChannelConfig = Field(default_factory=VSCodeChannelConfig)
     matrix: MatrixChannelConfig = Field(default_factory=MatrixChannelConfig)
 
 

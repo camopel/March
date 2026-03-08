@@ -17,11 +17,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Union
 
 from march.core.agent import Agent, AgentResponse, _extract_text
-from march.core.message import Message, Role, ToolCall, ToolResult
+from march.core.message import Message
 from march.core.session import Session, SessionStore
 from march.core.turn_log import TurnLogger
 from march.llm.base import StreamChunk
@@ -285,23 +285,60 @@ class Orchestrator:
         )
         yield Error(message="Agent stream ended without a final response.")
 
-    async def reset_session(self, session_id: str) -> None:
-        """Reset a session — clear in-memory cache and DB.
+    async def reset_session(self, session_id: str) -> dict[str, Any]:
+        """Reset a session — clear in-memory cache, DB, and agent memory.
+
+        Performs a full reset:
+          1. Evict from in-memory session cache
+          2. Clear messages from the session store (DB)
+          3. Reset agent memory for this session (facts, embeddings, etc.)
+          4. Delete session memory files on disk (facts.md, plan.md, etc.)
 
         Args:
             session_id: The session to reset.
+
+        Returns:
+            Dict with cleanup details (e.g. memory entries cleared).
         """
-        # Clear from cache
+        result: dict[str, Any] = {}
+
+        # 1. Clear from cache
         session = self._sessions.pop(session_id, None)
         if session is not None:
             session.clear()
 
-        # Clear from DB
+        # 2. Clear from DB
         try:
             await self.session_store.clear_session(session_id)
         except Exception as exc:
             logger.error("session reset DB clear failed", session_id=session_id, error=str(exc))
             raise
+
+        # 3. Reset agent memory (MemoryStore: facts, embeddings, etc.)
+        if hasattr(self.agent, "memory") and self.agent.memory is not None:
+            try:
+                mem_result = await self.agent.memory.reset_session(session_id)
+                result["memory"] = mem_result
+            except Exception as exc:
+                logger.warning(
+                    "session reset memory clear failed (non-fatal)",
+                    session_id=session_id,
+                    error=str(exc),
+                )
+
+        # 4. Delete session memory files on disk
+        try:
+            from march.core.compaction import delete_session_memory
+            if delete_session_memory(session_id):
+                result["session_memory_deleted"] = True
+        except Exception as exc:
+            logger.warning(
+                "session reset memory file delete failed (non-fatal)",
+                session_id=session_id,
+                error=str(exc),
+            )
+
+        return result
 
     def get_cached_session(self, session_id: str) -> Session | None:
         """Return the cached session if present, else ``None``.

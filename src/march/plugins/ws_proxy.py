@@ -457,11 +457,11 @@ class ChatDB:
         return await self._store.add_message(session_id, msg, attachments=attachments)
 
     async def update_message_image(self, message_id: str, image_data: str) -> None:
-        """Update the image_data field of an existing message."""
+        """Update the attachments field of an existing message with image data."""
         attachments = json.dumps([{"type": "image_data", "data": image_data}])
         await self._store._db.execute(
-            "UPDATE messages SET image_data = ?, attachments = ? WHERE id = ?",
-            (image_data, attachments, message_id),
+            "UPDATE messages SET attachments = ? WHERE id = ?",
+            (attachments, message_id),
         )
         await self._store._db.commit()
 
@@ -711,6 +711,8 @@ class WSProxyPlugin(Plugin):
         """Synchronous fallback for listing sessions when event loop is busy."""
         import sqlite3 as _sqlite3
 
+        if self._db is None or self._db._store is None:
+            return []
         db_path = str(self._db._store.db_path)
         conn = _sqlite3.connect(db_path, timeout=1)
         conn.row_factory = _sqlite3.Row
@@ -755,6 +757,8 @@ class WSProxyPlugin(Plugin):
         """Synchronous fallback for creating sessions."""
         import sqlite3 as _sqlite3
 
+        if self._db is None or self._db._store is None:
+            raise ValueError("WSProxyPlugin DB not initialised")
         db_path = str(self._db._store.db_path)
         session_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -991,13 +995,6 @@ class WSProxyPlugin(Plugin):
 
         display = f"📎 {filename}"
 
-        # Save display message to DB IMMEDIATELY — before processing.
-        # This prevents the message from disappearing if the WebSocket
-        # disconnects during the (potentially slow) _process_attachment call.
-        msg_id = await self._db.save_message(
-            conn.session_id, "user", display
-        )
-
         # Process attachment: save to disk + generate LLM summary
         user_content = await _process_attachment(
             raw_bytes, filename, mime_type, str(tmp_path),
@@ -1007,23 +1004,17 @@ class WSProxyPlugin(Plugin):
             summary_chunk_size=self._summary_chunk_size,
         )
 
-        # For images: send preview to frontend and update DB with image data
+        # For images: send preview to frontend
         if mime_type.startswith("image/"):
             resized_bytes = tmp_path.read_bytes()
             out_mime = "image/jpeg" if resized_bytes[:3] == b'\xff\xd8\xff' else mime_type
             preview_b64 = base64.b64encode(resized_bytes).decode("ascii")
-            image_data_uri = f"data:{out_mime};base64,{preview_b64}"
             await _try_send(conn.ws, {
                 "type": "image.preview",
                 "data": preview_b64,
                 "mime_type": out_mime,
                 "filename": filename,
             })
-            # Update the already-saved message with image data
-            try:
-                await self._db.update_message_image(msg_id, image_data_uri)
-            except Exception as e:
-                logger.warning("failed to update image_data", error=str(e))
 
         if conn.busy:
             if len(conn.pending) >= self._max_queue_size:
@@ -1224,7 +1215,8 @@ class WSProxyPlugin(Plugin):
         2. Iterates OrchestratorEvents and maps them to WebSocket JSON messages
         3. Manages the stream buffer for reconnect recovery
         """
-        assert self._orchestrator is not None
+        if self._orchestrator is None:
+            raise ValueError("WSProxyPlugin._stream_response called before Orchestrator was initialised")
 
         from march.core.orchestrator import (
             TextDelta, ToolProgress, FinalResponse, Cancelled, Error,
@@ -1277,8 +1269,7 @@ class WSProxyPlugin(Plugin):
                     end_msg: dict[str, Any] = {"type": "stream.end"}
                     if event.total_tokens or event.total_cost:
                         end_msg["usage"] = {
-                            "input_tokens": event.total_tokens,
-                            "output_tokens": event.total_tokens,
+                            "total_tokens": event.total_tokens,
                             "cost": event.total_cost,
                         }
                     if event.turn_summary:
@@ -1337,20 +1328,26 @@ class WSProxyPlugin(Plugin):
         buf.done = True
 
     async def _handle_reset(self, conn: "_WSConn") -> None:
-        """Handle /reset: clear DB messages, queue, attachments, and reset session.
+        """Handle /reset: delegate to Orchestrator for full session cleanup.
 
         Only cleans data belonging to this session — other sessions are untouched.
         """
         conn.pending.clear()
-        await self._db.clear_session_messages(conn.session_id)
 
         # Clear stream buffer so reconnect doesn't replay old content
         if conn.session_id in self._stream_buffers:
             self._stream_buffers[conn.session_id].reset()
 
-        # Evict from Orchestrator cache
+        # Delegate full reset to Orchestrator (clears cache + DB + memory + session files)
         if self._orchestrator:
-            self._orchestrator.evict_session(conn.session_id)
+            try:
+                await self._orchestrator.reset_session(conn.session_id)
+            except Exception as e:
+                logger.error("orchestrator reset_session failed",
+                             session_id=conn.session_id, error=str(e))
+        else:
+            # Fallback: manual DB clear if orchestrator not available
+            await self._db.clear_session_messages(conn.session_id)
 
         # Clean up this session's attachment folder
         attach_dir = Path.home() / ".march" / "attachments" / conn.session_id
@@ -1358,24 +1355,6 @@ class WSProxyPlugin(Plugin):
             import shutil
             shutil.rmtree(attach_dir, ignore_errors=True)
             logger.info("attachments cleaned", session_id=conn.session_id)
-
-        # Reset agent memory for this session
-        try:
-            result = await self._agent.memory.reset_session(conn.session_id)
-            logger.info("session reset", session_id=conn.session_id, result=str(result))
-        except Exception as e:
-            logger.error("session reset failed",
-                         session_id=conn.session_id, error=str(e),
-                         action="session may be in inconsistent state")
-
-        # Delete session memory files (facts.md, plan.md, etc.)
-        try:
-            from march.core.compaction import delete_session_memory
-            if delete_session_memory(conn.session_id):
-                logger.info("session memory files deleted", session_id=conn.session_id)
-        except Exception as e:
-            logger.warning("failed to delete session memory files",
-                           session_id=conn.session_id, error=str(e))
 
         await _try_send(conn.ws, {"type": "session.reset"})
 

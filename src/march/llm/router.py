@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from march.llm.base import LLMProvider, LLMResponse, ProviderError, StreamChunk, ToolDefinition
+from march.llm.base import LLMProvider, LLMResponse, ProviderError, ToolDefinition
 
 logger = logging.getLogger(__name__)
 

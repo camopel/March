@@ -7,7 +7,6 @@ to the Orchestrator.  Never touches Agent or SessionStore directly.
 from __future__ import annotations
 
 import asyncio
-import sys
 from typing import Any, AsyncIterator, TYPE_CHECKING
 
 from rich.console import Console
@@ -26,6 +25,7 @@ from march.core.orchestrator import (
     TextDelta,
     ToolProgress,
 )
+from march.core.session import deterministic_session_id
 from march.logging import get_logger
 
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 logger = get_logger("march.terminal")
 
 # Deterministic session id for the interactive terminal.
-_TERMINAL_SESSION_ID = "terminal-interactive"
+_TERMINAL_SESSION_ID = deterministic_session_id("terminal", "interactive")
 
 
 class TerminalChannel(Channel):
@@ -107,7 +107,6 @@ class TerminalChannel(Channel):
 
                 # Process message through the Orchestrator
                 self.console.print()
-                self._cancel_event.clear()
                 await self._process_message(user_input)
                 self.console.print()
 
@@ -118,10 +117,8 @@ class TerminalChannel(Channel):
                     break
                 self._cancel_event.set()
                 self.console.print("\n[yellow]⏹ Stopping...[/yellow] [dim](Ctrl+C again to quit)[/dim]")
-                # Reset after a short delay
-                asyncio.get_event_loop().call_later(
-                    2.0, self._cancel_event.clear
-                )
+                # cancel_event is cleared at the start of the next
+                # _process_message() call, so no timer is needed.
             except EOFError:
                 break
 
@@ -171,6 +168,10 @@ class TerminalChannel(Channel):
     async def _process_message(self, user_input: str) -> None:
         """Send user_input through the Orchestrator and render events."""
         assert self._orchestrator is not None
+
+        # Clear cancel_event at the start of every new message to avoid
+        # stale cancellation from a previous Ctrl+C.
+        self._cancel_event.clear()
 
         collected = ""
 

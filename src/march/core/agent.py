@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from march.core.context import Context, estimate_tokens
-from march.core.message import Message, Role, ToolCall, ToolResult
+from march.core.message import ToolCall, ToolResult
 from march.core.attachments import (
     strip_attachments_from_messages,
-    content_to_history_text,
 )
 from march.core.session import Session
 from march.logging import get_logger
@@ -1071,10 +1070,10 @@ class Agent:
         # handles removing image data from older messages at LLM call time.
         session.add_exchange(user_message, content)
 
-        # NOTE: Message persistence to DB is handled by each channel individually.
-        # ws_proxy saves messages at specific points (user msg on receive, assistant
-        # msg on stream complete). ACP and terminal channels persist via SessionStore
-        # in their own flow. The agent does NOT auto-persist here to avoid duplicates.
+        # NOTE: Message persistence to DB is handled by the Orchestrator layer.
+        # The Orchestrator persists user messages on receive and assistant messages
+        # on stream completion. The agent does NOT auto-persist here to avoid
+        # duplicates.
 
         return AgentResponse(
             content=content,

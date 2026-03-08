@@ -8,18 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any
 from uuid import uuid4
 
 from march.agents.announce import SubagentAnnouncer
 from march.agents.registry import RunOutcome, RunRecord, SubagentRegistry
 from march.agents.task_queue import TaskQueue
 from march.logging import get_logger
-
-if TYPE_CHECKING:
-    from march.core.agent import Agent, AgentResponse
-    from march.core.session import Session, SessionStore
 
 logger = get_logger("march.agent_manager")
 

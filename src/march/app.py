@@ -24,7 +24,7 @@ from march.logging import get_logger
 from march.memory.store import MemoryStore
 from march.plugins._base import Plugin
 from march.plugins._manager import PluginManager
-from march.tools.base import Tool, ToolMeta, tool as tool_decorator
+from march.tools.base import tool as tool_decorator
 from march.tools.registry import ToolRegistry
 from march.tools.skills.loader import SkillLoader
 from march.tools.skills.base import Skill
@@ -444,14 +444,5 @@ class MarchApp:
                 rooms=list(matrix_config.rooms),
                 e2ee=matrix_config.e2ee,
                 auto_setup=matrix_config.auto_setup,
-            )
-        elif name == "vscode":
-            from march.channels.vscode import VSCodeChannel
-            vscode_config = self.config.channels.vscode
-            # VSCode channel connects to the ws_proxy plugin's WebSocket
-            proxy_cfg = self.config.plugins.ws_proxy
-            ws_url = f"ws://{proxy_cfg.host}:{proxy_cfg.port}"
-            return VSCodeChannel(
-                ws_url=ws_url,
             )
         return None

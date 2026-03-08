@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from march.core.agent import Agent, AgentResponse
+    from march.core.agent import Agent
     from march.core.session import Session
     from march.llm.base import StreamChunk
 

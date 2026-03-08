@@ -71,13 +71,23 @@ class ACPChannel(Channel):
     async def start(self, agent: "Agent", **kwargs: Any) -> None:
         """Start the ACP channel, reading newline-delimited JSON from stdin.
 
-        The ``orchestrator`` keyword argument is **required**.  The channel
-        does not interact with the Agent or SessionStore directly.
+        Accepts an ``orchestrator`` keyword argument.  If not provided,
+        builds one from ``agent`` + ``session_store`` (same pattern as
+        Matrix and Terminal channels).
         """
         orchestrator = kwargs.get("orchestrator")
         if orchestrator is None:
+            from march.core.orchestrator import Orchestrator as _Orc
+            session_store = kwargs.get("session_store")
+            if session_store is None and hasattr(agent, "session_store"):
+                session_store = agent.session_store
+            if agent and session_store:
+                orchestrator = _Orc(agent=agent, session_store=session_store)
+                logger.info("acp: created Orchestrator from agent + session_store")
+        if orchestrator is None:
             raise ValueError(
-                "ACPChannel requires an 'orchestrator' keyword argument"
+                "ACPChannel requires an 'orchestrator' keyword argument "
+                "(or agent + session_store to auto-create one)"
             )
         self._orchestrator = orchestrator
         self._running = True

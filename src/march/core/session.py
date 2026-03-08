@@ -98,16 +98,6 @@ class Session:
         self.history.append(Message.assistant(assistant_content))
         self.last_active = time.time()
 
-    def add_tool_exchange(
-        self,
-        assistant_message: Message,
-        tool_result_message: Message,
-    ) -> None:
-        """Add an assistant tool-call + tool results to history."""
-        self.history.append(assistant_message)
-        self.history.append(tool_result_message)
-        self.last_active = time.time()
-
     def clear(self) -> None:
         """Clear session history (reset). Clears backup too."""
         self.history.clear()
@@ -155,11 +145,6 @@ class Session:
 
         self.last_active = time.time()
         return len(old_messages)
-
-    def reactivate(self) -> None:
-        """Reactivate a reset session."""
-        self.state = "active"
-        self.last_active = time.time()
 
     def get_messages_for_llm(self) -> list[dict[str, Any]]:
         """Get all messages serialized for the LLM API.
@@ -595,46 +580,6 @@ class SessionStore:
             row = await cur.fetchone()
             return row[0] if row else 0
 
-    async def clear_messages(self, session_id: str) -> None:
-        """Delete all messages for a session."""
-        assert self._db is not None
-
-        await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        await self._db.commit()
-
-    # ── Streaming Support (for dashboard) ────────────────────────────────
-
-    async def save_draft(self, session_id: str, draft_id: str, content: str) -> None:
-        """Save or update a draft (in-progress streaming) message."""
-        assert self._db is not None
-
-        now = _now()
-        await self._db.execute(
-            """INSERT INTO messages (id, session_id, role, content, tool_calls,
-               tool_results, attachments, metadata, created_at)
-               VALUES (?, ?, 'assistant', ?, '[]', '[]', '[]', '{}', ?)
-               ON CONFLICT(id) DO UPDATE SET content = excluded.content""",
-            (draft_id, session_id, content, now),
-        )
-        await self._db.commit()
-
-    async def finalize_draft(
-        self,
-        draft_id: str,
-        content: str,
-        tool_calls: list | None = None,
-        metadata: dict | None = None,
-    ) -> None:
-        """Finalize a draft message (streaming complete)."""
-        assert self._db is not None
-
-        await self._db.execute(
-            "UPDATE messages SET content = ?, tool_calls = ?, metadata = ? WHERE id = ?",
-            (content, json.dumps(tool_calls or []),
-             json.dumps(metadata or {}), draft_id),
-        )
-        await self._db.commit()
-
     # ── Summaries ────────────────────────────────────────────────────────
 
     async def get_rolling_summary(self, session_id: str) -> str:
@@ -653,15 +598,6 @@ class SessionStore:
 
         await self._db.execute(
             "UPDATE sessions SET rolling_summary = ? WHERE id = ?", (summary, session_id)
-        )
-        await self._db.commit()
-
-    async def update_compaction_summary(self, session_id: str, summary: str) -> None:
-        """Update the compaction summary for a session."""
-        assert self._db is not None
-
-        await self._db.execute(
-            "UPDATE sessions SET compaction_summary = ? WHERE id = ?", (summary, session_id)
         )
         await self._db.commit()
 

@@ -411,16 +411,3 @@ class MetricsLogger:
             "messages_summarized": messages_compacted,
             "summary_length": summary_length,
         })
-
-    def stream_draft_saved(
-        self,
-        session_id: str,
-        chunks: int,
-        content_length: int,
-    ) -> None:
-        self._write({
-            "event": "stream.draft_saved",
-            "session_id": session_id,
-            "chunks": chunks,
-            "content_length": content_length,
-        })
