@@ -141,12 +141,15 @@ class GlobalMemoryConfig(BaseModel):
 
 
 class CompactionConfig(BaseModel):
-    """Compaction configuration for context window management."""
+    """Compaction configuration for context window management.
+
+    The dedup_session_memory() function handles deduplication with a size
+    target of min(current_size, context_window * 30%).  No separate
+    facts/plan budget ratios are needed.
+    """
 
     threshold: float = 0.95  # Trigger compaction at this % of context window
-    summary_budget_ratio: float = 0.15
-    facts_budget_ratio: float = 0.15
-    plan_budget_ratio: float = 0.05
+    summary_budget_ratio: float = 0.15  # Fraction of context window reserved for summary
 
 
 class MemoryConfig(BaseModel):

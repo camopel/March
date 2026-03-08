@@ -123,16 +123,11 @@ class TestSchemaDefaults:
         config = CompactionConfig()
         assert config.threshold == 0.95
         assert config.summary_budget_ratio == 0.15
-        assert config.facts_budget_ratio == 0.15
-        assert config.plan_budget_ratio == 0.05
 
     def test_compaction_config_override(self):
         config = CompactionConfig(threshold=0.80, summary_budget_ratio=0.20)
         assert config.threshold == 0.80
         assert config.summary_budget_ratio == 0.20
-        # Unset fields keep defaults
-        assert config.facts_budget_ratio == 0.15
-        assert config.plan_budget_ratio == 0.05
 
     def test_memory_config_has_compaction(self):
         config = MemoryConfig()

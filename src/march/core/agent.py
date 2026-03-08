@@ -90,6 +90,39 @@ class Agent:
         self.session_store: Any = None  # Set by MarchApp for auto-persistence
         self._mlogger = MarchLogger()
         self._metrics = MetricsLogger.get()
+        self._steering_queues: dict[str, asyncio.Queue] = {}  # session_id → Queue
+
+    # ── Steering API ─────────────────────────────────────────────────
+
+    def get_steering_queue(self, session_id: str) -> asyncio.Queue:
+        """Get or create a steering queue for a session."""
+        if session_id not in self._steering_queues:
+            self._steering_queues[session_id] = asyncio.Queue()
+        return self._steering_queues[session_id]
+
+    def steer(self, session_id: str, message: str) -> bool:
+        """Queue a steering message for a running session.
+
+        Returns True if the session has an active queue (is running).
+        """
+        queue = self._steering_queues.get(session_id)
+        if queue is None:
+            return False
+        queue.put_nowait(message)
+        return True
+
+    def _drain_steering(self, session_id: str) -> list[str]:
+        """Drain all pending steering messages for a session."""
+        queue = self._steering_queues.get(session_id)
+        if queue is None:
+            return []
+        messages = []
+        while not queue.empty():
+            try:
+                messages.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return messages
 
     async def handle_command(self, user_message: str, session: Session) -> AgentResponse | None:
         """Handle slash commands (/rmb, /reset). Returns AgentResponse if handled, None otherwise."""
@@ -208,6 +241,9 @@ class Agent:
             cmd_response = await self.handle_command(user_message, session)
             if cmd_response is not None:
                 return cmd_response
+
+        # Create steering queue for this session's turn
+        self._steering_queues[session.id] = asyncio.Queue()
 
         start_time = time.monotonic()
         total_tokens = 0
@@ -391,7 +427,8 @@ class Agent:
 
             # Execute tool calls
             tool_results: list[ToolResult] = []
-            for llm_tool_call in llm_response.tool_calls:
+            steering_messages: list[str] = []
+            for i, llm_tool_call in enumerate(llm_response.tool_calls):
                 core_tool_call = ToolCall(
                     id=llm_tool_call.id,
                     name=llm_tool_call.name,
@@ -451,6 +488,19 @@ class Agent:
                 tool_results.append(result)
                 tool_calls_made += 1
 
+                # ── Steering checkpoint ──
+                steering_messages = self._drain_steering(session.id)
+                if steering_messages:
+                    # Skip remaining tools
+                    for remaining_tc in llm_response.tool_calls[i + 1:]:
+                        skip_result = ToolResult(
+                            id=remaining_tc.id,
+                            error="Skipped due to queued user message.",
+                        )
+                        tool_results.append(skip_result)
+                        tool_calls_made += 1
+                    break  # Exit tool loop
+
             # Add assistant message (with tool calls) + tool results to messages
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
@@ -481,6 +531,14 @@ class Agent:
             # Only the final assistant reply is saved via _finalize() →
             # session.add_exchange(). This keeps session history clean:
             # [user, assistant, user, assistant, ...]
+
+            # ── Inject steering messages as user messages ──
+            if not steering_messages:
+                steering_messages = self._drain_steering(session.id)
+            if steering_messages:
+                for steer_msg in steering_messages:
+                    messages.append({"role": "user", "content": steer_msg})
+                continue  # Skip truncation, go straight to next LLM call
 
             # Truncate messages if context is growing too large
             messages = self._truncate_messages(messages, context)
@@ -643,6 +701,9 @@ class Agent:
         total_tokens = 0
         total_cost = 0.0
         tool_calls_made = 0
+
+        # Create steering queue for this session's turn
+        self._steering_queues[session.id] = asyncio.Queue()
 
         # Set session ID in context var so tools can access it
         current_session_id.set(session.id)
@@ -839,7 +900,8 @@ class Agent:
 
             # Execute tool calls
             tool_results: list[ToolResult] = []
-            for tc in llm_tool_calls:
+            steering_messages: list[str] = []
+            for i, tc in enumerate(llm_tool_calls):
                 core_tool_call = ToolCall(id=tc.id, name=tc.name, args=tc.args)
 
                 modified_call = await self.plugins.dispatch_before_tool(core_tool_call)
@@ -912,6 +974,28 @@ class Agent:
                     },
                 )
 
+                # ── Steering checkpoint ──
+                steering_messages = self._drain_steering(session.id)
+                if steering_messages:
+                    # Skip remaining tools
+                    for remaining_tc in llm_tool_calls[i + 1:]:
+                        skip_result = ToolResult(
+                            id=remaining_tc.id,
+                            error="Skipped due to queued user message.",
+                        )
+                        tool_results.append(skip_result)
+                        tool_calls_made += 1
+                        yield StreamChunk(
+                            delta="",
+                            tool_progress={
+                                "name": remaining_tc.name,
+                                "status": "skipped",
+                                "summary": "Skipped due to steering",
+                                "duration_ms": 0,
+                            },
+                        )
+                    break  # Exit tool loop
+
             # Add to messages for next LLM call
             assistant_msg = {
                 "role": "assistant",
@@ -935,6 +1019,14 @@ class Agent:
 
             # Tool call intermediate messages stay in `messages` only —
             # not saved to session.history. See run() for explanation.
+
+            # ── Inject steering messages as user messages ──
+            if not steering_messages:
+                steering_messages = self._drain_steering(session.id)
+            if steering_messages:
+                for steer_msg in steering_messages:
+                    messages.append({"role": "user", "content": steer_msg})
+                continue  # Skip truncation, go straight to next LLM call
 
             messages = self._truncate_messages(messages, context)
 
@@ -1085,6 +1177,9 @@ class Agent:
         # so images are available in history. strip_attachments_from_messages()
         # handles removing image data from older messages at LLM call time.
         session.add_exchange(user_message, content)
+
+        # Clean up steering queue for this session's turn
+        self._steering_queues.pop(session.id, None)
 
         # NOTE: Message persistence to DB is handled by the Orchestrator layer.
         # The Orchestrator persists user messages on receive and assistant messages

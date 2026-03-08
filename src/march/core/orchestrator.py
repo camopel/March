@@ -378,6 +378,14 @@ class Orchestrator:
         """
         return self._sessions.get(session_id)
 
+    def try_steer(self, session_id: str, message: str) -> bool:
+        """Try to steer an active turn.
+
+        Returns True if the message was injected into the agent's steering
+        queue for the given session (i.e. the session has an active turn).
+        """
+        return self.agent.steer(session_id, message)
+
     def evict_session(self, session_id: str) -> None:
         """Remove a session from the in-memory cache.
 

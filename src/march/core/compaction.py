@@ -23,11 +23,6 @@ COMPACTION_THRESHOLD = 0.95
 # Reserve this fraction of the context window for the summary + new messages
 SUMMARY_BUDGET_RATIO = 0.15
 
-# Budget for session memory within the compaction summary
-# Facts: max 15% of context window, Plans: max 5%
-FACTS_BUDGET_RATIO = 0.15
-PLAN_BUDGET_RATIO = 0.05
-
 # Safety margin for token estimation inaccuracy
 SAFETY_MARGIN = 1.2
 
@@ -250,87 +245,47 @@ def _load_session_memory(session_id: str) -> dict[str, str]:
     return result
 
 
-async def _compress_facts(facts: str, max_tokens: int, summarize_fn, facts_path: str = "") -> str:
-    """Create a compressed index of facts that fits within token budget.
+DEDUP_SESSION_MEMORY_PROMPT = """You are a memory deduplicator. You are given session memory files that have accumulated entries over multiple compaction cycles.
 
-    Does NOT modify the original facts file. Instead, creates a concise
-    summary with a reference to the full file so the LLM can read details
-    on demand.
-    """
-    prompt = (
-        "Create a concise INDEX of these facts. Rules:\n"
-        "- One bullet per fact (merge duplicates, keep latest by timestamp)\n"
-        "- Each bullet: brief summary of the fact\n"
-        "- Preserve all identifiers, paths, URLs verbatim in backticks\n"
-        "- Drop [UPDATE] prefixes — just keep the final value\n"
-        f"- Target: under {max_tokens} tokens (~{max_tokens * 4} chars)\n\n"
-        f"Facts to index:\n{facts}"
-    )
-    try:
-        compressed = await summarize_fn(prompt)
-        index = compressed.strip() if compressed else facts
-    except Exception:
-        # If compression fails, truncate to fit
-        max_chars = max_tokens * 4
-        if len(facts) > max_chars:
-            index = facts[-max_chars:] + "\n... (older facts truncated)"
-        else:
-            index = facts
-
-    # Add reference to full file
-    if facts_path:
-        index += f"\n\n_Full details: `{facts_path}` (use read tool to access)_"
-
-    return index
-
-
-MERGE_SESSION_MEMORY_PROMPT = """You are a memory deduplicator. You are given session memory (facts, plan, checkpoint, progress) and a new compaction summary.
-
-Your job: Deduplicate and merge, do NOT compress or lose detail. Remove only true duplicates and superseded entries.
+Your job: Deduplicate each section independently. Do NOT compress or lose detail. Remove only true duplicates and superseded entries.
 
 Rules:
-- If the same fact appears multiple times, keep only the latest version
+- If the same fact appears multiple times, keep only the latest version (by timestamp if present)
 - If a fact was updated/evolved, keep only the final version
 - Merge overlapping information into single entries
 - Preserve ALL unique details, identifiers, paths, URLs, code snippets verbatim
-- Keep the structure organized with clear sections
 - Do NOT summarize or compress — maintain full detail level
-- Output clean markdown with sections: ## Facts, ## Plan, ## Checkpoint, ## Progress
-- Only include sections that have content
+- Output clean markdown with the SAME sections as input: ## Facts, ## Plan, ## Checkpoint, ## Progress
+- Only include sections that have content (omit empty sections)
 - Target size: {target_tokens} tokens (~{target_chars} chars). Do not exceed this.
-
-Input:
 
 {memory_content}
 
----
-New compaction summary:
-{new_summary}
-
-Output the merged, deduplicated session memory:"""
+Output the deduplicated session memory (same sections, no data loss):"""
 
 
-async def merge_session_memory(
+async def dedup_session_memory(
     memory_dict: dict[str, str],
-    new_summary: str,
     summarize_fn,
     context_window: int,
-) -> str:
-    """Merge all session memory types with a new compaction summary.
+) -> dict[str, str]:
+    """Deduplicate session memory files in-place.
 
-    Combines facts, plan, checkpoint, progress, and the new summary,
-    then asks the LLM to deduplicate (not compress) the result.
+    Reads all session memory types, asks the LLM to remove duplicates
+    and superseded entries, then returns the cleaned dict.
+
+    This does NOT touch the compaction summary — it only cleans the
+    session memory files themselves.
 
     Args:
         memory_dict: Dict with keys "facts", "plan", "checkpoint", "progress".
-        new_summary: The new compaction summary from summarizing old messages.
         summarize_fn: Async function(prompt: str) -> str that calls the LLM.
         context_window: Model's context window in tokens.
 
     Returns:
-        Clean, merged carry-over summary string.
+        Cleaned dict with same keys, deduplicated content.
     """
-    # Build combined memory content
+    # Build combined memory content for dedup
     parts = []
     for section, key in [("Facts", "facts"), ("Plan", "plan"),
                          ("Checkpoint", "checkpoint"), ("Progress", "progress")]:
@@ -338,51 +293,39 @@ async def merge_session_memory(
         if content:
             parts.append(f"## {section}\n{content}")
 
-    memory_content = "\n\n".join(parts) if parts else "(no existing session memory)"
+    if not parts:
+        return memory_dict
+
+    memory_content = "\n\n".join(parts)
 
     # Calculate size target: min(current_token_size, context_window * 0.30)
-    current_tokens = estimate_tokens(memory_content) + estimate_tokens(new_summary)
+    current_tokens = estimate_tokens(memory_content)
     target_tokens = min(current_tokens, int(context_window * 0.30))
     target_chars = target_tokens * 4
 
-    prompt = MERGE_SESSION_MEMORY_PROMPT.format(
+    prompt = DEDUP_SESSION_MEMORY_PROMPT.format(
         target_tokens=target_tokens,
         target_chars=target_chars,
         memory_content=memory_content,
-        new_summary=new_summary,
     )
 
     try:
-        merged = await summarize_fn(prompt)
-        return merged.strip() if merged else new_summary
+        deduped = await summarize_fn(prompt)
+        if not deduped or len(deduped.strip()) < 5:
+            return memory_dict
+        return _parse_memory_sections(deduped.strip())
     except Exception as e:
-        logger.error("merge_session_memory failed: %s — falling back to concatenation", e)
-        # Fallback: simple concatenation
-        fallback_parts = []
-        if memory_content and memory_content != "(no existing session memory)":
-            fallback_parts.append(memory_content)
-        if new_summary:
-            fallback_parts.append(f"## Recent Summary\n{new_summary}")
-        return "\n\n".join(fallback_parts)
+        logger.error("dedup_session_memory failed: %s — keeping originals", e)
+        return memory_dict
 
 
-def _write_merged_session_memory(session_id: str, merged: str) -> None:
-    """Write merged session memory back to disk, overwriting existing files.
-
-    Parses the merged output into sections and writes each to the
-    corresponding file.
-    """
-    from pathlib import Path
-
-    memory_dir = Path.home() / ".march" / "memory" / session_id
-    memory_dir.mkdir(parents=True, exist_ok=True)
-
-    # Parse sections from merged output
+def _parse_memory_sections(text: str) -> dict[str, str]:
+    """Parse markdown text with ## sections into a memory dict."""
     sections: dict[str, str] = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
-    current_section = None
+    current_section: str | None = None
     current_lines: list[str] = []
 
-    for line in merged.split("\n"):
+    for line in text.split("\n"):
         stripped = line.strip().lower()
         if stripped.startswith("## fact"):
             if current_section and current_lines:
@@ -404,11 +347,6 @@ def _write_merged_session_memory(session_id: str, merged: str) -> None:
                 sections[current_section] = "\n".join(current_lines).strip()
             current_section = "progress"
             current_lines = []
-        elif stripped.startswith("## recent summary"):
-            if current_section and current_lines:
-                sections[current_section] = "\n".join(current_lines).strip()
-            current_section = "facts"  # Fold recent summary into facts
-            current_lines = []
         elif current_section is not None:
             current_lines.append(line)
 
@@ -416,17 +354,30 @@ def _write_merged_session_memory(session_id: str, merged: str) -> None:
     if current_section and current_lines:
         sections[current_section] = "\n".join(current_lines).strip()
 
-    # Write each section to its file (overwrite, not append)
+    return sections
+
+
+def write_session_memory(session_id: str, memory_dict: dict[str, str]) -> None:
+    """Write session memory dict back to disk, overwriting existing files.
+
+    Only writes files that have content. Does NOT clear files that are
+    absent from the dict — preserves files the dict doesn't know about.
+    """
+    from pathlib import Path
+
+    memory_dir = Path.home() / ".march" / "memory" / session_id
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
     file_map = {"facts": "facts.md", "plan": "plan.md",
                 "checkpoint": "checkpoint.md", "progress": "progress.md"}
     for key, filename in file_map.items():
-        content = sections.get(key, "").strip()
+        content = memory_dict.get(key, "").strip()
         path = memory_dir / filename
         if content:
             path.write_text(content, encoding="utf-8")
-        elif path.exists():
-            # Clear file if section is empty after merge
-            path.write_text("", encoding="utf-8")
+        # If content is empty but file exists, leave it alone —
+        # the dedup may not have produced that section but the
+        # original file might have valid data from session_memory_tool.
 
 
 def delete_session_memory(session_id: str) -> bool:
@@ -543,8 +494,6 @@ async def compact_messages(
     session_id: str | None = None,
     threshold: float | None = None,
     summary_budget_ratio: float | None = None,
-    facts_budget_ratio: float | None = None,
-    plan_budget_ratio: float | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Compact messages by summarizing old ones.
 
@@ -557,8 +506,6 @@ async def compact_messages(
         session_id: Session ID for extracting facts/plans before compaction.
         threshold: Optional compaction threshold (default from COMPACTION_THRESHOLD).
         summary_budget_ratio: Optional summary budget ratio (default from SUMMARY_BUDGET_RATIO).
-        facts_budget_ratio: Optional facts budget ratio (default from FACTS_BUDGET_RATIO).
-        plan_budget_ratio: Optional plan budget ratio (default from PLAN_BUDGET_RATIO).
 
     Returns:
         (new_messages, summary_text) — new_messages starts with a summary
@@ -587,7 +534,7 @@ async def compact_messages(
         except Exception as e:
             logger.error("Session memory extraction failed (non-fatal): %s", e)
 
-    # Build and run the summarization
+    # Build and run the summarization of old messages
     prompt = build_summary_prompt(old, previous_summary)
     try:
         summary = await summarize_fn(prompt)
@@ -596,32 +543,37 @@ async def compact_messages(
         # Fallback: just drop old messages without summary
         return recent, previous_summary or ""
 
-    # Smart merge: load all session memory types and merge with new summary
+    # Deduplicate session memory files (separate from summary)
+    # This cleans up accumulated duplicates in facts.md, plan.md, etc.
+    # then folds the cleaned memory into the carry-over summary as read-only context.
     if session_id:
         memory_dict = _load_session_memory(session_id)
-
         has_memory = any(v.strip() for v in memory_dict.values())
+
         if has_memory:
+            # Step 1: Dedup the session memory files themselves
             try:
-                merged = await merge_session_memory(
-                    memory_dict, summary, summarize_fn, context_window,
+                deduped = await dedup_session_memory(
+                    memory_dict, summarize_fn, context_window,
                 )
-                # Write merged result back to session memory files (overwrite)
-                _write_merged_session_memory(session_id, merged)
-                # Use the merged result as the carry-over summary
-                summary = merged
+                # Write cleaned memory back to disk
+                write_session_memory(session_id, deduped)
+                memory_dict = deduped
             except Exception as e:
-                logger.error("Session memory merge failed (non-fatal): %s — using legacy fold", e)
-                # Fallback to legacy fold logic
-                summary = _legacy_fold_session_memory(
-                    summary, memory_dict, context_window,
-                    facts_budget_ratio or FACTS_BUDGET_RATIO,
-                    plan_budget_ratio or PLAN_BUDGET_RATIO,
-                    summarize_fn, session_id,
-                )
-        else:
-            # No session memory — just use the summary as-is
-            pass
+                logger.error("Session memory dedup failed (non-fatal): %s", e)
+                # Keep original memory_dict
+
+            # Step 2: Fold session memory into the carry-over summary
+            # (read-only — the files are the source of truth, this just
+            # ensures the LLM sees the memory in the compacted context)
+            memory_parts = []
+            for section, key in [("Facts", "facts"), ("Plan", "plan"),
+                                 ("Checkpoint", "checkpoint"), ("Progress", "progress")]:
+                content = memory_dict.get(key, "").strip()
+                if content:
+                    memory_parts.append(f"**{section}:**\n{content}")
+            if memory_parts:
+                summary = summary + "\n\n---\n\n**Session Memory:**\n" + "\n\n".join(memory_parts)
 
     # Build the compacted message list
     summary_msg = {
@@ -640,49 +592,3 @@ async def compact_messages(
     )
 
     return compacted, summary
-
-
-async def _legacy_fold_session_memory(
-    summary: str,
-    memory_dict: dict[str, str],
-    context_window: int,
-    facts_budget_ratio: float,
-    plan_budget_ratio: float,
-    summarize_fn,
-    session_id: str,
-) -> str:
-    """Legacy fallback: fold session memory into summary with budget limits.
-
-    Used when merge_session_memory fails.
-    """
-    facts = memory_dict.get("facts", "")
-    plan = memory_dict.get("plan", "")
-
-    if not facts and not plan:
-        return summary
-
-    facts_budget = int(context_window * facts_budget_ratio)
-    plan_budget = int(context_window * plan_budget_ratio)
-
-    # Compress facts if they exceed budget
-    facts_tokens = estimate_tokens(facts) if facts else 0
-    if facts and facts_tokens > facts_budget:
-        from pathlib import Path
-        facts_path = str(Path.home() / ".march" / "memory" / session_id / "facts.md")
-        facts = await _compress_facts(facts, facts_budget, summarize_fn, facts_path)
-
-    # Truncate plan if it exceeds budget
-    if plan and estimate_tokens(plan) > plan_budget:
-        max_chars = plan_budget * 4
-        plan = plan[-max_chars:]
-
-    memory_parts = []
-    if facts:
-        memory_parts.append(f"**Facts:**\n{facts}")
-    if plan:
-        memory_parts.append(f"**Plan:**\n{plan}")
-
-    if memory_parts:
-        summary = summary + "\n\n---\n\n**Preserved Session Memory:**\n" + "\n\n".join(memory_parts)
-
-    return summary

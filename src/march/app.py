@@ -183,8 +183,8 @@ class MarchApp:
             return ""
 
         async def _try_steer(requester_key: str, message: str) -> bool:
-            """Try to inject into parent's active turn — not implemented yet."""
-            return False
+            """Try to inject into parent's active turn."""
+            return self.agent.steer(requester_key, message)
 
         async def _try_queue(requester_key: str, message: str) -> bool:
             """Queue message for delivery after parent's current turn."""
@@ -241,6 +241,20 @@ class MarchApp:
 
         # Expose agent manager to the agent for sub-agent spawning
         self.agent.agent_manager = self.agent_manager
+
+        # Wire steer from AgentManager to Agent
+        # When a steering message is sent to a sub-agent, try Agent.steer first
+        # (for active turns), then fall back to AgentManager's own queue.
+        original_send = self.agent_manager.send
+
+        async def _wired_send(agent_id: str, message: str) -> bool:
+            # Try Agent.steer first (for active turns)
+            if self.agent.steer(agent_id, message):
+                return True
+            # Fall back to AgentManager's queue
+            return await original_send(agent_id, message)
+
+        self.agent_manager.send = _wired_send
 
         # Wire sessions tools to the real agent manager
         from march.tools.builtin.sessions_tools import set_agent_manager

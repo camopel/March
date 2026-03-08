@@ -15,24 +15,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from march.core.compaction import (
     COMPACTION_THRESHOLD,
-    FACTS_BUDGET_RATIO,
     MIN_RECENT_KEEP,
-    PLAN_BUDGET_RATIO,
     SAFETY_MARGIN,
     SUMMARY_BUDGET_RATIO,
-    _compress_facts,
     _load_session_memory,
-    _write_merged_session_memory,
+    _parse_memory_sections,
     build_summary_prompt,
     compact_messages,
+    dedup_session_memory,
     delete_session_memory,
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_tokens,
     extract_session_memory,
-    merge_session_memory,
     needs_compaction,
     split_for_compaction,
+    write_session_memory,
 )
 
 
@@ -266,42 +264,6 @@ class TestDeleteSessionMemory:
         assert delete_session_memory("nonexistent-session-xyz") is False
 
 
-# ── Facts Compression ────────────────────────────────────────────────────
-
-class TestFactsCompression:
-    @pytest.mark.asyncio
-    async def test_compress_adds_reference(self):
-        facts = "- fact 1\n- fact 2\n- fact 3"
-
-        async def fake_summarize(prompt):
-            return "- fact 1\n- fact 2\n- fact 3 (compressed)"
-
-        result = await _compress_facts(facts, 100, fake_summarize, "/path/to/facts.md")
-        assert "/path/to/facts.md" in result
-        assert "read tool" in result
-
-    @pytest.mark.asyncio
-    async def test_compress_fallback_on_error(self):
-        facts = "- fact 1\n- fact 2"
-
-        async def failing_summarize(prompt):
-            raise RuntimeError("fail")
-
-        result = await _compress_facts(facts, 100, failing_summarize)
-        assert "fact 1" in result  # Returns original on failure
-
-    @pytest.mark.asyncio
-    async def test_compress_truncates_on_error_if_too_large(self):
-        facts = "x" * 10000
-
-        async def failing_summarize(prompt):
-            raise RuntimeError("fail")
-
-        result = await _compress_facts(facts, 50, failing_summarize)  # 50 tokens = ~200 chars
-        assert len(result) < len(facts)
-        assert "truncated" in result
-
-
 # ── Full Compaction Flow ─────────────────────────────────────────────────
 
 class TestCompactMessages:
@@ -349,7 +311,7 @@ class TestCompactMessages:
                 if "memory curator" in prompt.lower():
                     return "## Facts\n- extracted fact\n\n## Plan\n- extracted plan"
                 if "deduplicat" in prompt.lower():
-                    # merge_session_memory prompt
+                    # dedup_session_memory prompt
                     return "## Facts\n- DB is PostgreSQL\n- extracted fact\n\n## Plan\n1. Deploy to prod"
                 return "Conversation summary."
 
@@ -384,23 +346,11 @@ class TestCompactMessages:
 # ── Budget Constants ─────────────────────────────────────────────────────
 
 class TestBudgetConstants:
-    def test_facts_budget(self):
-        assert FACTS_BUDGET_RATIO == 0.15
-
-    def test_plan_budget(self):
-        assert PLAN_BUDGET_RATIO == 0.05
-
     def test_summary_budget(self):
         assert SUMMARY_BUDGET_RATIO == 0.15
 
     def test_compaction_threshold(self):
         assert COMPACTION_THRESHOLD == 0.95
-
-    def test_total_budget_reasonable(self):
-        # Summary + facts + plans should leave room for recent messages
-        total = SUMMARY_BUDGET_RATIO + FACTS_BUDGET_RATIO + PLAN_BUDGET_RATIO
-        assert total <= 0.40  # Max 40% for compacted content
-        assert total >= 0.30  # At least 30% for meaningful content
 
 
 # ── Session Memory Tool ──────────────────────────────────────────────────
@@ -498,49 +448,45 @@ class TestSessionMemoryTool:
             current_session_id.reset(token)
 
 
-# ── Merge Session Memory ─────────────────────────────────────────────────
+# ── Dedup Session Memory ──────────────────────────────────────────────────
 
-class TestMergeSessionMemory:
-    """Tests for the new merge_session_memory function."""
+class TestDedupSessionMemory:
+    """Tests for the dedup_session_memory function."""
 
     @pytest.mark.asyncio
-    async def test_merge_combines_all_types(self):
+    async def test_dedup_removes_duplicates(self):
         memory_dict = {
-            "facts": "- DB is PostgreSQL\n- Python 3.12",
+            "facts": "- DB is PostgreSQL\n- Python 3.12\n- DB is PostgreSQL",
             "plan": "1. Deploy to prod",
-            "checkpoint": "- Last checkpoint: migration done",
-            "progress": "- 80% complete",
+            "checkpoint": "",
+            "progress": "",
         }
 
         async def fake_summarize(prompt):
-            # Verify the prompt contains all memory types
             assert "PostgreSQL" in prompt
             assert "Deploy to prod" in prompt
-            assert "migration done" in prompt
-            assert "80% complete" in prompt
-            assert "new summary info" in prompt
-            return "## Facts\n- DB: PostgreSQL\n- Python 3.12\n\n## Plan\n1. Deploy to prod\n\n## Progress\n- 80% complete"
+            return "## Facts\n- DB is PostgreSQL\n- Python 3.12\n\n## Plan\n1. Deploy to prod"
 
-        result = await merge_session_memory(
-            memory_dict, "new summary info", fake_summarize, context_window=100000,
+        result = await dedup_session_memory(
+            memory_dict, fake_summarize, context_window=100000,
         )
-        assert "PostgreSQL" in result
-        assert "Deploy to prod" in result
+        assert "PostgreSQL" in result["facts"]
+        assert "Deploy to prod" in result["plan"]
 
     @pytest.mark.asyncio
-    async def test_merge_with_empty_memory(self):
+    async def test_dedup_with_empty_memory(self):
         memory_dict = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
 
-        async def fake_summarize(prompt):
-            return "## Facts\n- from summary only"
+        async def should_not_be_called(prompt):
+            raise AssertionError("Should not call LLM for empty memory")
 
-        result = await merge_session_memory(
-            memory_dict, "new summary", fake_summarize, context_window=100000,
+        result = await dedup_session_memory(
+            memory_dict, should_not_be_called, context_window=100000,
         )
-        assert result  # Should produce something
+        assert result == memory_dict
 
     @pytest.mark.asyncio
-    async def test_merge_fallback_on_error(self):
+    async def test_dedup_fallback_on_error(self):
         memory_dict = {
             "facts": "- important fact",
             "plan": "- important plan",
@@ -551,15 +497,15 @@ class TestMergeSessionMemory:
         async def failing_summarize(prompt):
             raise RuntimeError("LLM down")
 
-        result = await merge_session_memory(
-            memory_dict, "new summary", failing_summarize, context_window=100000,
+        result = await dedup_session_memory(
+            memory_dict, failing_summarize, context_window=100000,
         )
-        # Should fall back to concatenation
-        assert "important fact" in result
-        assert "new summary" in result
+        # Should return originals on failure
+        assert result["facts"] == "- important fact"
+        assert result["plan"] == "- important plan"
 
     @pytest.mark.asyncio
-    async def test_merge_size_target(self):
+    async def test_dedup_size_target(self):
         """Verify the prompt includes a size target based on context window."""
         memory_dict = {
             "facts": "- fact",
@@ -573,15 +519,15 @@ class TestMergeSessionMemory:
             captured_prompts.append(prompt)
             return "## Facts\n- fact"
 
-        await merge_session_memory(
-            memory_dict, "summary", capturing_summarize, context_window=10000,
+        await dedup_session_memory(
+            memory_dict, capturing_summarize, context_window=10000,
         )
         assert len(captured_prompts) == 1
         # Should mention target tokens (min of current size, 30% of 10000 = 3000)
-        assert "3000" in captured_prompts[0] or "token" in captured_prompts[0].lower()
+        assert "token" in captured_prompts[0].lower()
 
     @pytest.mark.asyncio
-    async def test_merge_dedup_prompt_content(self):
+    async def test_dedup_prompt_content(self):
         """Verify the prompt explicitly asks for deduplication, not compression."""
         memory_dict = {"facts": "- fact", "plan": "", "checkpoint": "", "progress": ""}
         captured_prompts = []
@@ -590,32 +536,86 @@ class TestMergeSessionMemory:
             captured_prompts.append(prompt)
             return "## Facts\n- fact"
 
-        await merge_session_memory(
-            memory_dict, "summary", capturing_summarize, context_window=100000,
+        await dedup_session_memory(
+            memory_dict, capturing_summarize, context_window=100000,
         )
         prompt = captured_prompts[0].lower()
-        assert "deduplicate" in prompt
+        assert "deduplicate" in prompt or "deduplicat" in prompt
         assert "do not compress" in prompt
 
+    @pytest.mark.asyncio
+    async def test_dedup_preserves_all_sections(self):
+        memory_dict = {
+            "facts": "- fact A",
+            "plan": "- plan B",
+            "checkpoint": "- checkpoint C",
+            "progress": "- progress D",
+        }
 
-# ── Write Merged Session Memory ──────────────────────────────────────────
+        async def fake_summarize(prompt):
+            return (
+                "## Facts\n- fact A\n\n"
+                "## Plan\n- plan B\n\n"
+                "## Checkpoint\n- checkpoint C\n\n"
+                "## Progress\n- progress D"
+            )
 
-class TestWriteMergedSessionMemory:
+        result = await dedup_session_memory(
+            memory_dict, fake_summarize, context_window=100000,
+        )
+        assert "fact A" in result["facts"]
+        assert "plan B" in result["plan"]
+        assert "checkpoint C" in result["checkpoint"]
+        assert "progress D" in result["progress"]
+
+
+# ── Parse Memory Sections ────────────────────────────────────────────────
+
+class TestParseMemorySections:
+    def test_parse_all_sections(self):
+        text = (
+            "## Facts\n- fact A\n- fact B\n\n"
+            "## Plan\n1. step one\n\n"
+            "## Checkpoint\n- checkpoint data\n\n"
+            "## Progress\n- 50% done"
+        )
+        result = _parse_memory_sections(text)
+        assert "fact A" in result["facts"]
+        assert "step one" in result["plan"]
+        assert "checkpoint data" in result["checkpoint"]
+        assert "50% done" in result["progress"]
+
+    def test_parse_partial_sections(self):
+        text = "## Facts\n- only facts here"
+        result = _parse_memory_sections(text)
+        assert "only facts here" in result["facts"]
+        assert result["plan"] == ""
+        assert result["checkpoint"] == ""
+        assert result["progress"] == ""
+
+    def test_parse_empty(self):
+        result = _parse_memory_sections("")
+        assert all(v == "" for v in result.values())
+
+
+# ── Write Session Memory ─────────────────────────────────────────────────
+
+class TestWriteSessionMemory:
     def setup_method(self):
-        self.session_id = "test-write-merged"
+        self.session_id = "test-write-session-mem"
         _cleanup_session(self.session_id)
 
     def teardown_method(self):
         _cleanup_session(self.session_id)
 
     def test_write_all_sections(self):
-        merged = (
-            "## Facts\n- fact A\n- fact B\n\n"
-            "## Plan\n1. step one\n\n"
-            "## Checkpoint\n- checkpoint data\n\n"
-            "## Progress\n- 50% done"
-        )
-        _write_merged_session_memory(self.session_id, merged)
+        memory_dict = {
+            "facts": "- fact A\n- fact B",
+            "plan": "1. step one",
+            "checkpoint": "- checkpoint data",
+            "progress": "- 50% done",
+        }
+        write_session_memory(self.session_id, memory_dict)
 
         d = Path.home() / ".march" / "memory" / self.session_id
         assert "fact A" in (d / "facts.md").read_text()
@@ -623,34 +623,43 @@ class TestWriteMergedSessionMemory:
         assert "checkpoint data" in (d / "checkpoint.md").read_text()
         assert "50% done" in (d / "progress.md").read_text()
 
-    def test_write_partial_sections(self):
-        merged = "## Facts\n- only facts here"
-        _write_merged_session_memory(self.session_id, merged)
+    def test_write_partial_does_not_clear_others(self):
+        """Writing only facts should NOT clear existing plan file."""
+        d = _make_session_dir(self.session_id)
+        (d / "plan.md").write_text("existing plan")
 
-        d = Path.home() / ".march" / "memory" / self.session_id
-        assert "only facts here" in (d / "facts.md").read_text()
-        # Other files should not exist (no content for those sections)
-        assert not (d / "plan.md").exists() or (d / "plan.md").read_text().strip() == ""
+        memory_dict = {
+            "facts": "- new facts",
+            "plan": "",  # empty — should NOT overwrite existing
+            "checkpoint": "",
+            "progress": "",
+        }
+        write_session_memory(self.session_id, memory_dict)
+
+        assert "new facts" in (d / "facts.md").read_text()
+        # plan.md should still have old content (not cleared)
+        assert "existing plan" in (d / "plan.md").read_text()
 
     def test_write_overwrites_existing(self):
         d = _make_session_dir(self.session_id)
         (d / "facts.md").write_text("old facts")
-        (d / "plan.md").write_text("old plan")
 
-        merged = "## Facts\n- new facts\n\n## Plan\n- new plan"
-        _write_merged_session_memory(self.session_id, merged)
+        memory_dict = {
+            "facts": "- new facts",
+            "plan": "",
+            "checkpoint": "",
+            "progress": "",
+        }
+        write_session_memory(self.session_id, memory_dict)
 
         assert "new facts" in (d / "facts.md").read_text()
         assert "old facts" not in (d / "facts.md").read_text()
-        assert "new plan" in (d / "plan.md").read_text()
-        assert "old plan" not in (d / "plan.md").read_text()
 
     def test_write_creates_dir(self):
-        """Should create the memory directory if it doesn't exist."""
         d = Path.home() / ".march" / "memory" / self.session_id
         assert not d.exists()
 
-        _write_merged_session_memory(self.session_id, "## Facts\n- data")
+        write_session_memory(self.session_id, {"facts": "- data", "plan": "", "checkpoint": "", "progress": ""})
         assert d.exists()
         assert "data" in (d / "facts.md").read_text()
 
