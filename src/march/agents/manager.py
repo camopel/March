@@ -77,10 +77,8 @@ class AgentManagerConfig:
     """Configuration for the agent manager."""
 
     max_spawn_depth: int = 1
-    max_children_per_agent: int = 5
     max_concurrent_subagents: int = 8
-    run_timeout_seconds: int = 0  # 0 = no timeout
-    archive_after_minutes: int = 60
+    reset_after_complete_minutes: int = 60
     announce_timeout_seconds: int = 60
 
 
@@ -146,14 +144,6 @@ class AgentManager:
             return SpawnResult(
                 status="forbidden",
                 error=f"max spawn depth ({self.config.max_spawn_depth}) reached",
-            )
-
-        # Validate max children
-        active_children = self.registry.count_active(ctx.requester_session)
-        if active_children >= self.config.max_children_per_agent:
-            return SpawnResult(
-                status="forbidden",
-                error=f"max children ({self.config.max_children_per_agent}) reached for this agent",
             )
 
         # Create child session key
@@ -379,7 +369,7 @@ class AgentManager:
         for cleanup (cleanup_done=True). Normal completed runs persist
         until the parent calls reset_children().
         """
-        max_age = self.config.archive_after_minutes * 60
+        max_age = self.config.reset_after_complete_minutes * 60
         return self.registry.cleanup_old(max_age)
 
     async def reset_children(self, parent_session_key: str) -> int:

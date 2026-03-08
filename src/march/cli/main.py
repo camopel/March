@@ -66,7 +66,7 @@ LIFECYCLE
   march start                  Init (if needed) + start agent + guardian + dashboard
   march start --channel matrix Start with Matrix channel
   march start --all            Start all enabled channels
-  march start --headless       Plugins only (e.g. ws_proxy)
+  march start --headless       WS proxy channel only (no interactive channels)
   march stop                   Stop March and all services
   march restart                Stop + start
   march enable                 Install as systemd service (auto-start on boot)

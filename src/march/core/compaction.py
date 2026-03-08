@@ -168,56 +168,31 @@ def build_summary_prompt(
     return "\n".join(parts)
 
 
-EXTRACT_PROMPT = """You are a memory curator. Extract key information from this conversation that should be preserved across context compaction.
-
-Output TWO sections in markdown:
-
-## Facts
-- Concrete facts, decisions, conclusions, technical details
-- Names, IDs, paths, URLs, config values mentioned
-- What was built, fixed, or changed
-- If a fact was updated/changed during the conversation, note the latest version with [UPDATE]
-- Only include things that are STILL RELEVANT (skip resolved issues)
-
-## Plan
-- Active tasks, next steps, TODOs that are NOT yet done
-- Ongoing goals or intentions
-- Skip anything already completed
-
-Rules:
-- Be concise — bullet points only, no prose
-- If nothing fits a section, write "None" under it
-- Max 50 lines total
-- Preserve identifiers verbatim in backticks
-- For conflicting/evolved facts, keep only the latest decision"""
-
 
 def _load_session_memory(session_id: str) -> dict[str, str]:
-    """Load all session memory types from disk.
+    """Load session memory from disk.
 
-    Reads facts.md, plan.md, checkpoint.md, and progress.md from the
-    session memory directory. Also picks up any other .md/.txt files
-    and folds them into facts.
+    Reads facts.md and plan.md from the session memory directory.
+    Also picks up any other .md/.txt files and folds them into facts.
 
     Files are NOT cleared — they accumulate across compactions so every
     compaction sees the full facts and plans. This prevents important
     details from being lost across multiple compressions.
 
     Returns:
-        Dict with keys: "facts", "plan", "checkpoint", "progress" — raw text from each file.
+        Dict with keys: "facts", "plan" — raw text from each file.
     """
     from pathlib import Path
 
     memory_dir = Path.home() / ".march" / "memory" / session_id
-    result = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
+    result = {"facts": "", "plan": ""}
 
     if not memory_dir.is_dir():
         return result
 
-    known_files = {"facts.md", "plan.md", "checkpoint.md", "progress.md"}
+    known_files = {"facts.md", "plan.md"}
 
-    for name, key in [("facts.md", "facts"), ("plan.md", "plan"),
-                      ("checkpoint.md", "checkpoint"), ("progress.md", "progress")]:
+    for name, key in [("facts.md", "facts"), ("plan.md", "plan")]:
         path = memory_dir / name
         if path.exists():
             result[key] = path.read_text(encoding="utf-8", errors="replace").strip()
@@ -245,6 +220,27 @@ def _load_session_memory(session_id: str) -> dict[str, str]:
     return result
 
 
+DEDUP_ROLLING_CONTEXT_PROMPT = """You are a context deduplicator for an AI agent. You are given:
+1. The agent's system rules, profile, tools, and long-term memory (from .md files)
+2. Session-specific facts and plans
+3. A conversation summary
+
+Your job: Produce a single, compact rolling context that the agent can use instead of re-reading all .md files every turn.
+
+Rules:
+- REMOVE any content from the conversation summary that duplicates the system rules, profile, tools, or long-term memory
+- KEEP all unique conversation-specific details, decisions, and facts
+- KEEP session facts and plans verbatim
+- PRESERVE all identifiers, paths, URLs, commands in backticks
+- The output should be a self-contained context document the agent can use as its system prompt
+- Structure with clear markdown sections
+- Target size: {target_tokens} tokens (~{target_chars} chars). Do not exceed this.
+
+{dedup_input}
+
+Output the deduplicated rolling context:"""
+
+
 DEDUP_SESSION_MEMORY_PROMPT = """You are a memory deduplicator. You are given session memory files that have accumulated entries over multiple compaction cycles.
 
 Your job: Deduplicate each section independently. Do NOT compress or lose detail. Remove only true duplicates and superseded entries.
@@ -255,7 +251,7 @@ Rules:
 - Merge overlapping information into single entries
 - Preserve ALL unique details, identifiers, paths, URLs, code snippets verbatim
 - Do NOT summarize or compress — maintain full detail level
-- Output clean markdown with the SAME sections as input: ## Facts, ## Plan, ## Checkpoint, ## Progress
+- Output clean markdown with the SAME sections as input: ## Facts, ## Plan
 - Only include sections that have content (omit empty sections)
 - Target size: {target_tokens} tokens (~{target_chars} chars). Do not exceed this.
 
@@ -278,7 +274,7 @@ async def dedup_session_memory(
     session memory files themselves.
 
     Args:
-        memory_dict: Dict with keys "facts", "plan", "checkpoint", "progress".
+        memory_dict: Dict with keys "facts", "plan".
         summarize_fn: Async function(prompt: str) -> str that calls the LLM.
         context_window: Model's context window in tokens.
 
@@ -287,8 +283,7 @@ async def dedup_session_memory(
     """
     # Build combined memory content for dedup
     parts = []
-    for section, key in [("Facts", "facts"), ("Plan", "plan"),
-                         ("Checkpoint", "checkpoint"), ("Progress", "progress")]:
+    for section, key in [("Facts", "facts"), ("Plan", "plan")]:
         content = memory_dict.get(key, "").strip()
         if content:
             parts.append(f"## {section}\n{content}")
@@ -321,7 +316,7 @@ async def dedup_session_memory(
 
 def _parse_memory_sections(text: str) -> dict[str, str]:
     """Parse markdown text with ## sections into a memory dict."""
-    sections: dict[str, str] = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
+    sections: dict[str, str] = {"facts": "", "plan": ""}
     current_section: str | None = None
     current_lines: list[str] = []
 
@@ -336,16 +331,6 @@ def _parse_memory_sections(text: str) -> dict[str, str]:
             if current_section and current_lines:
                 sections[current_section] = "\n".join(current_lines).strip()
             current_section = "plan"
-            current_lines = []
-        elif stripped.startswith("## checkpoint"):
-            if current_section and current_lines:
-                sections[current_section] = "\n".join(current_lines).strip()
-            current_section = "checkpoint"
-            current_lines = []
-        elif stripped.startswith("## progress"):
-            if current_section and current_lines:
-                sections[current_section] = "\n".join(current_lines).strip()
-            current_section = "progress"
             current_lines = []
         elif current_section is not None:
             current_lines.append(line)
@@ -368,8 +353,7 @@ def write_session_memory(session_id: str, memory_dict: dict[str, str]) -> None:
     memory_dir = Path.home() / ".march" / "memory" / session_id
     memory_dir.mkdir(parents=True, exist_ok=True)
 
-    file_map = {"facts": "facts.md", "plan": "plan.md",
-                "checkpoint": "checkpoint.md", "progress": "progress.md"}
+    file_map = {"facts": "facts.md", "plan": "plan.md"}
     for key, filename in file_map.items():
         content = memory_dict.get(key, "").strip()
         path = memory_dir / filename
@@ -393,96 +377,6 @@ def delete_session_memory(session_id: str) -> bool:
         shutil.rmtree(memory_dir, ignore_errors=True)
         return True
     return False
-
-
-async def extract_session_memory(
-    messages: list[dict[str, Any]],
-    session_id: str,
-    summarize_fn,
-    memory_dir: str | None = None,
-) -> None:
-    """Extract facts and plans from messages and save to session memory dir.
-
-    Called automatically before compaction so important information
-    survives context compression.
-
-    Args:
-        messages: Messages about to be compacted (the old ones being removed).
-        session_id: Current session ID.
-        summarize_fn: Async function(prompt: str) -> str that calls the LLM.
-        memory_dir: Override memory directory (default: ~/.march/memory/{session_id}/).
-    """
-    from pathlib import Path
-
-    if not messages:
-        return
-
-    target_dir = Path(memory_dir) if memory_dir else (
-        Path.home() / ".march" / "memory" / session_id
-    )
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    # Build extraction prompt
-    parts = [EXTRACT_PROMPT, "\n\nConversation:"]
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and "text" in b]
-            content = " ".join(text_parts) if text_parts else "[non-text content]"
-        if len(str(content)) > 1500:
-            content = str(content)[:1500] + "..."
-        parts.append(f"\n[{role}]: {content}")
-
-    prompt = "\n".join(parts)
-
-    try:
-        extracted = await summarize_fn(prompt)
-    except Exception as e:
-        logger.error("Session memory extraction failed: %s", e)
-        return
-
-    if not extracted or len(extracted.strip()) < 10:
-        return
-
-    # Parse into facts and plan sections
-    facts_content = ""
-    plan_content = ""
-
-    lines = extracted.strip().split("\n")
-    current_section = None
-    for line in lines:
-        stripped = line.strip().lower()
-        if stripped.startswith("## fact"):
-            current_section = "facts"
-            continue
-        elif stripped.startswith("## plan"):
-            current_section = "plan"
-            continue
-
-        if current_section == "facts":
-            facts_content += line + "\n"
-        elif current_section == "plan":
-            plan_content += line + "\n"
-
-    # Save/append to session memory files
-    facts_content = facts_content.strip()
-    plan_content = plan_content.strip()
-
-    if facts_content and facts_content.lower() != "none":
-        facts_path = target_dir / "facts.md"
-        existing = facts_path.read_text() if facts_path.exists() else ""
-        with open(facts_path, "a") as f:
-            if existing:
-                f.write("\n\n")
-            f.write(facts_content)
-        logger.info("Saved session facts: %s (%d chars)", facts_path, len(facts_content))
-
-    if plan_content and plan_content.lower() != "none":
-        # Plan is overwritten (not appended) — always reflects latest state
-        plan_path = target_dir / "plan.md"
-        plan_path.write_text(plan_content)
-        logger.info("Saved session plan: %s (%d chars)", plan_path, len(plan_content))
 
 
 async def compact_messages(
@@ -528,11 +422,7 @@ async def compact_messages(
     )
 
     # Extract facts and plans BEFORE compaction so nothing important is lost
-    if session_id:
-        try:
-            await extract_session_memory(old, session_id, summarize_fn)
-        except Exception as e:
-            logger.error("Session memory extraction failed (non-fatal): %s", e)
+    # (No longer done here — agent calls session_memory tool proactively)
 
     # Build and run the summarization of old messages
     prompt = build_summary_prompt(old, previous_summary)
@@ -567,8 +457,7 @@ async def compact_messages(
             # (read-only — the files are the source of truth, this just
             # ensures the LLM sees the memory in the compacted context)
             memory_parts = []
-            for section, key in [("Facts", "facts"), ("Plan", "plan"),
-                                 ("Checkpoint", "checkpoint"), ("Progress", "progress")]:
+            for section, key in [("Facts", "facts"), ("Plan", "plan")]:
                 content = memory_dict.get(key, "").strip()
                 if content:
                     memory_parts.append(f"**{section}:**\n{content}")

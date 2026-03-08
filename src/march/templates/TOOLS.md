@@ -27,7 +27,7 @@
 
 ## Messaging & Sessions
 - **message** — Send messages across channels
-- **session_memory** — Save facts, plans, checkpoints, or progress to session memory. Types: facts, plan, checkpoint, progress. Auto-timestamped, append-only.
+- **session_memory** — Save facts or plans to session memory. Types: facts, plan, progress, checkpoint. Facts go to facts.md; plan/progress/checkpoint all go to plan.md. Auto-timestamped, append-only.
 - **cron** — Scheduled jobs (create, list, delete, enable/disable)
 - **sessions_list** — List sessions
 - **sessions_history** — Get session history

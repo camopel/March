@@ -27,12 +27,12 @@ logger = get_logger("march.tools.session_memory")
 @tool(
     name="session_memory",
     description=(
-        "Save facts, plans, checkpoints, or progress to session memory. "
+        "Save facts or plans to session memory. "
         "Use when the user provides important information, documents, or attachments. "
         "Entries are timestamped — if a fact evolves, save the update (don't worry about duplicates, "
         "the latest timestamp wins). Type: 'facts', 'plan', 'checkpoint', or 'progress'. "
-        "Use checkpoint at key milestones to enable session recovery. "
-        "Use progress to track plan execution status."
+        "Facts go to facts.md; plan/progress/checkpoint all go to plan.md. "
+        "Auto-timestamped, append-only."
     ),
 )
 async def session_memory_tool(
@@ -72,8 +72,8 @@ async def session_memory_tool(
     _type_to_filename = {
         "facts": "facts.md",
         "plan": "plan.md",
-        "checkpoint": "checkpoint.md",
-        "progress": "progress.md",
+        "checkpoint": "plan.md",
+        "progress": "plan.md",
     }
     filename = _type_to_filename[type]
     filepath = memory_dir / filename

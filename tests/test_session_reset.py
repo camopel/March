@@ -2,7 +2,7 @@
 
 Covers:
   - Session memory fields and MemoryStore interface
-  - Session/orchestrator reset behavior (history, DB, cache, cross-session isolation)
+  - Session/orchestrator reset behavior (messages, DB, cache, cross-session isolation)
   - Guardian module imports and configuration
   - Log structure expectations (xfail — not yet implemented)
 
@@ -74,11 +74,23 @@ class InMemorySessionStore:
             return msgs[offset:offset + limit]
         return msgs[offset:]
 
+    async def get_messages_after_seq(self, session_id, last_processed_seq) -> list[Message]:
+        msgs = self._messages.get(session_id, [])
+        return [m for m in msgs if (m.metadata or {}).get("seq", 0) > last_processed_seq]
+
     async def add_message(self, session_id, message, attachments=None) -> str:
         if session_id not in self._messages:
             self._messages[session_id] = []
         self._messages[session_id].append(message)
         return "msg-id"
+
+    async def flush_messages(self, session_id, messages) -> None:
+        if session_id not in self._messages:
+            self._messages[session_id] = []
+        self._messages[session_id].extend(messages)
+
+    async def save_session(self, session) -> None:
+        self._sessions[session.id] = session
 
     async def clear_session(self, session_id) -> None:
         self._messages.pop(session_id, None)
@@ -102,16 +114,18 @@ class TestSessionMemory:
     """Session memory fields and MemoryStore interface."""
 
     def test_session_has_memory_fields(self):
-        """Session has compaction_summary, rolling_summary, and backup_history fields."""
+        """Session has rolling_summary, messages, dirty_messages, and last_processed_seq fields."""
         s = Session(source_type="test", source_id="mem-test")
-        # These fields serve as the session's memory/facts/plan/checkpoint equivalents
-        assert hasattr(s, "compaction_summary")
+        # Rolling context fields
         assert hasattr(s, "rolling_summary")
-        assert hasattr(s, "backup_history")
+        assert hasattr(s, "messages")
+        assert hasattr(s, "dirty_messages")
+        assert hasattr(s, "last_processed_seq")
         # Verify defaults
-        assert s.compaction_summary == ""
         assert s.rolling_summary == ""
-        assert s.backup_history == []
+        assert s.messages == []
+        assert s.dirty_messages == []
+        assert s.last_processed_seq == 0
         # Also has metadata dict for arbitrary facts
         assert isinstance(s.metadata, dict)
 
@@ -141,21 +155,20 @@ class TestSessionMemory:
 class TestReset:
     """Session and orchestrator reset behavior."""
 
-    def test_reset_clears_history(self):
-        """Create session with messages, reset, verify history empty."""
+    def test_reset_clears_messages(self):
+        """Create session with messages, reset, verify messages empty."""
         s = Session(source_type="test", source_id="reset-hist")
         s.add_message(Message.user("hello"))
         s.add_message(Message.assistant("hi"))
         s.add_message(Message.user("how are you"))
-        assert len(s.history) == 3
+        assert len(s.messages) == 3
 
         s.reset()
 
-        assert len(s.history) == 0
-        assert s.backup_history == []
-        assert s.compaction_summary == ""
+        assert len(s.messages) == 0
+        assert s.dirty_messages == []
         assert s.rolling_summary == ""
-        assert s.state == "reset"
+        assert s.last_processed_seq == 0
 
     async def test_reset_clears_db_messages(self):
         """Add messages to SessionStore, reset via orchestrator, verify DB empty."""

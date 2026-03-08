@@ -199,32 +199,7 @@ class Agent:
         return AgentResponse(content=msg)
 
     async def run(self, user_message: str | list, session: Session) -> AgentResponse:
-        """The main agent loop. Called once per user message.
-
-        Flow:
-        0. Check for slash commands (/rmb, /reset)
-        1. Build context from memory files
-        2. Plugin: before_llm (can modify context/message or short-circuit)
-        3. Call LLM (with retry on transient errors)
-        4. Plugin: after_llm
-        5. If tool calls: execute tools (with plugin hooks), loop back to LLM
-        6. Finalize: save to session, return response
-
-        Error recovery:
-        - Transient LLM errors (rate limits, timeouts, 5xx) are retried with
-          exponential backoff (3 retries, 1s/2s/4s delays).
-        - Tool failures produce error ToolResults fed back to the LLM.
-        - Context overflow triggers truncation of oldest messages.
-        - Unexpected exceptions return a clean error response.
-
-        Args:
-            user_message: The user's input text, or a list of content blocks
-                          for multimodal messages (text + images).
-            session: The current session (contains conversation history).
-
-        Returns:
-            AgentResponse with the assistant's reply and metadata.
-        """
+        """The main agent loop. Called once per user message."""
         try:
             return await self._run_inner(user_message, session)
         except Exception as e:
@@ -292,7 +267,7 @@ class Agent:
                 duration_ms=(time.monotonic() - start_time) * 1000,
             )
 
-        # 4. Build messages list: session history + new user message
+        # 4. Build messages list: session messages + new user message
         messages = session.get_messages_for_llm()
         messages.append({"role": "user", "content": user_message})
 
@@ -302,22 +277,23 @@ class Agent:
 
         # 5. Compact or truncate messages if they exceed the context window
         from march.core.compaction import needs_compaction, split_for_compaction, \
-            build_summary_prompt, MIN_RECENT_KEEP, extract_session_memory
+            build_summary_prompt, MIN_RECENT_KEEP
         context_window = self._get_context_window()
         system_tokens = context.estimated_tokens
 
         # Get compaction config if available
         _compaction_threshold = None
         _summary_budget_ratio = None
+        _dedup_max_ratio = None
         if self.config and hasattr(self.config, 'memory') and hasattr(self.config.memory, 'compaction'):
             _compaction_threshold = self.config.memory.compaction.threshold
             _summary_budget_ratio = self.config.memory.compaction.summary_budget_ratio
+            _dedup_max_ratio = getattr(self.config.memory.compaction, 'dedup_max_ratio', None)
 
         if needs_compaction(messages, context_window, system_tokens, threshold=_compaction_threshold):
             old, recent = split_for_compaction(messages, context_window, system_tokens,
                                                 summary_budget_ratio=_summary_budget_ratio)
             if old:
-                # Extract facts/plans BEFORE compaction so nothing is lost
                 async def _summarize_sync(prompt: str) -> str:
                     r = await provider.converse(
                         messages=[{"role": "user", "content": prompt}],
@@ -327,31 +303,18 @@ class Agent:
                     return r.content.strip() if r and r.content else ""
 
                 try:
-                    await extract_session_memory(old, session.id, _summarize_sync)
-                except Exception as e:
-                    logger.warning("session memory extraction failed (non-fatal)",
-                                   session_id=session.id, error=str(e))
-
-                prompt = build_summary_prompt(old, session.compaction_summary)
-                try:
-                    result = await provider.converse(
-                        messages=[{"role": "user", "content": prompt}],
-                        system="You are a helpful assistant that summarizes conversations concisely.",
-                        max_tokens=500,
+                    new_rolling = await self._two_step_compaction(
+                        session, messages, _summarize_sync,
+                        context_window, _dedup_max_ratio,
                     )
-                    summary = result.content.strip() if result and result.content else ""
-                    if summary:
-                        moved = session.compact_history(summary, keep_recent=MIN_RECENT_KEEP)
-                        logger.info(
-                            "session history compacted (non-streaming)",
-                            session_id=session.id,
-                            moved_messages=moved,
-                            kept_recent=len(session.history) - 1,
-                        )
-                        messages = session.get_messages_for_llm()
-                        messages.append({"role": "user", "content": user_message})
-                    else:
-                        messages = self._truncate_messages(messages, context)
+                    session.compact(new_rolling)
+                    logger.info(
+                        "session compacted (non-streaming)",
+                        session_id=session.id,
+                        old_messages=len(old),
+                    )
+                    messages = session.get_messages_for_llm()
+                    messages.append({"role": "user", "content": user_message})
                 except Exception as e:
                     logger.warning("compaction failed, falling back to truncation",
                                    session_id=session.id, error=str(e))
@@ -363,17 +326,6 @@ class Agent:
 
         # 6. Agent loop (LLM → tools → LLM → ... until no more tool calls)
         system_prompt = context.build_system_prompt()
-
-        # Inform LLM about backup history if compaction has occurred
-        if session.backup_history:
-            system_prompt += (
-                f"\n\n[System: This conversation has been compacted. "
-                f"{len(session.backup_history)} earlier messages are archived in backup. "
-                f"A summary of those messages is included at the start of the conversation. "
-                f"If the user asks about something from earlier that isn't in the summary, "
-                f"mention that the full conversation backup exists and can be searched.]"
-            )
-
 
         tool_definitions = self.tools.definitions() if self.tools.tool_count > 0 else None
 
@@ -527,9 +479,9 @@ class Agent:
                 )
 
             # Tool call intermediate messages stay in `messages` (for current
-            # turn's LLM context) but are NOT added to session.history.
+            # turn's LLM context) but are NOT added to session.messages.
             # Only the final assistant reply is saved via _finalize() →
-            # session.add_exchange(). This keeps session history clean:
+            # session.add_exchange(). This keeps session messages clean:
             # [user, assistant, user, assistant, ...]
 
             # ── Inject steering messages as user messages ──
@@ -551,15 +503,7 @@ class Agent:
         tool_definitions: list[dict[str, Any]] | None,
         mlog: MarchLogger | None = None,
     ) -> LLMResponse | None:
-        """Call the LLM with retry on transient errors.
-
-        Uses exponential backoff: 1s, 2s, 4s delays between retries.
-        Only retries on errors that are marked as retryable (rate limits,
-        timeouts, 5xx server errors).
-
-        Returns:
-            LLMResponse on success, None if all retries exhausted.
-        """
+        """Call the LLM with retry on transient errors."""
         last_error: Exception | None = None
         _mlog = mlog or self._mlogger
         for attempt in range(MAX_LLM_RETRIES):
@@ -620,28 +564,15 @@ class Agent:
         messages: list[dict[str, Any]],
         context: Context,
     ) -> list[dict[str, Any]]:
-        """Truncate oldest messages if they exceed the model's context window.
-
-        Keeps the system prompt budget in mind. Always preserves at least
-        MIN_MESSAGES_KEEP recent messages.
-
-        Args:
-            messages: Current message list.
-            context: Current context (for estimating system prompt tokens).
-
-        Returns:
-            Possibly truncated message list.
-        """
+        """Truncate oldest messages if they exceed the model's context window."""
         # Determine context window from config
         context_window = DEFAULT_CONTEXT_WINDOW
         if self.config:
-            # Check for context_window in the default provider config
             default_provider = getattr(self.config.llm, 'default', '')
             providers = getattr(self.config.llm, 'providers', {})
             if default_provider and default_provider in providers:
                 context_window = providers[default_provider].context_window
             elif hasattr(self.config.llm, 'providers') and providers:
-                # Use the first provider's context_window
                 first_provider = next(iter(providers.values()), None)
                 if first_provider:
                     context_window = first_provider.context_window
@@ -652,25 +583,22 @@ class Agent:
         available_tokens = int(context_window * 0.8) - system_tokens
 
         if available_tokens <= 0:
-            # Even the system prompt is too large; just keep minimum messages
             if len(messages) > MIN_MESSAGES_KEEP:
                 return messages[-MIN_MESSAGES_KEEP:]
             return messages
 
-        # Estimate message tokens (including tool calls and results)
+        # Estimate message tokens
         total_msg_tokens = 0
         for msg in messages:
             content = msg.get("content", "") or ""
-            total_msg_tokens += estimate_tokens(str(content)) + 4  # overhead per message
-            # Count tool call tokens
+            total_msg_tokens += estimate_tokens(str(content)) + 4
             for tc in msg.get("tool_calls", []):
                 func = tc.get("function", tc)
                 total_msg_tokens += estimate_tokens(str(func.get("arguments", func.get("args", "")))) + 10
 
         if total_msg_tokens <= available_tokens:
-            return messages  # Everything fits
+            return messages
 
-        # Need to truncate — remove oldest messages but keep at least MIN_MESSAGES_KEEP
         while len(messages) > MIN_MESSAGES_KEEP and total_msg_tokens > available_tokens:
             removed = messages.pop(0)
             removed_content = removed.get("content", "") or ""
@@ -678,17 +606,101 @@ class Agent:
 
         return messages
 
+    # ── Two-step compaction ──────────────────────────────────────────
+
+    async def _two_step_compaction(
+        self,
+        session: Session,
+        messages: list[dict[str, Any]],
+        summarize_fn,
+        context_window: int,
+        dedup_max_ratio: float | None = None,
+    ) -> str:
+        """Two-step compaction: summarize → dedup with .md files.
+
+        Step 1: Summarize rolling_summary + all messages into a conversation summary.
+        Step 2: Dedup the summary against all .md files + session memory to produce
+                a self-contained rolling context.
+
+        Returns:
+            The new rolling summary (deduped).
+        """
+        from march.core.compaction import (
+            SUMMARIZE_PROMPT, DEDUP_ROLLING_CONTEXT_PROMPT,
+            _load_session_memory, estimate_tokens as est_tokens,
+        )
+
+        _dedup_max_ratio = dedup_max_ratio or 0.30
+
+        # Step 1: Summarize entire rolling context
+        full_context = ""
+        if session.rolling_summary:
+            full_context = session.rolling_summary + "\n\n"
+        full_context += "\n".join(
+            f"[{m.get('role', 'unknown')}]: {m.get('content', '')}"
+            for m in messages
+            if isinstance(m.get('content', ''), str)
+        )
+
+        summary_prompt = SUMMARIZE_PROMPT + "\n\n" + full_context
+        summary = await summarize_fn(summary_prompt)
+
+        if not summary or not summary.strip():
+            # Fallback: use rolling_summary as-is
+            return session.rolling_summary or ""
+
+        # Step 2: Dedup with all .md files + session memory
+        system_rules = await self.memory.load_system_rules()
+        agent_profile = await self.memory.load_agent_profile()
+        tool_inventory = await self.memory.load_tool_rules()
+        long_term = await self.memory.load_long_term()
+
+        session_mem = _load_session_memory(session.id)
+
+        dedup_input = f"""## System Rules
+{system_rules}
+
+## Agent Profile
+{agent_profile}
+
+## Tools
+{tool_inventory}
+
+## Long-Term Memory
+{long_term}
+
+## Session Facts
+{session_mem.get('facts', '')}
+
+## Session Plan
+{session_mem.get('plan', '')}
+
+## Conversation Summary
+{summary}"""
+
+        # Dedup target: min(dedup_max_ratio * context_window, current_input_tokens)
+        current_tokens = est_tokens(dedup_input)
+        target_tokens = min(int(context_window * _dedup_max_ratio), current_tokens)
+        target_chars = target_tokens * 4
+
+        dedup_prompt = DEDUP_ROLLING_CONTEXT_PROMPT.format(
+            target_tokens=target_tokens,
+            target_chars=target_chars,
+            dedup_input=dedup_input,
+        )
+
+        dedup_result = await summarize_fn(dedup_prompt)
+
+        if not dedup_result or not dedup_result.strip():
+            # Fallback: use the summary without dedup
+            return summary
+
+        return dedup_result.strip()
+
     async def run_stream(
         self, user_message: str | list, session: Session
     ) -> AsyncIterator[StreamChunk | AgentResponse]:
-        """Streaming version of the agent loop.
-
-        Yields StreamChunk objects for each piece of the response as it arrives.
-        The final yield is an AgentResponse with complete metadata.
-
-        For tool calls during streaming, this method collects the full response,
-        executes tools, and then streams the next LLM call.
-        """
+        """Streaming version of the agent loop."""
         # Check for slash commands first (only for text messages)
         if isinstance(user_message, str):
             cmd_response = await self.handle_command(user_message, session)
@@ -745,25 +757,23 @@ class Agent:
         messages = session.get_messages_for_llm()
         messages.append({"role": "user", "content": user_message})
 
-        # Strip attachment data (images, etc.) from history messages.
-        # Only the current request (last message) keeps full attachment data.
+        # Strip attachment data from history messages.
         messages = strip_attachments_from_messages(messages, skip_last=True)
 
-        # Context management: compact history if too large
-        # Unlike re-compacting every call, this permanently moves old messages
-        # to backup and replaces them with a summary in the session history.
-        from march.core.compaction import needs_compaction, compact_messages, \
-            split_for_compaction, build_summary_prompt, MIN_RECENT_KEEP, \
-            extract_session_memory
+        # Context management: compact if too large
+        from march.core.compaction import needs_compaction, split_for_compaction, \
+            build_summary_prompt, MIN_RECENT_KEEP
         context_window = self._get_context_window()
         system_tokens = context.estimated_tokens
 
         # Get compaction config if available
         _compaction_threshold = None
         _summary_budget_ratio = None
+        _dedup_max_ratio = None
         if self.config and hasattr(self.config, 'memory') and hasattr(self.config.memory, 'compaction'):
             _compaction_threshold = self.config.memory.compaction.threshold
             _summary_budget_ratio = self.config.memory.compaction.summary_budget_ratio
+            _dedup_max_ratio = getattr(self.config.memory.compaction, 'dedup_max_ratio', None)
 
         if needs_compaction(messages, context_window, system_tokens, threshold=_compaction_threshold):
             # Summarize old messages and permanently compact the session
@@ -781,26 +791,16 @@ class Agent:
             old, recent = split_for_compaction(messages, context_window, system_tokens,
                                                 summary_budget_ratio=_summary_budget_ratio)
             if old:
-                # Extract facts/plans BEFORE compaction so nothing is lost
                 try:
-                    await extract_session_memory(old, session.id, _summarize)
-                except Exception as e:
-                    get_logger("march.compaction", subsystem="compaction").warning(
-                        "session memory extraction failed (non-fatal)",
-                        session_id=session.id, error=str(e),
+                    new_rolling = await self._two_step_compaction(
+                        session, messages, _summarize,
+                        context_window, _dedup_max_ratio,
                     )
-
-                prompt = build_summary_prompt(old, session.compaction_summary)
-                try:
-                    summary = await _summarize(prompt)
-                    # Permanently compact the session history
-                    moved = session.compact_history(summary, keep_recent=MIN_RECENT_KEEP)
+                    session.compact(new_rolling)
                     get_logger("march.compaction", subsystem="compaction").info(
-                        "session history compacted",
+                        "session compacted (streaming)",
                         session_id=session.id,
-                        moved_messages=moved,
-                        total_backup=len(session.backup_history),
-                        kept_recent=len(session.history) - 1,
+                        old_messages=len(old),
                     )
                     # Rebuild messages from the now-compacted session
                     messages = session.get_messages_for_llm()
@@ -817,16 +817,6 @@ class Agent:
             messages = self._truncate_messages(messages, context)
 
         system_prompt = context.build_system_prompt()
-
-        # Inform LLM about backup history if compaction has occurred
-        if session.backup_history:
-            system_prompt += (
-                f"\n\n[System: This conversation has been compacted. "
-                f"{len(session.backup_history)} earlier messages are archived in backup. "
-                f"A summary of those messages is included at the start of the conversation. "
-                f"If the user asks about something from earlier that isn't in the summary, "
-                f"mention that the full conversation backup exists and can be searched.]"
-            )
 
         tool_definitions = self.tools.definitions() if self.tools.tool_count > 0 else None
 
@@ -977,7 +967,6 @@ class Agent:
                 # ── Steering checkpoint ──
                 steering_messages = self._drain_steering(session.id)
                 if steering_messages:
-                    # Skip remaining tools
                     for remaining_tc in llm_tool_calls[i + 1:]:
                         skip_result = ToolResult(
                             id=remaining_tc.id,
@@ -1018,7 +1007,7 @@ class Agent:
                 )
 
             # Tool call intermediate messages stay in `messages` only —
-            # not saved to session.history. See run() for explanation.
+            # not saved to session.messages. See run() for explanation.
 
             # ── Inject steering messages as user messages ──
             if not steering_messages:
@@ -1072,23 +1061,35 @@ class Agent:
         return result
 
     async def _build_context(self, session: Session) -> Context:
-        """Assemble system prompt from config + memory files."""
-        system_rules = await self.memory.load_system_rules()
-        agent_profile = await self.memory.load_agent_profile()
-        tool_inventory = await self.memory.load_tool_rules()
-        long_term = await self.memory.load_long_term()
+        """Assemble system prompt from config + memory files.
 
-        # Session metadata for context (session_id is NOT exposed to LLM —
-        # tools that need it read from the contextvar set by the agent loop)
-        ctx = dict(session.metadata)
+        For the FIRST turn of a new session (rolling_summary is empty),
+        reads .md files to bootstrap. For subsequent turns, uses the
+        rolling_summary which already contains the deduped content.
+        """
+        if session.rolling_summary:
+            # Use cached rolling summary — no .md file reads
+            ctx = dict(session.metadata)
+            return Context(
+                system_rules=session.rolling_summary,
+                session_context=ctx,
+            )
+        else:
+            # First turn — bootstrap from .md files
+            system_rules = await self.memory.load_system_rules()
+            agent_profile = await self.memory.load_agent_profile()
+            tool_inventory = await self.memory.load_tool_rules()
+            long_term = await self.memory.load_long_term()
 
-        return Context(
-            system_rules=system_rules,
-            agent_profile=agent_profile,
-            tool_inventory=tool_inventory,
-            long_term_memory=long_term,
-            session_context=ctx,
-        )
+            ctx = dict(session.metadata)
+
+            return Context(
+                system_rules=system_rules,
+                agent_profile=agent_profile,
+                tool_inventory=tool_inventory,
+                long_term_memory=long_term,
+                session_context=ctx,
+            )
 
     async def _generate_turn_summary(
         self,
@@ -1096,17 +1097,11 @@ class Agent:
         assistant_content: str,
         tool_calls_made: int,
     ) -> str:
-        """Generate a short summary (≤200 words) of the agent turn.
-
-        Only generates for turns with tool calls or long responses,
-        to avoid wasting tokens on simple Q&A.
-        """
-        # Skip summary for simple turns (no tools, short response)
+        """Generate a short summary (≤200 words) of the agent turn."""
         if tool_calls_made == 0 and len(assistant_content) < 500:
             return ""
 
         user_text = user_message if isinstance(user_message, str) else "[multimodal input]"
-        # Truncate for summary prompt
         user_preview = user_text[:500]
         assistant_preview = assistant_content[:2000]
 
@@ -1141,10 +1136,10 @@ class Agent:
         total_cost: float,
         start_time: float,
     ) -> AgentResponse:
-        """Post-process response and save to session history."""
+        """Post-process response and save to session."""
         duration_ms = (time.monotonic() - start_time) * 1000
 
-        # Log turn completion via MarchLogger (subsystem: [agent])
+        # Log turn completion via MarchLogger
         mlog = self._mlogger.bind(session_id=session.id)
         mlog.turn_complete(
             session_id=session.id,
@@ -1168,23 +1163,16 @@ class Agent:
         if not isinstance(content, str):
             content = str(content)
 
-        # Generate turn summary (async, non-blocking for simple turns)
+        # Generate turn summary
         turn_summary = await self._generate_turn_summary(
             user_message, content, tool_calls_made
         )
 
-        # Save exchange to session — keep original content (including multimodal)
-        # so images are available in history. strip_attachments_from_messages()
-        # handles removing image data from older messages at LLM call time.
+        # Save exchange to session
         session.add_exchange(user_message, content)
 
         # Clean up steering queue for this session's turn
         self._steering_queues.pop(session.id, None)
-
-        # NOTE: Message persistence to DB is handled by the Orchestrator layer.
-        # The Orchestrator persists user messages on receive and assistant messages
-        # on stream completion. The agent does NOT auto-persist here to avoid
-        # duplicates.
 
         return AgentResponse(
             content=content,

@@ -4,8 +4,10 @@ The Orchestrator owns:
   - Session cache (in-memory dict[str, Session])
   - Message persistence (save user msg on receive, assistant msg on completion)
   - Cancel support (checks cancel_event between LLM calls and tool executions)
-  - Clean history (only user + final assistant reply in session.history)
+  - Clean history (only user + final assistant reply in session.messages)
   - Translation of StreamChunks into OrchestratorEvents for channels
+  - Per-session locking to prevent concurrent processing
+  - Dirty message flushing to DB
 
 Channels call ``orchestrator.handle_message()`` and iterate over
 ``OrchestratorEvent`` objects — they never touch the Agent or SessionStore
@@ -96,6 +98,8 @@ class Orchestrator:
     5. Supports cooperative cancellation via ``asyncio.Event``.
     6. Keeps session history clean — only user + final assistant reply are
        stored; tool-call intermediates live in ephemeral turn context only.
+    7. Per-session locking prevents concurrent processing of the same session.
+    8. Dirty message flushing batches writes to DB.
 
     Args:
         agent: The core Agent instance (handles LLM calls, tool execution,
@@ -108,10 +112,20 @@ class Orchestrator:
         self.session_store = session_store
         # In-memory session cache — avoids DB round-trips on every turn.
         self._sessions: dict[str, Session] = {}
+        # Per-session locks to prevent concurrent processing.
+        self._session_locks: dict[str, asyncio.Lock] = {}
         # Structured JSONL turn logger for debugging.
         self._turn_log = TurnLogger()
 
-    # ── Public API ───────────────────────────────────────────────────────
+    # ── Per-session locking ──────────────────────────────────────────
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create a per-session lock."""
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
+
+    # ── Public API ───────────────────────────────────────────────────
 
     async def handle_message(
         self,
@@ -244,13 +258,23 @@ class Orchestrator:
 
                 elif isinstance(item, AgentResponse):
                     # Turn complete — Agent already called session.add_exchange()
-                    # so history is up to date.  Persist the assistant message.
+                    # so messages are up to date.  Persist the assistant message.
                     try:
                         assistant_msg = Message.assistant(item.content)
                         await self.session_store.add_message(session_id, assistant_msg)
                     except Exception as exc:
                         logger.warning(
                             "failed to persist assistant message (non-fatal)",
+                            session_id=session_id,
+                            error=str(exc),
+                        )
+
+                    # Flush dirty messages if needed
+                    try:
+                        await self._maybe_flush(session)
+                    except Exception as exc:
+                        logger.warning(
+                            "failed to flush dirty messages (non-fatal)",
                             session_id=session_id,
                             error=str(exc),
                         )
@@ -319,56 +343,90 @@ class Orchestrator:
         """
         result: dict[str, Any] = {}
 
-        # 1. Clear from cache
-        session = self._sessions.pop(session_id, None)
-        if session is not None:
-            session.clear()
+        # Acquire session lock
+        lock = self._get_session_lock(session_id)
+        async with lock:
+            # 1. Clear from cache
+            session = self._sessions.pop(session_id, None)
+            if session is not None:
+                session.clear()
 
-        # 2. Clear from DB
-        try:
-            await self.session_store.clear_session(session_id)
-        except Exception as exc:
-            logger.error("session reset DB clear failed", session_id=session_id, error=str(exc))
-            raise
-
-        # 3. Reset agent memory (MemoryStore: facts, embeddings, etc.)
-        if hasattr(self.agent, "memory") and self.agent.memory is not None:
+            # 2. Clear from DB
             try:
-                mem_result = await self.agent.memory.reset_session(session_id)
-                result["memory"] = mem_result
+                await self.session_store.clear_session(session_id)
+            except Exception as exc:
+                logger.error("session reset DB clear failed", session_id=session_id, error=str(exc))
+                raise
+
+            # 3. Reset agent memory (MemoryStore: facts, embeddings, etc.)
+            if hasattr(self.agent, "memory") and self.agent.memory is not None:
+                try:
+                    mem_result = await self.agent.memory.reset_session(session_id)
+                    result["memory"] = mem_result
+                except Exception as exc:
+                    logger.warning(
+                        "session reset memory clear failed (non-fatal)",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
+
+            # 4. Delete session memory files on disk
+            try:
+                from march.core.compaction import delete_session_memory
+                if delete_session_memory(session_id):
+                    result["session_memory_deleted"] = True
             except Exception as exc:
                 logger.warning(
-                    "session reset memory clear failed (non-fatal)",
+                    "session reset memory file delete failed (non-fatal)",
                     session_id=session_id,
                     error=str(exc),
                 )
 
-        # 4. Delete session memory files on disk
+            # 5. Reset sub-agent data: kill active children, delete their sessions/memory
+            agent_manager = getattr(self.agent, "agent_manager", None)
+            if agent_manager is not None:
+                try:
+                    children_cleaned = await agent_manager.reset_children(session_id)
+                    result["children_cleaned"] = children_cleaned
+                except Exception as exc:
+                    logger.warning(
+                        "session reset children cleanup failed (non-fatal)",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
+
+        return result
+
+    async def flush_session(self, session_id: str) -> None:
+        """Flush dirty messages for a session to DB.
+
+        Gets dirty messages from session, batch writes to DB,
+        and updates session's last_processed_seq in DB.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+
+        dirty = session.flush()
+        if dirty:
+            try:
+                await self.session_store.flush_messages(session_id, dirty)
+            except Exception as exc:
+                logger.warning(
+                    "failed to flush messages to DB (non-fatal)",
+                    session_id=session_id,
+                    error=str(exc),
+                )
+
+        # Save session metadata (rolling_summary, last_processed_seq)
         try:
-            from march.core.compaction import delete_session_memory
-            if delete_session_memory(session_id):
-                result["session_memory_deleted"] = True
+            await self.session_store.save_session(session)
         except Exception as exc:
             logger.warning(
-                "session reset memory file delete failed (non-fatal)",
+                "failed to save session metadata (non-fatal)",
                 session_id=session_id,
                 error=str(exc),
             )
-
-        # 5. Reset sub-agent data: kill active children, delete their sessions/memory
-        agent_manager = getattr(self.agent, "agent_manager", None)
-        if agent_manager is not None:
-            try:
-                children_cleaned = await agent_manager.reset_children(session_id)
-                result["children_cleaned"] = children_cleaned
-            except Exception as exc:
-                logger.warning(
-                    "session reset children cleanup failed (non-fatal)",
-                    session_id=session_id,
-                    error=str(exc),
-                )
-
-        return result
 
     def get_cached_session(self, session_id: str) -> Session | None:
         """Return the cached session if present, else ``None``.
@@ -396,6 +454,14 @@ class Orchestrator:
 
     # ── Internal helpers ─────────────────────────────────────────────────
 
+    async def _maybe_flush(self, session: Session) -> None:
+        """Flush dirty messages if the session needs it."""
+        if session.needs_flush():
+            dirty = session.flush()
+            if dirty:
+                await self.session_store.flush_messages(session.id, dirty)
+            await self.session_store.save_session(session)
+
     async def _get_or_create_session(
         self,
         session_id: str,
@@ -404,8 +470,8 @@ class Orchestrator:
         """Resolve a session from cache or DB (cold-start).
 
         On cold start the session is loaded from the DB and its message
-        history is populated.  The session is then cached for subsequent
-        turns.
+        history is populated from messages after last_processed_seq.
+        The session is then cached for subsequent turns.
         """
         # Fast path: cache hit
         if session_id in self._sessions:
@@ -414,14 +480,30 @@ class Orchestrator:
         # Cold start: try loading from DB
         session = await self.session_store.get_session(session_id)
         if session is not None:
-            # Load message history into the session object
-            messages = await self.session_store.get_messages(session_id)
-            session.history = messages
+            # Load messages after last_processed_seq to rebuild sliding window
+            try:
+                messages = await self.session_store.get_messages_after_seq(
+                    session_id, session.last_processed_seq
+                )
+                session.messages = messages
+                # Restore _seq_counter from loaded messages
+                max_seq = 0
+                for msg in messages:
+                    seq = msg.metadata.get("seq", 0) if msg.metadata else 0
+                    if seq > max_seq:
+                        max_seq = seq
+                session._seq_counter = max(max_seq, session.last_processed_seq)
+            except Exception:
+                # Fallback: load all messages
+                messages = await self.session_store.get_messages(session_id)
+                session.messages = messages
+
             self._sessions[session_id] = session
             logger.info(
                 "session loaded from DB (cold start)",
                 session_id=session_id,
-                message_count=len(messages),
+                message_count=len(session.messages),
+                rolling_summary_len=len(session.rolling_summary),
             )
             return session
 

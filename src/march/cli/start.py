@@ -25,7 +25,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
         march start                    # terminal + guardian + dashboard
         march start --channel matrix   # matrix channel
         march start --all              # all enabled channels
-        march start --headless         # plugins only (e.g. ws_proxy)
+        march start --headless         # ws_proxy channel only
     """
     import asyncio
     import os

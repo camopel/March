@@ -158,10 +158,8 @@ class MarchApp:
 
         agent_mgr_config = AgentManagerConfig(
             max_spawn_depth=self.config.agents.subagents.max_spawn_depth,
-            max_children_per_agent=self.config.agents.subagents.max_children_per_agent,
             max_concurrent_subagents=self.config.agents.subagents.max_concurrent,
-            run_timeout_seconds=self.config.agents.subagents.run_timeout_seconds,
-            archive_after_minutes=self.config.agents.subagents.archive_after_minutes,
+            reset_after_complete_minutes=self.config.agents.subagents.reset_after_complete_minutes,
             announce_timeout_seconds=self.config.agents.subagents.announce_timeout_seconds,
         )
         self.task_queue = TaskQueue()
@@ -271,9 +269,15 @@ class MarchApp:
 
         The logger plugin is always loaded (core infrastructure).
         Other plugins are loaded only if listed in config.plugins.enabled.
+        ws_proxy is excluded — it's now a channel, not a plugin.
         """
         plugins_pkg_dir = Path(__file__).parent / "plugins"
         enabled = list(self.config.plugins.enabled or [])
+
+        # ws_proxy is now a channel — filter it out of plugin loading
+        # (backward compat: if ws_proxy is in plugins.enabled, it's handled
+        # by _create_channel / _run_headless instead)
+        enabled = [p for p in enabled if p != "ws_proxy"]
 
         # Logger is always enabled — ensure it's in the list
         if "logger" not in enabled:
@@ -458,22 +462,42 @@ class MarchApp:
         asyncio.run(self._run_async(channel_names, session))
 
     async def _run_headless(self) -> None:
-        """Run in headless mode: initialize plugins and wait forever.
+        """Run in headless mode: initialize, start ws_proxy channel, and wait.
 
-        Used when the server is provided by a plugin (e.g. ws_proxy)
-        rather than a built-in channel.
+        Used when the server is provided by the ws_proxy channel
+        rather than a built-in interactive channel like terminal.
         """
         await self.initialize()
         # on_start is already dispatched by initialize()
 
-        logger.info("March running in headless mode (plugins active, no channels)")
+        # Start ws_proxy channel if configured
+        ws_channel = None
+        ws_config = self.config.channels.ws_proxy
+        # Also check backward compat: plugins.enabled containing ws_proxy
+        ws_enabled = (
+            (ws_config and ws_config.port)
+            or "ws_proxy" in (self.config.plugins.enabled or [])
+        )
+        if ws_enabled:
+            from march.channels.ws_channel import WSChannel
+            ws_channel = WSChannel(config=ws_config)
+            await ws_channel.start(
+                self.agent,
+                app=self,
+                session_store=self.session_store,
+            )
+            self._channels["ws_proxy"] = ws_channel
+
+        logger.info("March running in headless mode (ws_proxy channel active)")
 
         try:
-            # Wait forever — plugins provide the actual server
+            # Wait forever — ws_proxy channel provides the actual server
             await asyncio.Event().wait()
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("Shutting down headless mode")
         finally:
+            if ws_channel:
+                await ws_channel.stop()
             await self.plugin_manager.dispatch_simple("on_shutdown", self)
 
     async def _run_async(
@@ -492,7 +516,12 @@ class MarchApp:
                 if channel:
                     self._channels[name] = channel
                     task = asyncio.create_task(
-                        channel.start(self.agent, session=session, session_store=self.session_store)
+                        channel.start(
+                            self.agent,
+                            session=session,
+                            session_store=self.session_store,
+                            app=self,
+                        )
                     )
                     tasks.append(task)
                 else:
@@ -542,4 +571,8 @@ class MarchApp:
                 e2ee=matrix_config.e2ee,
                 auto_setup=matrix_config.auto_setup,
             )
+        elif name == "ws_proxy":
+            from march.channels.ws_channel import WSChannel
+            ws_config = self.config.channels.ws_proxy
+            return WSChannel(config=ws_config)
         return None

@@ -363,7 +363,6 @@ class TestAgentManager:
     def manager(self, tmp_path):
         config = AgentManagerConfig(
             max_spawn_depth=2,
-            max_children_per_agent=3,
             max_concurrent_subagents=4,
         )
         registry = SubagentRegistry(persist_dir=tmp_path / "agents")
@@ -392,23 +391,16 @@ class TestAgentManager:
         assert "max spawn depth" in result.error
 
     @pytest.mark.asyncio
-    async def test_spawn_children_limit(self, manager):
+    async def test_spawn_many_children_allowed(self, manager):
+        """After removing max_children_per_agent, spawning many children is allowed
+        (limited only by max_concurrent in the task queue lane)."""
         await manager.initialize()
-        # Spawn max children
-        for i in range(3):
+        for i in range(4):
             result = await manager.spawn(
                 SpawnParams(task=f"task {i}"),
                 SpawnContext(requester_session="parent-1", caller_depth=0),
             )
             assert result.status == "accepted"
-
-        # 4th should be forbidden
-        result = await manager.spawn(
-            SpawnParams(task="too many"),
-            SpawnContext(requester_session="parent-1", caller_depth=0),
-        )
-        assert result.status == "forbidden"
-        assert "max children" in result.error
 
     @pytest.mark.asyncio
     async def test_list_agents(self, manager):
@@ -508,7 +500,6 @@ class TestSubagentSessionPersistence:
     def manager(self, tmp_path):
         config = AgentManagerConfig(
             max_spawn_depth=2,
-            max_children_per_agent=5,
             max_concurrent_subagents=8,
         )
         registry = SubagentRegistry(persist_dir=tmp_path / "agents")

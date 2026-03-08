@@ -32,6 +32,8 @@ from march.config.schema import (
     PluginsConfig,
     SubagentConfig,
     ToolsConfig,
+    WSProxyChannelConfig,
+    WSProxyPluginConfig,
 )
 
 
@@ -123,11 +125,13 @@ class TestSchemaDefaults:
         config = CompactionConfig()
         assert config.threshold == 0.95
         assert config.summary_budget_ratio == 0.15
+        assert config.dedup_max_ratio == 0.30
 
     def test_compaction_config_override(self):
-        config = CompactionConfig(threshold=0.80, summary_budget_ratio=0.20)
+        config = CompactionConfig(threshold=0.80, summary_budget_ratio=0.20, dedup_max_ratio=0.40)
         assert config.threshold == 0.80
         assert config.summary_budget_ratio == 0.20
+        assert config.dedup_max_ratio == 0.40
 
     def test_memory_config_has_compaction(self):
         config = MemoryConfig()
@@ -150,12 +154,33 @@ class TestSchemaDefaults:
         config = PluginsConfig()
         assert config.enabled == []
 
+    def test_ws_proxy_channel_config_defaults(self):
+        config = WSProxyChannelConfig()
+        assert config.port == 8101
+        assert config.host == "0.0.0.0"
+        assert config.cors_origins == []
+        assert config.max_image_dimension == 1200
+
+    def test_ws_proxy_in_channels(self):
+        config = ChannelsConfig()
+        assert hasattr(config, "ws_proxy")
+        assert isinstance(config.ws_proxy, WSProxyChannelConfig)
+        assert config.ws_proxy.port == 8101
+
+    def test_ws_proxy_deprecated_alias(self):
+        """WSProxyPluginConfig should be an alias for WSProxyChannelConfig."""
+        assert WSProxyPluginConfig is WSProxyChannelConfig
+        cfg = WSProxyPluginConfig(port=9999)
+        assert isinstance(cfg, WSProxyChannelConfig)
+        assert cfg.port == 9999
+
     def test_agents_config_defaults(self):
         config = AgentsConfig()
         assert config.max_concurrent == 4
         assert config.subagents.max_concurrent == 8
         assert config.subagents.max_spawn_depth == 1
-        assert config.subagents.max_children_per_agent == 5
+        assert config.subagents.reset_after_complete_minutes == 60
+        assert config.subagents.announce_timeout_seconds == 60
 
     def test_dashboard_config_defaults(self):
         config = DashboardConfig()

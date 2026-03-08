@@ -150,6 +150,7 @@ class CompactionConfig(BaseModel):
 
     threshold: float = 0.95  # Trigger compaction at this % of context window
     summary_budget_ratio: float = 0.15  # Fraction of context window reserved for summary
+    dedup_max_ratio: float = 0.30  # Max ratio of context window for dedup target
 
 
 class MemoryConfig(BaseModel):
@@ -193,19 +194,8 @@ class MatrixChannelConfig(BaseModel):
     e2ee: bool = True
 
 
-class ChannelsConfig(BaseModel):
-    """All channel configurations."""
-
-    terminal: TerminalChannelConfig = Field(default_factory=TerminalChannelConfig)
-    acp: ACPChannelConfig = Field(default_factory=ACPChannelConfig)
-    matrix: MatrixChannelConfig = Field(default_factory=MatrixChannelConfig)
-
-
-# ─── Plugin Configs ───
-
-
-class WSProxyPluginConfig(BaseModel):
-    """WS Proxy plugin configuration.
+class WSProxyChannelConfig(BaseModel):
+    """WS Proxy channel configuration.
 
     Runs an embedded HTTP/WS server for the frontend chat app.
     """
@@ -224,12 +214,27 @@ class WSProxyPluginConfig(BaseModel):
     summary_chunk_size: int = 4000  # Chars per chunk for large file summarization
 
 
+# Deprecated alias — use WSProxyChannelConfig instead
+WSProxyPluginConfig = WSProxyChannelConfig
+
+
+class ChannelsConfig(BaseModel):
+    """All channel configurations."""
+
+    terminal: TerminalChannelConfig = Field(default_factory=TerminalChannelConfig)
+    acp: ACPChannelConfig = Field(default_factory=ACPChannelConfig)
+    matrix: MatrixChannelConfig = Field(default_factory=MatrixChannelConfig)
+    ws_proxy: WSProxyChannelConfig = Field(default_factory=WSProxyChannelConfig)
+
+
+# ─── Plugin Configs ───
+
+
 class PluginsConfig(BaseModel):
     """Plugin system configuration."""
 
     enabled: list[str] = Field(default_factory=list)
     directory: str = "plugins"
-    ws_proxy: WSProxyPluginConfig = Field(default_factory=WSProxyPluginConfig)
 
 
 # ─── Agent / Sub-Agent Config ───
@@ -240,9 +245,7 @@ class SubagentConfig(BaseModel):
 
     max_concurrent: int = 8
     max_spawn_depth: int = 1
-    max_children_per_agent: int = 5
-    run_timeout_seconds: int = 0
-    archive_after_minutes: int = 60
+    reset_after_complete_minutes: int = 60
     announce_timeout_seconds: int = 60
 
 

@@ -143,6 +143,18 @@ class InMemorySessionStore:
         self._messages[session_id].append(message)
         return "msg-id"
 
+    async def get_messages_after_seq(self, session_id: str, last_processed_seq: int) -> list[Message]:
+        msgs = self._messages.get(session_id, [])
+        return [m for m in msgs if (m.metadata or {}).get("seq", 0) > last_processed_seq]
+
+    async def flush_messages(self, session_id: str, messages: list[Message]) -> None:
+        if session_id not in self._messages:
+            self._messages[session_id] = []
+        self._messages[session_id].extend(messages)
+
+    async def save_session(self, session: Session) -> None:
+        self._sessions[session.id] = session
+
     async def clear_session(self, session_id: str) -> None:
         self._messages.pop(session_id, None)
         self._sessions.pop(session_id, None)
@@ -481,7 +493,7 @@ class TestOrchestratorSessionManagement:
         assert "sess-cold" not in orch._sessions
         await collect_events(orch, "sess-cold", "New message")
         assert "sess-cold" in orch._sessions
-        assert len(orch._sessions["sess-cold"].history) >= 2
+        assert len(orch._sessions["sess-cold"].messages) >= 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -580,8 +592,7 @@ class TestSession:
         s = Session()
         assert s.id
         assert s.source_type == "terminal"
-        assert s.history == []
-        assert s.state == "active"
+        assert s.messages == []
 
     def test_session_deterministic_id(self):
         s1 = Session(source_type="matrix", source_id="!room:server")
@@ -591,46 +602,43 @@ class TestSession:
     def test_add_message(self):
         s = Session(id="test")
         s.add_message(Message.user("hello"))
-        assert len(s.history) == 1
+        assert len(s.messages) == 1
+        assert len(s.dirty_messages) == 1
 
     def test_add_exchange(self):
         s = Session(id="test")
         s.add_exchange("user says", "assistant says")
-        assert len(s.history) == 2
-        assert s.history[0].role == Role.USER
-        assert s.history[1].role == Role.ASSISTANT
+        assert len(s.messages) == 2
+        assert s.messages[0].role == Role.USER
+        assert s.messages[1].role == Role.ASSISTANT
 
     def test_clear(self):
         s = Session(id="test")
         s.add_exchange("a", "b")
-        s.compaction_summary = "summary"
         s.rolling_summary = "rolling"
         s.clear()
-        assert s.history == []
-        assert s.compaction_summary == ""
+        assert s.messages == []
+        assert s.dirty_messages == []
         assert s.rolling_summary == ""
+        assert s.last_processed_seq == 0
 
     def test_reset(self):
         s = Session(id="test")
         s.add_exchange("a", "b")
         s.reset()
-        assert s.history == []
-        assert s.state == "reset"
+        assert s.messages == []
+        assert s.dirty_messages == []
 
-    def test_compact_history(self):
+    def test_compact(self):
         s = Session(id="test")
         for i in range(20):
             s.add_exchange(f"user-{i}", f"assistant-{i}")
-        moved = s.compact_history("Summary of old messages", keep_recent=10)
-        assert moved > 0
-        assert len(s.backup_history) == moved
-        assert len(s.history) == 11  # 1 summary + 10 recent
-
-    def test_compact_history_too_few_messages(self):
-        s = Session(id="test")
-        s.add_exchange("a", "b")
-        moved = s.compact_history("summary", keep_recent=10)
-        assert moved == 0
+        assert len(s.messages) == 40
+        s.compact("Summary of conversation")
+        assert s.messages == []
+        assert s.dirty_messages == []
+        assert s.rolling_summary == "Summary of conversation"
+        assert s.last_processed_seq == s._seq_counter
 
     def test_to_dict_and_from_dict(self):
         s = Session(id="test-rt", source_type="ws", source_id="ws-1", name="Test Session")
@@ -640,7 +648,7 @@ class TestSession:
         restored = Session.from_dict(d)
         assert restored.id == s.id
         assert restored.source_type == s.source_type
-        assert len(restored.history) == len(s.history)
+        assert len(restored.messages) == len(s.messages)
         assert restored.metadata == s.metadata
 
     def test_get_messages_for_llm(self):
@@ -650,6 +658,38 @@ class TestSession:
         assert len(msgs) == 2
         assert msgs[0]["role"] == "user"
         assert msgs[1]["role"] == "assistant"
+
+    def test_get_messages_for_llm_with_rolling_summary(self):
+        s = Session(id="test")
+        s.rolling_summary = "Previous context summary"
+        s.add_exchange("hello", "world")
+        msgs = s.get_messages_for_llm()
+        assert len(msgs) == 3  # rolling summary + user + assistant
+        assert "Context Summary" in msgs[0]["content"]
+        assert msgs[1]["role"] == "user"
+        assert msgs[2]["role"] == "assistant"
+
+    def test_needs_flush(self):
+        s = Session(id="test")
+        assert s.needs_flush() is False
+        for i in range(10):
+            s.add_message(Message.user(f"msg-{i}"))
+        assert s.needs_flush() is True
+
+    def test_flush(self):
+        s = Session(id="test")
+        s.add_message(Message.user("hello"))
+        s.add_message(Message.assistant("world"))
+        flushed = s.flush()
+        assert len(flushed) == 2
+        assert s.dirty_messages == []
+
+    def test_history_property_alias(self):
+        """Legacy .history property maps to .messages."""
+        s = Session(id="test")
+        s.add_exchange("hello", "world")
+        assert s.history is s.messages
+        assert len(s.history) == 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -840,8 +880,8 @@ class TestSequentialTasks:
             await collect_events(orch, "multi-turn", f"Message {i}")
             session = orch.get_cached_session("multi-turn")
             assert session is not None
-            cur_len = len(session.history)
-            assert cur_len > prev_len, f"Turn {i}: history didn't grow ({cur_len} <= {prev_len})"
+            cur_len = len(session.messages)
+            assert cur_len > prev_len, f"Turn {i}: messages didn't grow ({cur_len} <= {prev_len})"
             prev_len = cur_len
 
         assert prev_len == 10  # 5 turns × 2 messages
@@ -925,10 +965,10 @@ class TestSequentialTasks:
 
 
 class TestWSProxy:
-    """Test WSProxyPlugin logic with mocked WebSocket and DB."""
+    """Test WSChannel logic with mocked WebSocket and DB."""
 
     def _make_ws_conn(self, session_id: str = "ws-test"):
-        from march.plugins.ws_proxy import _WSConn
+        from march.channels.ws_channel import _WSConn
         mock_ws = AsyncMock()
         mock_ws.closed = False
         mock_ws.send_json = AsyncMock()
@@ -936,8 +976,8 @@ class TestWSProxy:
         return conn
 
     def _make_plugin(self, agent=None, store=None):
-        from march.plugins.ws_proxy import WSProxyPlugin
-        plugin = WSProxyPlugin()
+        from march.channels.ws_channel import WSChannel
+        plugin = WSChannel()
         plugin._agent = agent or MockAgent([])
         plugin._db = MagicMock()
         plugin._db.session_exists = AsyncMock(return_value=True)
@@ -983,7 +1023,7 @@ class TestWSProxy:
 
     async def test_reconnect_mid_stream(self):
         """Stream buffer provides catchup data on reconnect."""
-        from march.plugins.ws_proxy import _StreamBuffer
+        from march.channels.ws_channel import _StreamBuffer
         buf = _StreamBuffer()
         buf.streaming = True
         buf.add_chunk({"type": "stream.start"})
@@ -1000,7 +1040,7 @@ class TestWSProxy:
 
     async def test_reconnect_after_stream_done(self):
         """After stream completes, reconnect gets full catchup."""
-        from march.plugins.ws_proxy import _StreamBuffer
+        from march.channels.ws_channel import _StreamBuffer
         buf = _StreamBuffer()
         buf.collected = "Full response text"
         buf.done = True
@@ -1025,7 +1065,7 @@ class TestWSProxy:
 
     async def test_session_crud_via_db(self):
         """Session CRUD operations through ChatDB adapter."""
-        from march.plugins.ws_proxy import ChatDB
+        from march.channels.ws_channel import ChatDB
         store = InMemorySessionStore()
         db = ChatDB(store=store)
 
@@ -1383,25 +1423,21 @@ class TestSessionMemory:
         s.rolling_summary = "User is building a web app with FastAPI"
         assert "FastAPI" in s.rolling_summary
 
-    async def test_compaction_extracts_memory(self, tmp_path: Path):
-        """Compaction extracts facts/plans from old messages."""
-        from march.core.compaction import extract_session_memory
+    async def test_compaction_loads_session_memory(self, tmp_path: Path):
+        """_load_session_memory loads facts/plans from disk."""
+        from march.core.compaction import _load_session_memory
 
         session_id = "compact-mem"
-        memory_dir = tmp_path / session_id
+        memory_dir = tmp_path / ".march" / "memory" / session_id
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "facts.md").write_text("- Project uses Python 3.12 and FastAPI")
+        (memory_dir / "plan.md").write_text("1. Refactor DB\n2. Add tests")
 
-        messages = [
-            {"role": "user", "content": "My project uses Python 3.12 and FastAPI"},
-            {"role": "assistant", "content": "Got it, I'll remember that."},
-        ]
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = _load_session_memory(session_id)
 
-        async def mock_summarize(prompt: str) -> str:
-            return "## Facts\n- Project uses Python 3.12 and FastAPI\n\n## Plan\nNone"
-
-        await extract_session_memory(messages, session_id, mock_summarize, memory_dir=str(memory_dir))
-        facts_file = memory_dir / "facts.md"
-        assert facts_file.exists()
-        assert "Python 3.12" in facts_file.read_text()
+        assert "Python 3.12" in result["facts"]
+        assert "Refactor DB" in result["plan"]
 
     async def test_delete_session_memory(self, tmp_path: Path):
         """delete_session_memory removes the session memory directory."""
@@ -1451,7 +1487,7 @@ class TestReset:
         await collect_events(orch, "reset-hist", "Hello")
         session = orch.get_cached_session("reset-hist")
         assert session is not None
-        assert len(session.history) == 2  # user + assistant
+        assert len(session.messages) == 2  # user + assistant
 
         with patch("march.core.compaction.delete_session_memory", return_value=False):
             await orch.reset_session("reset-hist")
@@ -1541,7 +1577,7 @@ class TestReset:
         orch = Orchestrator(agent=agent, session_store=store)
         await collect_events(orch, "reset-fresh", "Hello")
         session = orch.get_cached_session("reset-fresh")
-        history_len_1 = len(session.history)
+        history_len_1 = len(session.messages)
 
         with patch("march.core.compaction.delete_session_memory", return_value=False):
             await orch.reset_session("reset-fresh")
@@ -1549,7 +1585,7 @@ class TestReset:
         agent.items = [StreamChunk(delta="Second"), AgentResponse(content="Second")]
         await collect_events(orch, "reset-fresh", "New hello")
         session2 = orch.get_cached_session("reset-fresh")
-        assert len(session2.history) <= history_len_1
+        assert len(session2.messages) <= history_len_1
 
     async def test_reset_with_agent_memory(self):
         """Reset calls agent.memory.reset_session if memory exists."""
@@ -1676,8 +1712,8 @@ class TestCrossDeviceSession:
 
     @staticmethod
     def _make_plugin(agent=None, store=None):
-        from march.plugins.ws_proxy import WSProxyPlugin
-        plugin = WSProxyPlugin()
+        from march.channels.ws_channel import WSChannel
+        plugin = WSChannel()
         plugin._agent = agent or MockAgent([])
         plugin._db = MagicMock()
         plugin._db.session_exists = AsyncMock(return_value=True)
@@ -1718,7 +1754,7 @@ class TestCrossDeviceSession:
     async def test_same_session_different_ws_connections(self):
         """Second WS client takes over: first gets session.takeover + close,
         second works normally."""
-        from march.plugins.ws_proxy import _WSConn, _try_send
+        from march.channels.ws_channel import _WSConn, _try_send
 
         plugin, store = self._make_plugin(
             agent=MockAgent([
@@ -1776,7 +1812,7 @@ class TestCrossDeviceSession:
     async def test_session_continuity_across_reconnect(self):
         """Connect → send message → disconnect → reconnect → verify history
         is preserved and agent has context from previous messages."""
-        from march.plugins.ws_proxy import _WSConn
+        from march.channels.ws_channel import _WSConn
 
         store = InMemorySessionStore()
         sid = "reconnect-sess"
@@ -1939,7 +1975,7 @@ class TestCrossDeviceSession:
         """Client A is streaming. Client B connects to the same session.
         Client A gets session.takeover. Client B gets stream.active with
         the partial content accumulated so far."""
-        from march.plugins.ws_proxy import _WSConn, _StreamBuffer, _try_send
+        from march.channels.ws_channel import _WSConn, _StreamBuffer, _try_send
 
         plugin, store = self._make_plugin(
             agent=SlowAgent([
@@ -2024,7 +2060,7 @@ class TestCrossDeviceSession:
     async def test_takeover_when_first_client_already_closed(self):
         """If the first client already disconnected (ws.closed=True),
         takeover skips the send+close and just registers the new client."""
-        from march.plugins.ws_proxy import _WSConn, _try_send
+        from march.channels.ws_channel import _WSConn, _try_send
 
         plugin, store = self._make_plugin(
             agent=MockAgent([
@@ -2065,7 +2101,7 @@ class TestCrossDeviceSession:
     async def test_reconnect_gets_stream_catchup_when_done(self):
         """If a stream finished while the client was disconnected,
         reconnecting gets stream.catchup with the full content."""
-        from march.plugins.ws_proxy import _StreamBuffer, _try_send
+        from march.channels.ws_channel import _StreamBuffer, _try_send
 
         plugin, store = self._make_plugin()
         sid = "catchup-sess"

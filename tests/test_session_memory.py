@@ -27,7 +27,6 @@ from march.core.compaction import (
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_tokens,
-    extract_session_memory,
     needs_compaction,
     split_for_compaction,
     write_session_memory,
@@ -134,8 +133,7 @@ class TestSessionMemoryLoading:
         mem = _load_session_memory(self.session_id)
         assert mem["facts"] == ""
         assert mem["plan"] == ""
-        assert mem["checkpoint"] == ""
-        assert mem["progress"] == ""
+        assert set(mem.keys()) == {"facts", "plan"}
 
     def test_facts_only(self):
         d = _make_session_dir(self.session_id)
@@ -182,72 +180,6 @@ class TestSessionMemoryLoading:
         mem = _load_session_memory(self.session_id)
         assert "real fact" in mem["facts"]
         assert "PNG" not in mem["facts"]
-
-    def test_checkpoint_and_progress(self):
-        d = _make_session_dir(self.session_id)
-        (d / "checkpoint.md").write_text("- checkpoint data")
-        (d / "progress.md").write_text("- progress data")
-        mem = _load_session_memory(self.session_id)
-        assert "checkpoint data" in mem["checkpoint"]
-        assert "progress data" in mem["progress"]
-
-
-# ── Session Memory Extraction ────────────────────────────────────────────
-
-class TestSessionMemoryExtraction:
-    def setup_method(self):
-        self.session_id = "test-session-extraction"
-        _cleanup_session(self.session_id)
-
-    def teardown_method(self):
-        _cleanup_session(self.session_id)
-
-    @pytest.mark.asyncio
-    async def test_extraction_creates_files(self):
-        messages = [
-            {"role": "user", "content": "We decided to use PostgreSQL for the database"},
-            {"role": "assistant", "content": "Got it, PostgreSQL it is."},
-            {"role": "user", "content": "Next step is to set up the schema"},
-        ]
-
-        async def fake_summarize(prompt):
-            return "## Facts\n- Database: PostgreSQL\n\n## Plan\n- Set up the schema"
-
-        await extract_session_memory(messages, self.session_id, fake_summarize)
-
-        d = Path.home() / ".march" / "memory" / self.session_id
-        assert (d / "facts.md").exists()
-        assert (d / "plan.md").exists()
-        assert "PostgreSQL" in (d / "facts.md").read_text()
-        assert "schema" in (d / "plan.md").read_text()
-
-    @pytest.mark.asyncio
-    async def test_extraction_appends(self):
-        d = _make_session_dir(self.session_id)
-        (d / "facts.md").write_text("- existing fact")
-
-        async def fake_summarize(prompt):
-            return "## Facts\n- new fact\n\n## Plan\nNone"
-
-        await extract_session_memory(
-            [{"role": "user", "content": "test"}],
-            self.session_id, fake_summarize,
-        )
-
-        content = (d / "facts.md").read_text()
-        assert "existing fact" in content
-        assert "new fact" in content
-
-    @pytest.mark.asyncio
-    async def test_extraction_failure_nonfatal(self):
-        async def failing_summarize(prompt):
-            raise RuntimeError("LLM error")
-
-        # Should not raise
-        await extract_session_memory(
-            [{"role": "user", "content": "test"}],
-            self.session_id, failing_summarize,
-        )
 
 
 # ── Delete Session Memory ───────────────────────────────────────────────
@@ -306,13 +238,8 @@ class TestCompactMessages:
             msgs = _make_messages(50, chars_each=1000)
 
             async def fake_summarize(prompt):
-                if "INDEX" in prompt or "index" in prompt:
-                    return "- DB: PostgreSQL"
-                if "memory curator" in prompt.lower():
-                    return "## Facts\n- extracted fact\n\n## Plan\n- extracted plan"
                 if "deduplicat" in prompt.lower():
-                    # dedup_session_memory prompt
-                    return "## Facts\n- DB is PostgreSQL\n- extracted fact\n\n## Plan\n1. Deploy to prod"
+                    return "## Facts\n- DB is PostgreSQL\n\n## Plan\n1. Deploy to prod"
                 return "Conversation summary."
 
             result, summary = await compact_messages(
@@ -394,6 +321,32 @@ class TestSessionMemoryTool:
         assert "Build API" in (d / "plan.md").read_text()
 
     @pytest.mark.asyncio
+    async def test_save_checkpoint_writes_to_plan(self):
+        """checkpoint type should write to plan.md, not checkpoint.md."""
+        from march.tools.builtin.session_memory_tool import session_memory_tool
+        result = await session_memory_tool(
+            type="checkpoint",
+            content="## Phase 1 Complete\n- Schema deployed",
+        )
+        assert "Saved" in result
+        d = Path.home() / ".march" / "memory" / self.session_id
+        assert "Phase 1 Complete" in (d / "plan.md").read_text()
+        assert not (d / "checkpoint.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_save_progress_writes_to_plan(self):
+        """progress type should write to plan.md, not progress.md."""
+        from march.tools.builtin.session_memory_tool import session_memory_tool
+        result = await session_memory_tool(
+            type="progress",
+            content="- ✅ Step 1 done\n- 🔄 Step 2 in progress",
+        )
+        assert "Saved" in result
+        d = Path.home() / ".march" / "memory" / self.session_id
+        assert "Step 1 done" in (d / "plan.md").read_text()
+        assert not (d / "progress.md").exists()
+
+    @pytest.mark.asyncio
     async def test_append_facts(self):
         from march.tools.builtin.session_memory_tool import session_memory_tool
         await session_memory_tool(
@@ -458,8 +411,6 @@ class TestDedupSessionMemory:
         memory_dict = {
             "facts": "- DB is PostgreSQL\n- Python 3.12\n- DB is PostgreSQL",
             "plan": "1. Deploy to prod",
-            "checkpoint": "",
-            "progress": "",
         }
 
         async def fake_summarize(prompt):
@@ -475,7 +426,7 @@ class TestDedupSessionMemory:
 
     @pytest.mark.asyncio
     async def test_dedup_with_empty_memory(self):
-        memory_dict = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
+        memory_dict = {"facts": "", "plan": ""}
 
         async def should_not_be_called(prompt):
             raise AssertionError("Should not call LLM for empty memory")
@@ -490,8 +441,6 @@ class TestDedupSessionMemory:
         memory_dict = {
             "facts": "- important fact",
             "plan": "- important plan",
-            "checkpoint": "",
-            "progress": "",
         }
 
         async def failing_summarize(prompt):
@@ -510,8 +459,6 @@ class TestDedupSessionMemory:
         memory_dict = {
             "facts": "- fact",
             "plan": "",
-            "checkpoint": "",
-            "progress": "",
         }
         captured_prompts = []
 
@@ -529,7 +476,7 @@ class TestDedupSessionMemory:
     @pytest.mark.asyncio
     async def test_dedup_prompt_content(self):
         """Verify the prompt explicitly asks for deduplication, not compression."""
-        memory_dict = {"facts": "- fact", "plan": "", "checkpoint": "", "progress": ""}
+        memory_dict = {"facts": "- fact", "plan": ""}
         captured_prompts = []
 
         async def capturing_summarize(prompt):
@@ -544,20 +491,17 @@ class TestDedupSessionMemory:
         assert "do not compress" in prompt
 
     @pytest.mark.asyncio
-    async def test_dedup_preserves_all_sections(self):
+    async def test_dedup_only_facts_and_plan(self):
+        """Dedup should only process facts and plan sections."""
         memory_dict = {
             "facts": "- fact A",
             "plan": "- plan B",
-            "checkpoint": "- checkpoint C",
-            "progress": "- progress D",
         }
 
         async def fake_summarize(prompt):
             return (
                 "## Facts\n- fact A\n\n"
-                "## Plan\n- plan B\n\n"
-                "## Checkpoint\n- checkpoint C\n\n"
-                "## Progress\n- progress D"
+                "## Plan\n- plan B"
             )
 
         result = await dedup_session_memory(
@@ -565,33 +509,27 @@ class TestDedupSessionMemory:
         )
         assert "fact A" in result["facts"]
         assert "plan B" in result["plan"]
-        assert "checkpoint C" in result["checkpoint"]
-        assert "progress D" in result["progress"]
+        assert set(result.keys()) == {"facts", "plan"}
 
 
 # ── Parse Memory Sections ────────────────────────────────────────────────
 
 class TestParseMemorySections:
-    def test_parse_all_sections(self):
+    def test_parse_facts_and_plan(self):
         text = (
             "## Facts\n- fact A\n- fact B\n\n"
-            "## Plan\n1. step one\n\n"
-            "## Checkpoint\n- checkpoint data\n\n"
-            "## Progress\n- 50% done"
+            "## Plan\n1. step one"
         )
         result = _parse_memory_sections(text)
         assert "fact A" in result["facts"]
         assert "step one" in result["plan"]
-        assert "checkpoint data" in result["checkpoint"]
-        assert "50% done" in result["progress"]
+        assert set(result.keys()) == {"facts", "plan"}
 
     def test_parse_partial_sections(self):
         text = "## Facts\n- only facts here"
         result = _parse_memory_sections(text)
         assert "only facts here" in result["facts"]
         assert result["plan"] == ""
-        assert result["checkpoint"] == ""
-        assert result["progress"] == ""
 
     def test_parse_empty(self):
         result = _parse_memory_sections("")
@@ -608,20 +546,19 @@ class TestWriteSessionMemory:
     def teardown_method(self):
         _cleanup_session(self.session_id)
 
-    def test_write_all_sections(self):
+    def test_write_facts_and_plan(self):
         memory_dict = {
             "facts": "- fact A\n- fact B",
             "plan": "1. step one",
-            "checkpoint": "- checkpoint data",
-            "progress": "- 50% done",
         }
         write_session_memory(self.session_id, memory_dict)
 
         d = Path.home() / ".march" / "memory" / self.session_id
         assert "fact A" in (d / "facts.md").read_text()
         assert "step one" in (d / "plan.md").read_text()
-        assert "checkpoint data" in (d / "checkpoint.md").read_text()
-        assert "50% done" in (d / "progress.md").read_text()
+        # checkpoint.md and progress.md should NOT be created
+        assert not (d / "checkpoint.md").exists()
+        assert not (d / "progress.md").exists()
 
     def test_write_partial_does_not_clear_others(self):
         """Writing only facts should NOT clear existing plan file."""
@@ -631,8 +568,6 @@ class TestWriteSessionMemory:
         memory_dict = {
             "facts": "- new facts",
             "plan": "",  # empty — should NOT overwrite existing
-            "checkpoint": "",
-            "progress": "",
         }
         write_session_memory(self.session_id, memory_dict)
 
@@ -647,8 +582,6 @@ class TestWriteSessionMemory:
         memory_dict = {
             "facts": "- new facts",
             "plan": "",
-            "checkpoint": "",
-            "progress": "",
         }
         write_session_memory(self.session_id, memory_dict)
 
@@ -659,7 +592,7 @@ class TestWriteSessionMemory:
         d = Path.home() / ".march" / "memory" / self.session_id
         assert not d.exists()
 
-        write_session_memory(self.session_id, {"facts": "- data", "plan": "", "checkpoint": "", "progress": ""})
+        write_session_memory(self.session_id, {"facts": "- data", "plan": ""})
         assert d.exists()
         assert "data" in (d / "facts.md").read_text()
 

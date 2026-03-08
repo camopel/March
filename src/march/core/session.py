@@ -47,33 +47,37 @@ def _now() -> str:
 
 @dataclass
 class Session:
-    """A conversation session.
+    """A conversation session with rolling context support.
 
     Attributes:
         id: Unique session identifier (deterministic from source or random).
         source_type: Where the session originates (terminal, matrix, ws, acp).
         source_id: Source-specific identifier (room ID, workspace path, etc.).
         name: Human-readable session name.
-        history: Ordered list of messages in this session.
+        rolling_summary: Carry-over summary from last compaction.
+        messages: Messages since last compaction (sliding window).
+        dirty_messages: Messages not yet flushed to DB.
+        last_processed_seq: Sequence number of last processed message.
         metadata: Session metadata (channel info, user prefs, etc.).
         created_at: Unix timestamp of session creation.
         last_active: Unix timestamp of last activity.
-        state: Session state ("active" or "reset").
+        is_active: Whether the session is active.
     """
 
     id: str = ""
     source_type: str = "terminal"
     source_id: str = ""
     name: str = ""
-    history: list[Message] = field(default_factory=list)
+    rolling_summary: str = ""          # Carry-over summary from last compaction
+    messages: list[Message] = field(default_factory=list)  # Messages since last compaction (sliding window)
+    dirty_messages: list[Message] = field(default_factory=list)  # Not yet flushed to DB
+    last_processed_seq: int = 0        # Sequence number of last processed message
+    _seq_counter: int = 0              # Internal sequence counter
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
     last_active: float = 0.0
-    state: str = "active"
-    # Compaction state
-    compaction_summary: str = ""
-    rolling_summary: str = ""
-    backup_history: list[Message] = field(default_factory=list)
+    is_active: bool = True
+    _flush_timer: float = 0.0         # Last flush timestamp
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -86,80 +90,93 @@ class Session:
             self.created_at = time.time()
         if not self.last_active:
             self.last_active = self.created_at
+        if not self._flush_timer:
+            self._flush_timer = time.time()
 
     def add_message(self, message: Message) -> None:
-        """Add a single message to the session history."""
-        self.history.append(message)
+        """Add a single message to the session."""
+        self._seq_counter += 1
+        message.metadata = dict(message.metadata) if message.metadata else {}
+        message.metadata["seq"] = self._seq_counter
+        self.messages.append(message)
+        self.dirty_messages.append(message)
         self.last_active = time.time()
 
     def add_system_message(self, content: str) -> None:
-        """Add a system message (e.g., sub-agent completion) to history."""
-        self.history.append(Message.system(content))
-        self.last_active = time.time()
+        """Add a system message (e.g., sub-agent completion)."""
+        self.add_message(Message.system(content))
 
     def add_exchange(self, user_message: str | list, assistant_content: str) -> None:
-        """Add a user/assistant exchange to history."""
-        self.history.append(Message.user(user_message))
-        self.history.append(Message.assistant(assistant_content))
-        self.last_active = time.time()
-
-    def clear(self) -> None:
-        """Clear session history (reset). Clears backup too."""
-        self.history.clear()
-        self.backup_history.clear()
-        self.compaction_summary = ""
-        self.rolling_summary = ""
-        self.last_active = time.time()
-
-    def reset(self) -> None:
-        """Reset the session: clear history, backup, summary, and mark as reset."""
-        self.history.clear()
-        self.backup_history.clear()
-        self.compaction_summary = ""
-        self.rolling_summary = ""
-        self.state = "reset"
-        self.last_active = time.time()
-
-    def compact_history(self, summary: str, keep_recent: int = 10) -> int:
-        """Move old messages to backup, replace with summary + recent.
-
-        Args:
-            summary: LLM-generated summary of the old messages.
-            keep_recent: Number of recent messages to keep in active history.
-
-        Returns:
-            Number of messages moved to backup.
-        """
-        if len(self.history) <= keep_recent:
-            return 0
-
-        # Split: old messages → backup, recent → keep
-        split_idx = len(self.history) - keep_recent
-        old_messages = self.history[:split_idx]
-        recent_messages = self.history[split_idx:]
-
-        # Move old to backup
-        self.backup_history.extend(old_messages)
-
-        # Replace history with summary + recent
-        self.compaction_summary = summary
-        self.history = [Message.user(
-            f"[Context Summary — {len(old_messages)} earlier messages compacted, "
-            f"{len(self.backup_history)} total in backup]\n\n{summary}"
-        )] + recent_messages
-
-        self.last_active = time.time()
-        return len(old_messages)
+        """Add a user/assistant exchange."""
+        self.add_message(Message.user(user_message))
+        self.add_message(Message.assistant(assistant_content))
 
     def get_messages_for_llm(self) -> list[dict[str, Any]]:
         """Get all messages serialized for the LLM API.
 
+        Prepends rolling_summary as a user message if non-empty.
         Flattens tool result messages into individual tool messages.
         """
         llm_messages: list[dict[str, Any]] = []
-        for msg in self.history:
+
+        # Prepend rolling summary if available
+        if self.rolling_summary:
+            llm_messages.append({
+                "role": "user",
+                "content": f"[Context Summary — rolling context from previous compaction]\n\n{self.rolling_summary}",
+            })
+
+        for msg in self.messages:
             llm_messages.extend(msg.to_llm_messages())
         return llm_messages
+
+    def compact(self, new_rolling_summary: str) -> None:
+        """Compact the session: replace messages with a rolling summary.
+
+        Args:
+            new_rolling_summary: The new deduped rolling summary.
+        """
+        self.rolling_summary = new_rolling_summary
+        self.messages = []
+        self.dirty_messages = []
+        self.last_processed_seq = self._seq_counter
+
+    def needs_flush(self) -> bool:
+        """Check if dirty messages should be flushed to DB.
+
+        Returns True if 10+ dirty messages or 10+ seconds since last flush.
+        """
+        if len(self.dirty_messages) >= 10:
+            return True
+        if self.dirty_messages and (time.time() - self._flush_timer) >= 10:
+            return True
+        return False
+
+    def flush(self) -> list[Message]:
+        """Return dirty messages and clear the buffer.
+
+        Returns:
+            List of messages that need to be persisted.
+        """
+        flushed = list(self.dirty_messages)
+        self.dirty_messages = []
+        self._flush_timer = time.time()
+        return flushed
+
+    def clear(self) -> None:
+        """Clear session (for /reset). Resets everything."""
+        self.messages.clear()
+        self.dirty_messages.clear()
+        self.rolling_summary = ""
+        self.last_processed_seq = 0
+        self._seq_counter = 0
+        self._flush_timer = time.time()
+        self.last_active = time.time()
+
+    def reset(self) -> None:
+        """Reset the session: clear everything and mark as reset."""
+        self.clear()
+        self.is_active = True
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize session to dict for persistence."""
@@ -168,10 +185,9 @@ class Session:
             "source_type": self.source_type,
             "source_id": self.source_id,
             "name": self.name,
-            "history": [msg.to_dict() for msg in self.history],
-            "backup_history": [msg.to_dict() for msg in self.backup_history],
-            "compaction_summary": self.compaction_summary,
             "rolling_summary": self.rolling_summary,
+            "messages": [msg.to_dict() for msg in self.messages],
+            "last_processed_seq": self.last_processed_seq,
             "metadata": self.metadata,
             "created_at": self.created_at,
             "last_active": self.last_active,
@@ -180,21 +196,41 @@ class Session:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Session":
         """Deserialize session from dict."""
-        history = [Message.from_dict(m) for m in data.get("history", [])]
-        backup = [Message.from_dict(m) for m in data.get("backup_history", [])]
-        return cls(
+        messages = [Message.from_dict(m) for m in data.get("messages", [])]
+        session = cls(
             id=data["id"],
             source_type=data.get("source_type", "terminal"),
             source_id=data.get("source_id", ""),
             name=data.get("name", ""),
-            history=history,
-            backup_history=backup,
-            compaction_summary=data.get("compaction_summary", ""),
             rolling_summary=data.get("rolling_summary", ""),
+            messages=messages,
+            last_processed_seq=data.get("last_processed_seq", 0),
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at", 0.0),
             last_active=data.get("last_active", 0.0),
         )
+        # Restore _seq_counter from messages
+        max_seq = 0
+        for msg in messages:
+            seq = msg.metadata.get("seq", 0) if msg.metadata else 0
+            if seq > max_seq:
+                max_seq = seq
+        session._seq_counter = max(max_seq, session.last_processed_seq)
+        return session
+
+    # ── Legacy compatibility properties ──────────────────────────────
+    # These allow code that references session.history to still work
+    # during the transition period. They map to session.messages.
+
+    @property
+    def history(self) -> list[Message]:
+        """Legacy alias for messages (backward compatibility)."""
+        return self.messages
+
+    @history.setter
+    def history(self, value: list[Message]) -> None:
+        """Legacy setter for messages (backward compatibility)."""
+        self.messages = value
 
 
 # ── Unified SessionStore ─────────────────────────────────────────────────
@@ -210,7 +246,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_id TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL DEFAULT '',
     rolling_summary TEXT DEFAULT '',
-    compaction_summary TEXT DEFAULT '',
+    last_processed_seq INTEGER DEFAULT 0,
     metadata TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
     last_active TEXT NOT NULL,
@@ -220,8 +256,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source
     ON sessions(source_type, source_id);
 
 CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER DEFAULT 0,
     role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool', 'system')),
     content TEXT NOT NULL DEFAULT '',
     tool_calls TEXT DEFAULT '[]',
@@ -232,6 +269,8 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_seq
+    ON messages(session_id, seq);
 """
 
 
@@ -264,7 +303,7 @@ class SessionStore:
                 existing_tables.add(row["name"])
 
         if "sessions" in existing_tables:
-            # Existing DB — run migrations to add new columns
+            # Existing DB — run migrations
             await self._run_migrations()
         else:
             # Fresh DB — create tables from scratch
@@ -273,24 +312,37 @@ class SessionStore:
         await self._db.commit()
 
     async def _run_migrations(self) -> None:
-        """Run schema migrations for compatibility with existing ws_proxy tables."""
+        """Run schema migrations for rolling context support."""
         assert self._db is not None
 
         # Drop old agent-specific tables (never used, safe to remove)
         for old_table in ("agent_sessions", "agent_messages", "agent_backup_messages"):
             await self._db.execute(f"DROP TABLE IF EXISTS {old_table}")
 
-        # ── Sessions table migrations ────────────────────────────────────
+        # ── Check if we need the rolling context migration ───────────
         existing_session_cols = set()
         async with self._db.execute("PRAGMA table_info(sessions)") as cur:
             async for row in cur:
                 existing_session_cols.add(row["name"])
 
+        # If compaction_summary column exists, we need the full migration
+        if "compaction_summary" in existing_session_cols:
+            # Force clean rebuild: delete all sessions and messages
+            await self._db.execute("DELETE FROM messages")
+            await self._db.execute("DELETE FROM sessions")
+
+            # Recreate sessions table without compaction_summary
+            await self._db.execute("DROP TABLE IF EXISTS sessions")
+            await self._db.execute("DROP TABLE IF EXISTS messages")
+            await self._db.executescript(_SCHEMA)
+            return
+
+        # ── Sessions table migrations ────────────────────────────────
         session_migrations = {
             "source_type": "ALTER TABLE sessions ADD COLUMN source_type TEXT NOT NULL DEFAULT 'ws'",
             "source_id": "ALTER TABLE sessions ADD COLUMN source_id TEXT NOT NULL DEFAULT ''",
-            "compaction_summary": "ALTER TABLE sessions ADD COLUMN compaction_summary TEXT DEFAULT ''",
             "rolling_summary": "ALTER TABLE sessions ADD COLUMN rolling_summary TEXT DEFAULT ''",
+            "last_processed_seq": "ALTER TABLE sessions ADD COLUMN last_processed_seq INTEGER DEFAULT 0",
             "metadata": "ALTER TABLE sessions ADD COLUMN metadata TEXT DEFAULT '{}'",
         }
         for col, sql in session_migrations.items():
@@ -308,13 +360,14 @@ class SessionStore:
         except Exception:
             pass
 
-        # ── Messages table migrations ────────────────────────────────────
+        # ── Messages table migrations ────────────────────────────────
         existing_msg_cols = set()
         async with self._db.execute("PRAGMA table_info(messages)") as cur:
             async for row in cur:
                 existing_msg_cols.add(row["name"])
 
         msg_migrations = {
+            "seq": "ALTER TABLE messages ADD COLUMN seq INTEGER DEFAULT 0",
             "attachments": "ALTER TABLE messages ADD COLUMN attachments TEXT DEFAULT '[]'",
             "tool_results": "ALTER TABLE messages ADD COLUMN tool_results TEXT DEFAULT '[]'",
             "metadata": "ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT '{}'",
@@ -326,10 +379,12 @@ class SessionStore:
                 except Exception:
                     pass
 
-        # Relax role CHECK constraint if needed (old schema only allowed user/assistant)
-        # SQLite doesn't support ALTER CHECK, but new inserts with 'tool'/'system' will
-        # work because SQLite CHECK is not enforced on existing rows by default.
-        # For new DBs, the schema already includes all roles.
+        try:
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(session_id, seq)"
+            )
+        except Exception:
+            pass
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -337,7 +392,7 @@ class SessionStore:
             await self._db.close()
             self._db = None
 
-    # ── Session CRUD ─────────────────────────────────────────────────────
+    # ── Session CRUD ─────────────────────────────────────────────────
 
     async def create_session(
         self,
@@ -360,8 +415,8 @@ class SessionStore:
         now = _now()
         await self._db.execute(
             """INSERT INTO sessions (id, source_type, source_id, name, rolling_summary,
-               compaction_summary, metadata, created_at, last_active, is_active)
-               VALUES (?, ?, ?, ?, '', '', ?, ?, ?, 1)""",
+               last_processed_seq, metadata, created_at, last_active, is_active)
+               VALUES (?, ?, ?, ?, '', 0, ?, ?, ?, 1)""",
             (session.id, source_type, source_id, name,
              json.dumps(session.metadata), now, now),
         )
@@ -401,9 +456,16 @@ class SessionStore:
             row = await cur.fetchone()
             if row:
                 session = self._row_to_session(row)
-                # Load history into session
-                messages = await self.get_messages(session.id)
-                session.history = messages
+                # Load messages after last_processed_seq to rebuild sliding window
+                messages = await self.get_messages_after_seq(session.id, session.last_processed_seq)
+                session.messages = messages
+                # Restore _seq_counter
+                max_seq = 0
+                for msg in messages:
+                    seq = msg.metadata.get("seq", 0) if msg.metadata else 0
+                    if seq > max_seq:
+                        max_seq = seq
+                session._seq_counter = max(max_seq, session.last_processed_seq)
                 return session
 
         return await self.create_session(
@@ -453,17 +515,21 @@ class SessionStore:
                 results.append(s)
         return results
 
-    async def update_session(self, session: Session) -> None:
-        """Update session metadata (not messages)."""
+    async def save_session(self, session: Session) -> None:
+        """Save session metadata (rolling_summary, last_processed_seq, metadata)."""
         assert self._db is not None
 
         await self._db.execute(
-            """UPDATE sessions SET name = ?, rolling_summary = ?, compaction_summary = ?,
-               metadata = ?, last_active = ? WHERE id = ?""",
-            (session.name, session.rolling_summary, session.compaction_summary,
+            """UPDATE sessions SET name = ?, rolling_summary = ?,
+               last_processed_seq = ?, metadata = ?, last_active = ? WHERE id = ?""",
+            (session.name, session.rolling_summary, session.last_processed_seq,
              json.dumps(session.metadata), _now(), session.id),
         )
         await self._db.commit()
+
+    async def update_session(self, session: Session) -> None:
+        """Update session metadata (alias for save_session)."""
+        await self.save_session(session)
 
     async def delete_session(self, session_id: str) -> None:
         """Soft-delete a session."""
@@ -480,12 +546,12 @@ class SessionStore:
 
         await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         await self._db.execute(
-            "UPDATE sessions SET rolling_summary = '', compaction_summary = '' WHERE id = ?",
+            "UPDATE sessions SET rolling_summary = '', last_processed_seq = 0 WHERE id = ?",
             (session_id,),
         )
         await self._db.commit()
 
-    # ── Message CRUD ─────────────────────────────────────────────────────
+    # ── Message CRUD ─────────────────────────────────────────────────
 
     async def add_message(
         self,
@@ -496,11 +562,9 @@ class SessionStore:
         """Add a message to a session. Returns the message ID."""
         assert self._db is not None
 
-        msg_id = str(uuid.uuid4())
         now = _now()
 
         # Serialize content — if it's a multimodal list, extract text-only for DB
-        # (images are stored as attachment refs, not inline base64)
         content = message.content
         if isinstance(content, list):
             content = self._extract_text_content(content)
@@ -512,26 +576,76 @@ class SessionStore:
             [tr.to_dict() for tr in message.tool_results] if message.tool_results else []
         )
 
-        await self._db.execute(
-            """INSERT INTO messages (id, session_id, role, content, tool_calls,
+        seq = message.metadata.get("seq", 0) if message.metadata else 0
+
+        async with self._db.execute(
+            """INSERT INTO messages (session_id, seq, role, content, tool_calls,
                tool_results, attachments, metadata, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                msg_id, session_id,
+                session_id,
+                seq,
                 message.role.value if isinstance(message.role, Role) else message.role,
                 content,
                 tool_calls_json,
                 tool_results_json,
                 json.dumps(attachments or []),
-                json.dumps(message.metadata),
+                json.dumps(message.metadata or {}),
                 now,
             ),
-        )
+        ) as cur:
+            msg_id = str(cur.lastrowid)
+
         await self._db.execute(
             "UPDATE sessions SET last_active = ? WHERE id = ?", (now, session_id)
         )
         await self._db.commit()
         return msg_id
+
+    async def flush_messages(self, session_id: str, messages: list[Message]) -> None:
+        """Batch insert dirty messages with their seq numbers."""
+        assert self._db is not None
+
+        if not messages:
+            return
+
+        now = _now()
+        rows = []
+        for message in messages:
+            content = message.content
+            if isinstance(content, list):
+                content = self._extract_text_content(content)
+
+            tool_calls_json = json.dumps(
+                [tc.to_dict() for tc in message.tool_calls] if message.tool_calls else []
+            )
+            tool_results_json = json.dumps(
+                [tr.to_dict() for tr in message.tool_results] if message.tool_results else []
+            )
+            seq = message.metadata.get("seq", 0) if message.metadata else 0
+
+            rows.append((
+                session_id,
+                seq,
+                message.role.value if isinstance(message.role, Role) else message.role,
+                content,
+                tool_calls_json,
+                tool_results_json,
+                json.dumps([]),
+                json.dumps(message.metadata or {}),
+                now,
+            ))
+
+        await self._db.executemany(
+            """INSERT INTO messages (session_id, seq, role, content, tool_calls,
+               tool_results, attachments, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        await self._db.execute(
+            "UPDATE sessions SET last_active = ? WHERE id = ?", (now, session_id)
+        )
+        await self._db.commit()
 
     async def get_messages(
         self,
@@ -548,6 +662,23 @@ class SessionStore:
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])
+
+        messages: list[Message] = []
+        async with self._db.execute(query, params) as cur:
+            async for row in cur:
+                messages.append(self._row_to_message(row))
+        return messages
+
+    async def get_messages_after_seq(
+        self,
+        session_id: str,
+        last_processed_seq: int,
+    ) -> list[Message]:
+        """Get messages with seq > last_processed_seq to rebuild sliding window."""
+        assert self._db is not None
+
+        query = "SELECT * FROM messages WHERE session_id = ? AND seq > ? ORDER BY seq"
+        params: list[Any] = [session_id, last_processed_seq]
 
         messages: list[Message] = []
         async with self._db.execute(query, params) as cur:
@@ -585,7 +716,7 @@ class SessionStore:
             row = await cur.fetchone()
             return row[0] if row else 0
 
-    # ── Summaries ────────────────────────────────────────────────────────
+    # ── Summaries ────────────────────────────────────────────────────
 
     async def get_rolling_summary(self, session_id: str) -> str:
         """Get the rolling summary for a session."""
@@ -606,17 +737,19 @@ class SessionStore:
         )
         await self._db.commit()
 
-    # ── Helpers ──────────────────────────────────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────────────
 
     def _row_to_session(self, row: sqlite3.Row) -> Session:
         """Convert a DB row to a Session object."""
+        cols = row.keys()
+        last_processed_seq = row["last_processed_seq"] if "last_processed_seq" in cols else 0
         return Session(
             id=row["id"],
             source_type=row["source_type"],
             source_id=row["source_id"],
             name=row["name"],
             rolling_summary=row["rolling_summary"] or "",
-            compaction_summary=row["compaction_summary"] or "",
+            last_processed_seq=last_processed_seq,
             metadata=json.loads(row["metadata"]) if row["metadata"] else {},
             created_at=row["created_at"],
             last_active=row["last_active"],
@@ -648,6 +781,10 @@ class SessionStore:
                 metadata = json.loads(row["metadata"])
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        # Restore seq from DB
+        if "seq" in row.keys():
+            metadata["seq"] = row["seq"]
 
         return Message(
             role=row["role"],

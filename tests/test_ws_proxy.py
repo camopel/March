@@ -1,4 +1,4 @@
-"""Tests for WSProxyPlugin — WS Proxy as I/O adapter.
+"""Tests for WSChannel — WS Proxy as I/O adapter channel.
 
 Uses a real aiohttp server on a random port with mocked DB (ChatDB) and
 mocked Orchestrator.handle_message() to yield predetermined events.
@@ -26,8 +26,8 @@ from march.core.orchestrator import (
     TextDelta,
     ToolProgress,
 )
-from march.plugins.ws_proxy import (
-    WSProxyPlugin,
+from march.channels.ws_channel import (
+    WSChannel,
     ChatDB,
     _StreamBuffer,
     _WSConn,
@@ -126,12 +126,12 @@ class FakeChatDB:
 def _make_plugin_and_app(
     fake_db: FakeChatDB,
     orchestrator_side_effect=None,
-) -> tuple[WSProxyPlugin, web.Application]:
-    """Build a WSProxyPlugin wired to a fake DB and mock orchestrator.
+) -> tuple[WSChannel, web.Application]:
+    """Build a WSChannel wired to a fake DB and mock orchestrator.
 
-    Returns (plugin, aiohttp_app) — caller starts the server.
+    Returns (channel, aiohttp_app) — caller starts the server.
     """
-    plugin = WSProxyPlugin()
+    plugin = WSChannel()
     plugin._db = fake_db
     plugin._agent = MagicMock()
     plugin._app_ref = MagicMock()
@@ -528,7 +528,7 @@ class TestWSProxyMultiModal:
             "ycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/AP0poA//2Q=="
         )
 
-        with patch("march.plugins.ws_proxy._process_attachment") as mock_proc:
+        with patch("march.channels.ws_channel._process_attachment") as mock_proc:
             # Return multimodal content (image block + text)
             mock_proc.return_value = [
                 {
@@ -638,7 +638,7 @@ class TestWSProxyMultiModal:
 
         fake_pdf = base64.b64encode(b"%PDF-1.4 fake content").decode()
 
-        with patch("march.plugins.ws_proxy._process_attachment") as mock_proc:
+        with patch("march.channels.ws_channel._process_attachment") as mock_proc:
             mock_proc.return_value = (
                 "[media attached: /tmp/test.pdf (PDF, 3 pages, 10KB)]\n\n"
                 "Summary: This document discusses testing strategies."

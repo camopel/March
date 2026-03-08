@@ -377,7 +377,6 @@ class TestAgentManagerExtended:
     def manager(self, tmp_path):
         config = AgentManagerConfig(
             max_spawn_depth=2,
-            max_children_per_agent=3,
             max_concurrent_subagents=4,
         )
         registry = SubagentRegistry(persist_dir=tmp_path / "agents")
@@ -488,7 +487,7 @@ class TestAgentManagerExtended:
             factory_calls.append(kwargs)
             return "factory result"
 
-        config = AgentManagerConfig(max_spawn_depth=2, max_children_per_agent=5)
+        config = AgentManagerConfig(max_spawn_depth=2, max_concurrent_subagents=5)
         registry = SubagentRegistry(persist_dir=tmp_path / "agents")
         tq = TaskQueue()
         manager = AgentManager(
