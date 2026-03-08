@@ -321,7 +321,65 @@ class MatrixChannel(Channel):
         # This returns control to the sync loop immediately so the read
         # receipt and typing indicator actually get flushed to the server
         # without waiting for the full LLM response.
-        asyncio.create_task(self._process_message(room_id, text, event))
+
+        # Handle /reset directly — clean up everything
+        if text.strip().lower() == "/reset":
+            asyncio.create_task(self._handle_matrix_reset(room_id))
+        else:
+            asyncio.create_task(self._process_message(room_id, text, event))
+
+    async def _handle_matrix_reset(self, room_id: str) -> None:
+        """Handle /reset: clear session history, attachments, and DB entries."""
+        import shutil
+
+        session = self._get_or_create_session(room_id)
+        session_id = session.id
+        cleaned = []
+
+        try:
+            # 1. Clear in-memory session
+            session.clear()
+            cleaned.append("history")
+
+            # 2. Clear session from unified SessionStore (if it exists there)
+            if self._agent and hasattr(self._agent, "memory"):
+                result = await self._agent.memory.reset_session(session_id)
+                db_count = result.get("sqlite_entries", 0)
+                if db_count:
+                    cleaned.append(f"{db_count} DB entries")
+
+            # 3. Delete session memory files (facts.md, plan.md, etc.)
+            try:
+                from march.core.compaction import delete_session_memory
+                if delete_session_memory(session_id):
+                    cleaned.append("session memory")
+            except Exception as e:
+                logger.warning("matrix: reset - failed to delete session memory: %s", e)
+
+            # 4. Clean up Matrix attachments
+            attach_dir = Path.home() / ".march" / "attachments" / "matrix"
+            if attach_dir.exists():
+                file_count = sum(1 for _ in attach_dir.iterdir())
+                if file_count > 0:
+                    shutil.rmtree(str(attach_dir))
+                    attach_dir.mkdir(parents=True, exist_ok=True)
+                    cleaned.append(f"{file_count} attachments")
+
+            # 5. Remove from in-memory sessions dict so next message creates fresh
+            self._sessions.pop(room_id, None)
+
+            msg = f"✓ Session reset. Cleaned: {', '.join(cleaned)}."
+            logger.info("matrix: reset session %s: %s", session_id[:8], msg)
+            await self.send(msg, room_id=room_id)
+
+        except Exception as e:
+            logger.error("matrix: reset failed: %s", e)
+            await self.send(f"Reset error: {e}", room_id=room_id)
+        finally:
+            try:
+                await self._client.room_typing(room_id, typing_state=False)
+            except Exception:
+                pass
 
     async def _process_message(self, room_id: str, text: str, event: Any) -> None:
         """Process a message with the LLM in the background."""
