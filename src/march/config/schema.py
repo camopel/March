@@ -235,7 +235,7 @@ class DashboardConfig(BaseModel):
     """Dashboard configuration."""
 
     enabled: bool = True
-    port: str = "auto"
+    port: int | str = "auto"
 
 
 # ─── Root Config ───
