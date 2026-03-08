@@ -703,7 +703,6 @@ class TestWSProxyConnection:
         await ws1.close()
         await ws2.close()
 
-    @pytest.mark.xfail(reason="Timing-sensitive: stream finishes before reconnect in test env")
     async def test_ws_reconnect_during_stream(self, server_and_client):
         """Disconnect mid-stream, reconnect → stream.active with collected content.
 
