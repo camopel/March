@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from march.logging import get_logger
@@ -15,7 +16,38 @@ _DEFAULT_EXCLUDES = {
     ".egg-info", ".tox",
 }
 
+# Directories that should never be traversed (network mounts, fuse, etc.)
+_SKIP_DIRS = {
+    "S3", ".Trash", ".cache", ".local/share/Trash",
+}
+
 _MAX_RESULTS = 500
+_GLOB_TIMEOUT = 10  # seconds
+
+
+def _run_glob(root: Path, pattern: str, include_hidden: bool) -> list[Path]:
+    """Run glob synchronously (called from executor)."""
+    matches = []
+    try:
+        for m in root.glob(pattern):
+            # Skip problematic directories early
+            try:
+                rel = m.relative_to(root)
+                parts = rel.parts
+                if any(p in _SKIP_DIRS for p in parts):
+                    continue
+                if any(p in _DEFAULT_EXCLUDES for p in parts):
+                    continue
+                if not include_hidden and any(p.startswith(".") for p in parts):
+                    continue
+                matches.append(rel)
+                if len(matches) >= _MAX_RESULTS:
+                    break
+            except (OSError, ValueError):
+                continue
+    except (OSError, PermissionError) as e:
+        logger.warning("glob error in %s: %s", root, e)
+    return sorted(matches)
 
 
 @tool(name="glob", description="Find files matching a glob pattern. Returns a tree-style listing.")
@@ -44,26 +76,17 @@ async def glob_tool(
     if not root.is_dir():
         return f"Error: Not a directory: {path}"
 
+    # Run glob in thread pool to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
     try:
-        matches = sorted(root.glob(pattern))
+        results = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_glob, root, pattern, include_hidden),
+            timeout=_GLOB_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return f"Error: glob timed out after {_GLOB_TIMEOUT}s (pattern may traverse network mounts)"
     except Exception as e:
         return f"Error in glob: {e}"
-
-    # Filter
-    results = []
-    for m in matches:
-        rel = m.relative_to(root)
-        parts = rel.parts
-
-        # Skip excluded directories
-        if any(p in _DEFAULT_EXCLUDES for p in parts):
-            continue
-        if not include_hidden and any(p.startswith(".") for p in parts):
-            continue
-
-        results.append(rel)
-        if len(results) >= _MAX_RESULTS:
-            break
 
     if not results:
         return f"No files matching '{pattern}' in {root}"

@@ -720,12 +720,10 @@ class WSProxyPlugin(Plugin):
     async def _handle_list_sessions(self, request: Any) -> Any:
         import aiohttp.web as web
 
-        # Use synchronous sqlite to avoid event loop contention
-        # (aiosqlite can hang when the event loop is saturated by agent tasks)
-        try:
-            sessions = await asyncio.wait_for(self._db.list_sessions(), timeout=2.0)
-        except asyncio.TimeoutError:
-            sessions = self._list_sessions_sync()
+        # Run in thread pool to avoid event loop contention
+        # (agent tool calls like glob can block the event loop)
+        loop = asyncio.get_event_loop()
+        sessions = await loop.run_in_executor(None, self._list_sessions_sync)
         return web.json_response({"sessions": sessions})
 
     def _list_sessions_sync(self) -> list[dict]:
@@ -766,12 +764,10 @@ class WSProxyPlugin(Plugin):
         body = await request.json()
         name = body.get("name", "New Chat")
         description = body.get("description", "")
-        try:
-            result = await asyncio.wait_for(
-                self._db.create_session(name, description), timeout=3.0
-            )
-        except asyncio.TimeoutError:
-            result = self._create_session_sync(name, description)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, self._create_session_sync, name, description
+        )
         return web.json_response(result, status=201)
 
     def _create_session_sync(self, name: str, description: str = "") -> dict:
