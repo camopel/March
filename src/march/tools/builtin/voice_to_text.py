@@ -73,8 +73,7 @@ async def voice_to_text(
         detected_lang = info.language if hasattr(info, "language") else "unknown"
 
         return (
-            f"Language: {detected_lang}\n"
-            f"Duration: {info.duration:.1f}s\n"
+            f"Language: {detected_lang} | Duration: {info.duration:.1f}s\n"
             f"\n"
             f"{transcript.strip()}"
         )

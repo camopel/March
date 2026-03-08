@@ -54,7 +54,7 @@ DEFAULTS = {
     "max_message_size": 20 * 1024 * 1024,  # 20MB
     "stream_drain_timeout": 120,
     "max_queue_size": 100,
-    "context_keep_recent": 20,      # Messages to keep in active context
+    "context_keep_recent": 50,      # Messages to keep in active context
     "compaction_threshold": 40,     # Compact when total messages exceed this
 }
 
@@ -464,6 +464,15 @@ class ChatDB:
         msg.metadata = {"summary": summary} if summary else {}
         return await self._store.add_message(session_id, msg, attachments=attachments)
 
+    async def update_message_image(self, message_id: str, image_data: str) -> None:
+        """Update the image_data field of an existing message."""
+        attachments = json.dumps([{"type": "image_data", "data": image_data}])
+        await self._store._db.execute(
+            "UPDATE messages SET image_data = ?, attachments = ? WHERE id = ?",
+            (image_data, attachments, message_id),
+        )
+        await self._store._db.commit()
+
     async def save_draft(self, session_id: str, draft_id: str, content: str) -> None:
         await self._store.save_draft(session_id, draft_id, content)
 
@@ -841,7 +850,10 @@ class WSProxyPlugin(Plugin):
             })
             await existing_ws.close()
 
-        ws = web.WebSocketResponse(max_msg_size=self._max_msg_size)
+        ws = web.WebSocketResponse(
+            max_msg_size=self._max_msg_size,
+            heartbeat=30.0,  # Send ping every 30s to keep connection alive
+        )
         await ws.prepare(request)
         self._active_connections[session_id] = ws
         logger.info("client connected", session_id=session_id)
@@ -989,6 +1001,17 @@ class WSProxyPlugin(Plugin):
             mime_type=mime_type, size_bytes=len(raw_bytes), path=str(tmp_path),
         )
 
+        display = f"📎 {filename}"
+
+        # Save display message to DB IMMEDIATELY — before processing.
+        # This prevents the message from disappearing if the WebSocket
+        # disconnects during the (potentially slow) _process_attachment call.
+        # If the client reconnects and fetchHistory runs, the message is
+        # already in the DB.
+        msg_id = await self._db.save_message(
+            conn.session_id, "user", display
+        )
+
         # Process attachment: save to disk + generate LLM summary
         user_content = await _process_attachment(
             raw_bytes, filename, mime_type, str(tmp_path),
@@ -998,15 +1021,9 @@ class WSProxyPlugin(Plugin):
             summary_chunk_size=self._summary_chunk_size,
         )
 
-        display = f"📎 {filename}"
-
-        # For images: send preview to frontend and store in DB for history
-        # _process_attachment() already resized and saved to tmp_path — read that.
-        image_data_uri = None
+        # For images: send preview to frontend and update DB with image data
         if mime_type.startswith("image/"):
             resized_bytes = tmp_path.read_bytes()
-            # _resize_image converts to JPEG on success; on failure it keeps original mime
-            # Check if the file starts with JPEG magic bytes (FF D8 FF)
             out_mime = "image/jpeg" if resized_bytes[:3] == b'\xff\xd8\xff' else mime_type
             preview_b64 = base64.b64encode(resized_bytes).decode("ascii")
             image_data_uri = f"data:{out_mime};base64,{preview_b64}"
@@ -1016,10 +1033,11 @@ class WSProxyPlugin(Plugin):
                 "mime_type": out_mime,
                 "filename": filename,
             })
-
-        await self._db.save_message(
-            conn.session_id, "user", display, image_data=image_data_uri
-        )
+            # Update the already-saved message with image data
+            try:
+                await self._db.update_message_image(msg_id, image_data_uri)
+            except Exception as e:
+                logger.warning("failed to update image_data", error=str(e))
 
         if conn.busy:
             if len(conn.pending) >= self._max_queue_size:
@@ -1189,8 +1207,8 @@ class WSProxyPlugin(Plugin):
                 duration_ms=_agent_dur,
             )
             conn.busy = False
-            # Clear cached session so next turn rebuilds from DB
-            self._march_sessions.pop(conn.session_id, None)
+            # Session stays cached in memory — preserves full tool call context
+            # across turns. Only rebuilt from DB on first access or after /reset.
         await self._drain_queue(conn)
 
     async def _drain_queue(self, conn: "_WSConn") -> None:
@@ -1224,6 +1242,22 @@ class WSProxyPlugin(Plugin):
         assert self._agent is not None
 
         session = await self._resolve_march_session(conn.session_id)
+
+        # On cold start, check for unprocessed user messages from before restart.
+        # These are trailing user messages in DB that never got an assistant reply.
+        unprocessed = session.metadata.pop("_unprocessed_messages", [])
+        if unprocessed:
+            logger.info(
+                "replaying unprocessed messages",
+                session_id=conn.session_id,
+                count=len(unprocessed),
+            )
+            # Prepend unprocessed messages to current content
+            if isinstance(content, str):
+                all_msgs = unprocessed + [content]
+                content = "\n\n".join(all_msgs)
+            # Note: unprocessed msgs are already in DB, no need to save again
+
         buf = self._get_stream_buffer(conn.session_id)
         buf.reset()
         buf.streaming = True
@@ -1416,28 +1450,52 @@ class WSProxyPlugin(Plugin):
     async def _resolve_march_session(self, session_id: str) -> Any:
         """Get or create a March Session for a chat session ID.
 
-        Builds context from DB: last N messages.
-        Compaction is handled by agent.py run_stream() when context grows too large.
-        No in-memory history accumulation — DB is the source of truth.
+        Sessions are cached in memory for the process lifetime.
+        DB is only used to bootstrap a session on first access (e.g. after restart).
+        The agent's own compaction handles context growth — we don't truncate here.
+
+        On cold start, distinguishes between:
+        - Completed turns (user+assistant pairs) → loaded as context history
+        - Unprocessed user messages (trailing user msgs with no assistant reply)
+          → returned separately so the caller can re-trigger the agent
         """
         from march.core.session import Session
         from march.core.message import Message
 
-        # Always rebuild from DB (no caching — DB is source of truth)
+        # Return cached session if available (preserves full tool call context)
+        if session_id in self._march_sessions:
+            return self._march_sessions[session_id]
+
+        # First access: bootstrap from DB
         session = Session(
             id=session_id,
             source_type="ws_proxy",
             source_id=session_id,
         )
 
-        # Load only recent messages for active context
+        # Load recent messages to give the LLM some context on restart
         keep_recent = self._keep_recent
         recent = await self._db.get_recent_messages(session_id, limit=keep_recent)
-        for msg in recent:
+
+        # Split into context (completed turns) and unprocessed user messages.
+        # Walk backwards from the end: any trailing user messages that have
+        # no assistant reply after them are "unprocessed".
+        context_msgs = list(recent)
+        unprocessed: list[dict] = []
+        while context_msgs and context_msgs[-1].get("role") == "user":
+            unprocessed.insert(0, context_msgs.pop())
+
+        # Load context (completed turns) into session history
+        for msg in context_msgs:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if content:
                 session.add_message(Message(role=role, content=content))
+
+        # Store unprocessed messages for the caller to handle
+        session.metadata["_unprocessed_messages"] = [
+            m.get("content", "") for m in unprocessed if m.get("content")
+        ]
 
         self._march_sessions[session_id] = session
         return session

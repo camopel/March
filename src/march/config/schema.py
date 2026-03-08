@@ -247,7 +247,6 @@ class AgentIdentityConfig(BaseModel):
 
     name: str = "march"
     version: str = "0.1.0"
-    max_tool_iterations: int = 100
 
 
 class AgentsConfig(BaseModel):

@@ -63,6 +63,7 @@ class MatrixChannel(Channel):
         self._client: Any = None  # nio.AsyncClient
         self._sessions: dict[str, Session] = {}  # room_id → session
         self._running = False
+        self._start_ts: int = 0  # server_timestamp threshold — ignore events before this
 
     async def start(self, agent: "Agent", **kwargs: Any) -> None:
         """Start the Matrix client, join rooms, and begin listening."""
@@ -108,6 +109,7 @@ class MatrixChannel(Channel):
                     store=SqliteStore,
                     store_name="march_crypto",
                     encryption_enabled=True,
+                    store_sync_tokens=True,
                 ),
             )
         else:
@@ -223,6 +225,11 @@ class MatrixChannel(Channel):
                     logger.warning("matrix: e2ee post-sync error: %s", e)
             self._client.add_response_callback(_post_sync_e2ee_setup, _SyncResponse)
 
+        # Record startup time — ignore events with server_timestamp before this
+        # to prevent replaying historical commands (like /reset) on initial sync.
+        import time
+        self._start_ts = int(time.time() * 1000)
+
         # Sync loop
         try:
             await self._client.sync_forever(timeout=30000, full_state=True)
@@ -293,6 +300,12 @@ class MatrixChannel(Channel):
         if self._client and event.sender == self._client.user_id:
             return
 
+        # Skip messages from before startup (initial sync replays history)
+        if self._start_ts and event.server_timestamp < self._start_ts:
+            logger.debug("matrix: skipping pre-startup message %s (ts=%d < start=%d)",
+                         event.event_id, event.server_timestamp, self._start_ts)
+            return
+
         text = event.body.strip()
         if not text:
             return
@@ -317,14 +330,16 @@ class MatrixChannel(Channel):
         except Exception as e:
             logger.debug("matrix: failed to send typing indicator: %s", e)
 
-        # ── Spawn LLM processing as background task ──────────────────
-        # This returns control to the sync loop immediately so the read
-        # receipt and typing indicator actually get flushed to the server
-        # without waiting for the full LLM response.
-
-        # Handle /reset directly — clean up everything
+        # ── Handle /reset synchronously, everything else as background task ─
+        # /reset MUST complete before any new messages are processed for this
+        # room, otherwise a race condition allows the next message to pick up
+        # the old (not-yet-cleared) session history.  We await it directly so
+        # the sync loop blocks until cleanup is done.
+        #
+        # Normal messages are still spawned as background tasks so the sync
+        # loop isn't blocked and the read receipt / typing indicator flush.
         if text.strip().lower() == "/reset":
-            asyncio.create_task(self._handle_matrix_reset(room_id))
+            await self._handle_matrix_reset(room_id)
         else:
             asyncio.create_task(self._process_message(room_id, text, event))
 
@@ -337,18 +352,26 @@ class MatrixChannel(Channel):
         cleaned = []
 
         try:
-            # 1. Clear in-memory session
+            # 1. Clear in-memory session (history, backup, summaries)
             session.clear()
             cleaned.append("history")
 
-            # 2. Clear session from unified SessionStore (if it exists there)
+            # 2. Clear persisted messages from SessionStore (SQLite)
+            if self._agent and self._agent.session_store:
+                try:
+                    await self._agent.session_store.clear_session(session_id)
+                    cleaned.append("persisted messages")
+                except Exception as e:
+                    logger.warning("matrix: reset - failed to clear session store: %s", e)
+
+            # 3. Clear session from MemoryStore (facts, embeddings, etc.)
             if self._agent and hasattr(self._agent, "memory"):
                 result = await self._agent.memory.reset_session(session_id)
                 db_count = result.get("sqlite_entries", 0)
                 if db_count:
                     cleaned.append(f"{db_count} DB entries")
 
-            # 3. Delete session memory files (facts.md, plan.md, etc.)
+            # 4. Delete session memory files (facts.md, plan.md, etc.)
             try:
                 from march.core.compaction import delete_session_memory
                 if delete_session_memory(session_id):
@@ -356,16 +379,15 @@ class MatrixChannel(Channel):
             except Exception as e:
                 logger.warning("matrix: reset - failed to delete session memory: %s", e)
 
-            # 4. Clean up attachments for THIS session only
+            # 5. Clean up attachments for THIS session only
             attach_dir = Path.home() / ".march" / "attachments" / "matrix" / session_id
             if attach_dir.exists():
                 file_count = sum(1 for _ in attach_dir.iterdir())
                 if file_count > 0:
                     shutil.rmtree(str(attach_dir))
                     cleaned.append(f"{file_count} attachments")
-                    cleaned.append(f"{file_count} attachments")
 
-            # 5. Remove from in-memory sessions dict so next message creates fresh
+            # 6. Remove from in-memory sessions dict so next message creates fresh
             self._sessions.pop(room_id, None)
 
             msg = f"✓ Session reset. Cleaned: {', '.join(cleaned)}."
@@ -416,6 +438,10 @@ class MatrixChannel(Channel):
 
         # Ignore our own messages
         if self._client and event.sender == self._client.user_id:
+            return
+
+        # Skip messages from before startup (initial sync replays history)
+        if self._start_ts and event.server_timestamp < self._start_ts:
             return
 
         room_id = room.room_id
@@ -578,6 +604,10 @@ class MatrixChannel(Channel):
         if self._client and event.sender == self._client.user_id:
             return
 
+        # Skip messages from before startup (initial sync replays history)
+        if self._start_ts and event.server_timestamp < self._start_ts:
+            return
+
         room_id = room.room_id
         logger.info("matrix: audio in %s from %s: %s", room_id, event.sender, getattr(event, "body", "audio"))
 
@@ -712,6 +742,10 @@ class MatrixChannel(Channel):
             return
 
         if self._client and event.sender == self._client.user_id:
+            return
+
+        # Skip messages from before startup (initial sync replays history)
+        if self._start_ts and event.server_timestamp < self._start_ts:
             return
 
         room_id = room.room_id
@@ -990,29 +1024,49 @@ class MatrixChannel(Channel):
         Uses the Python `markdown` library with extensions for
         fenced code blocks, tables, etc. Falls back to basic
         HTML-escaped text if the library is unavailable.
+
+        Important: Element (and other Matrix clients) sanitize HTML
+        aggressively — they strip all `style` attributes (except on
+        img), and only allow `class` values starting with `language-`
+        on `<code>` tags. So we avoid codehilite (inline styles) and
+        nl2br (breaks normal paragraph spacing).
         """
         try:
             import markdown
+            import re
+
             html_output = markdown.markdown(
                 text,
                 extensions=[
                     "fenced_code",
-                    "codehilite",
                     "tables",
-                    "nl2br",
                     "sane_lists",
                 ],
-                extension_configs={
-                    "codehilite": {
-                        "noclasses": True,
-                        "css_class": "highlight",
-                    },
-                },
             )
+
+            # fenced_code generates <code class="language-python"> which
+            # Element allows. But if it generates other class formats,
+            # normalize them to language- prefix so Element doesn't strip them.
+            def _fix_code_class(m: re.Match) -> str:
+                cls = m.group(1)
+                # Already has language- prefix — keep as-is
+                if cls.startswith("language-"):
+                    return m.group(0)
+                # Convert e.g. class="python" to class="language-python"
+                return f'<code class="language-{cls}">'
+
+            html_output = re.sub(
+                r'<code class="([^"]+)">',
+                _fix_code_class,
+                html_output,
+            )
+
             return html_output
         except ImportError:
             logger.warning("markdown library not installed, falling back to plain text HTML")
-            import html
-            escaped = html.escape(text)
-            lines = escaped.split("\n")
-            return "<br>".join(lines)
+            import html as html_mod
+            escaped = html_mod.escape(text)
+            # Preserve paragraph breaks (double newline) and line breaks
+            escaped = escaped.replace("\n\n", "</p><p>")
+            escaped = escaped.replace("\n", "<br>")
+            return f"<p>{escaped}</p>"

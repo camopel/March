@@ -30,7 +30,6 @@ from march.tools.registry import ToolRegistry, ToolNotFound
 logger = get_logger("march.agent", subsystem="agent")
 
 
-MAX_TOOL_ITERATIONS_DEFAULT = 100  # Default; overridden by config agent.max_tool_iterations
 MAX_LLM_RETRIES = 3  # Maximum retries on transient LLM errors
 RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff delays in seconds
 DEFAULT_CONTEXT_WINDOW = 200000  # Default context window in tokens
@@ -332,10 +331,11 @@ class Agent:
                 f"mention that the full conversation backup exists and can be searched.]"
             )
 
+
         tool_definitions = self.tools.definitions() if self.tools.tool_count > 0 else None
 
-        max_iterations = self._get_max_tool_iterations()
-        for iteration in range(max_iterations):
+        # Unlimited tool loop — runs until LLM stops calling tools
+        while True:
             # Call LLM with retry on transient errors
             llm_response = await self._call_llm_with_retry(
                 provider, messages, system_prompt, tool_definitions, mlog=mlog
@@ -385,14 +385,12 @@ class Agent:
             # Execute tool calls
             tool_results: list[ToolResult] = []
             for llm_tool_call in llm_response.tool_calls:
-                # Convert LLM ToolCall to core ToolCall
                 core_tool_call = ToolCall(
                     id=llm_tool_call.id,
                     name=llm_tool_call.name,
                     args=llm_tool_call.args,
                 )
 
-                # Plugin: before_tool (can block)
                 modified_call = await self.plugins.dispatch_before_tool(core_tool_call)
                 if modified_call is None:
                     tool_results.append(
@@ -405,12 +403,10 @@ class Agent:
 
                 core_tool_call = modified_call
 
-                # Execute the tool — errors are caught and fed back to the LLM
                 try:
                     _tool_t0 = time.monotonic()
                     result = await self.tools.execute(core_tool_call)
                     _tool_dur = (time.monotonic() - _tool_t0) * 1000
-                    # Plugin: after_tool
                     result = await self.plugins.dispatch_after_tool(core_tool_call, result)
                     mlog.tool_call(
                         tool=core_tool_call.name,
@@ -463,7 +459,6 @@ class Agent:
             }
             messages.append(assistant_msg)
 
-            # Add each tool result as a separate tool message
             for tr in tool_results:
                 content = tr.content if not tr.is_error else f"Error: {tr.error}"
                 messages.append(
@@ -474,33 +469,14 @@ class Agent:
                     }
                 )
 
-            # Also add to session history for persistence
-            assistant_message = Message.assistant(
-                content=llm_response.content,
-                tool_calls=[
-                    ToolCall(id=tc.id, name=tc.name, args=tc.args)
-                    for tc in llm_response.tool_calls
-                ],
-            )
-            tool_message = Message.tool(tool_results)
-            session.add_tool_exchange(assistant_message, tool_message)
+            # Tool call intermediate messages stay in `messages` (for current
+            # turn's LLM context) but are NOT added to session.history.
+            # Only the final assistant reply is saved via _finalize() →
+            # session.add_exchange(). This keeps session history clean:
+            # [user, assistant, user, assistant, ...]
 
             # Truncate messages if context is growing too large
             messages = self._truncate_messages(messages, context)
-
-        # If we hit the iteration limit, return whatever we have
-        mlog.max_iterations_reached(
-            session_id=session.id,
-            max_iterations=max_iterations,
-            tool_calls_made=tool_calls_made,
-        )
-        return AgentResponse(
-            content="I've reached the maximum number of tool call iterations. Please try breaking your request into smaller steps.",
-            tool_calls_made=tool_calls_made,
-            total_tokens=total_tokens,
-            total_cost=total_cost,
-            duration_ms=(time.monotonic() - start_time) * 1000,
-        )
 
     async def _call_llm_with_retry(
         self,
@@ -573,13 +549,6 @@ class Agent:
                 if first_provider:
                     context_window = first_provider.context_window
         return context_window
-
-    def _get_max_tool_iterations(self) -> int:
-        """Get max tool iterations from config (agent.max_tool_iterations)."""
-        if self.config:
-            return getattr(self.config.agent, 'max_tool_iterations',
-                           MAX_TOOL_ITERATIONS_DEFAULT)
-        return MAX_TOOL_ITERATIONS_DEFAULT
 
     def _truncate_messages(
         self,
@@ -785,8 +754,8 @@ class Agent:
 
         tool_definitions = self.tools.definitions() if self.tools.tool_count > 0 else None
 
-        max_iterations = self._get_max_tool_iterations()
-        for iteration in range(max_iterations):
+        # Unlimited tool loop — runs until LLM stops calling tools
+        while True:
             # Stream LLM response
             collected_content = ""
             collected_tool_calls: list[dict[str, Any]] = []
@@ -803,13 +772,11 @@ class Agent:
                         yield chunk
 
                     if chunk.tool_call_delta:
-                        # Accumulate tool call fragments (dict form)
                         self._merge_tool_call_delta(
                             collected_tool_calls, chunk.tool_call_delta
                         )
 
                     if chunk.delta_tool_call:
-                        # Accumulate tool call fragments (structured DeltaToolCall form, e.g. Bedrock)
                         dtc = chunk.delta_tool_call
                         self._merge_tool_call_delta(
                             collected_tool_calls,
@@ -840,7 +807,6 @@ class Agent:
                 yield StreamChunk(delta=f"\nError: {e}", finish_reason="error")
                 return
 
-            # Build an LLMResponse equivalent from collected data
             llm_tool_calls = self._parse_collected_tool_calls(collected_tool_calls)
 
             # If no tool calls, we're done
@@ -856,7 +822,7 @@ class Agent:
                 )
                 return
 
-            # Execute tool calls (same as non-streaming)
+            # Execute tool calls
             tool_results: list[ToolResult] = []
             for tc in llm_tool_calls:
                 core_tool_call = ToolCall(id=tc.id, name=tc.name, args=tc.args)
@@ -910,7 +876,6 @@ class Agent:
                 tool_results.append(result)
                 tool_calls_made += 1
 
-                # Yield a tool execution notification chunk
                 status = "✓" if not result.is_error else "✗"
                 yield StreamChunk(
                     delta="",
@@ -942,22 +907,10 @@ class Agent:
                     {"role": "tool", "tool_call_id": tr.id, "content": content}
                 )
 
-            # Add to session
-            assistant_message = Message.assistant(
-                content=collected_content,
-                tool_calls=[
-                    ToolCall(id=tc.id, name=tc.name, args=tc.args) for tc in llm_tool_calls
-                ],
-            )
-            tool_message = Message.tool(tool_results)
-            session.add_tool_exchange(assistant_message, tool_message)
+            # Tool call intermediate messages stay in `messages` only —
+            # not saved to session.history. See run() for explanation.
 
-            # Truncate if context is growing too large
             messages = self._truncate_messages(messages, context)
-        yield StreamChunk(
-            delta="\nReached maximum tool iterations.",
-            finish_reason="max_iterations",
-        )
 
     def _merge_tool_call_delta(
         self,
