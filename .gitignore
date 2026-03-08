@@ -55,3 +55,4 @@ htmlcov/
 # Internal planning docs (not for public release)
 PLAN.md
 SPEC.md
+config.yaml
