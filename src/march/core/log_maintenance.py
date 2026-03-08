@@ -18,7 +18,7 @@ logger = logging.getLogger("march.log_maintenance")
 LOG_TTL_DAYS: int = 30
 
 # Canonical subdirectories under ~/.march/logs/
-LOG_SUBDIRS = ("agent", "guardian", "turns", "metrics", "dashboard")
+LOG_SUBDIRS = ("agent", "turns", "metrics", "dashboard")
 
 
 def ensure_log_subdirectories(log_dir: Path | None = None) -> Path:
@@ -68,7 +68,6 @@ def cleanup_old_logs(log_dir: Path | None = None, ttl_days: int = LOG_TTL_DAYS) 
 _MIGRATION_MAP = {
     # old filename → (new subdir, new extension)
     "march.log": ("agent", ".log"),
-    "guardian.log": ("guardian", ".log"),
     "turns.jsonl": ("turns", ".jsonl"),
     "metrics.jsonl": ("metrics", ".jsonl"),
     "dashboard.log": ("dashboard", ".log"),

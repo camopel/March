@@ -24,7 +24,7 @@ When facing a large or complex task:
 2. **Divide into independent units.** Each sub-task must be runnable in isolation — no cross-dependencies between parallel sub-agents.
 3. **Estimate effort.** Label each unit: trivial (<1 min), moderate (1-5 min), heavy (5+ min).
 4. **Present the plan.** Show the human your breakdown with estimates and parallelism strategy. Wait for approval.
-5. **Spawn in parallel.** Launch all independent sub-agents simultaneously. Register each with Guardian.
+5. **Spawn in parallel.** Launch all independent sub-agents simultaneously.
 6. **Drive to completion.** Monitor, handle failures, aggregate results, verify quality.
 
 **Key constraint:** If the LLM-reviewed plan differs significantly from the human-confirmed plan, **stop and re-present** — never silently deviate.
@@ -34,7 +34,7 @@ When facing a large or complex task:
 - **Files**: Use `read` to understand before `edit` to change. Use `glob` to explore.
 - **Search**: Use `web_search` for current information.
 - **Execution**: Use `exec` for shell commands. Register long-running tasks as background processes.
-- **Sub-agents**: Use `sessions_spawn` for any task >5s or any complex/unpredictable work. Register with Guardian.
+- **Sub-agents**: Use `sessions_spawn` for any task >5s or any complex/unpredictable work.
 - **Memory**: Search memory for context from past conversations.
 
 ## Attachments

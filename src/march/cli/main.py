@@ -17,7 +17,6 @@ from march.cli.agent_cmd import agent
 from march.cli.skill_cmd import skill
 from march.cli.plugin_cmd import plugin
 from march.cli.log_cmd import log_group
-from march.cli.guardian_cmd import guardian
 from march.cli.start import start, stop, restart, enable, disable
 
 
@@ -49,7 +48,6 @@ cli.add_command(stop)
 cli.add_command(restart)
 cli.add_command(enable)
 cli.add_command(disable)
-cli.add_command(guardian)
 
 
 # ─── Help & Status ───
@@ -63,7 +61,7 @@ USAGE
   march <command> [options]
 
 LIFECYCLE
-  march start                  Init (if needed) + start agent + guardian + dashboard
+  march start                  Init (if needed) + start agent + dashboard
   march start --channel matrix Start with Matrix channel
   march start --all            Start all enabled channels
   march start --headless       WS proxy channel only (no interactive channels)
@@ -96,11 +94,6 @@ LOGS
   march log                    Follow log stream (default)
   march log -n 100             Last 100 lines + follow
   march log --no-follow        Print and exit
-
-GUARDIAN
-  march guardian start         Start guardian (background)
-  march guardian stop          Stop the guardian
-  march guardian status        Show watched entries
 
 Run 'march <command> -h' for detailed help.""")
 
@@ -163,9 +156,7 @@ def status() -> None:
         labels = []
         dashboard_url = None
         for _, cmd in pids:
-            if "guardian" in cmd:
-                labels.append("guardian")
-            elif "dashboard" in cmd:
+            if "dashboard" in cmd:
                 labels.append("dashboard")
                 # Extract port from cmdline if present
                 import re

@@ -4,7 +4,6 @@ from march.agents.manager import AgentManager, AgentManagerConfig, SpawnParams, 
 from march.agents.task_queue import TaskQueue
 from march.agents.registry import SubagentRegistry, RunRecord, RunOutcome
 from march.agents.announce import SubagentAnnouncer
-from march.agents.guardian import Guardian, GuardianConfig
 
 __all__ = [
     "AgentManager",
@@ -17,6 +16,4 @@ __all__ = [
     "RunRecord",
     "RunOutcome",
     "SubagentAnnouncer",
-    "Guardian",
-    "GuardianConfig",
 ]

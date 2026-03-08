@@ -1,4 +1,4 @@
-"""Tests for March agents: task queue, registry, manager, announcer, protocol, guardian."""
+"""Tests for March agents: task queue, registry, manager, announcer, protocol."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from march.agents.registry import SubagentRegistry, RunRecord, RunOutcome
 from march.agents.manager import AgentManager, AgentManagerConfig, SpawnParams, SpawnContext, SpawnResult
 from march.agents.announce import SubagentAnnouncer
 from march.agents.protocol import IPCMessage, MessageType
-from march.agents.guardian import Guardian, GuardianConfig, WatchEntry
 
 
 # ── Task Queue Tests ─────────────────────────────────────────────────────
@@ -437,54 +436,6 @@ class TestAgentManager:
         )
         logs = await manager.logs(result.run_id)
         assert any("logs test task" in line for line in logs)
-
-
-# ── Guardian Tests ───────────────────────────────────────────────────────
-
-class TestGuardian:
-    """Tests for the guardian process."""
-
-    @pytest.fixture
-    def guardian(self, tmp_path):
-        config = GuardianConfig(
-            check_interval=1,
-            march_config_path=str(tmp_path / "config.yaml"),
-        )
-        g = Guardian(config)
-        return g
-
-    @pytest.mark.asyncio
-    async def test_initialize(self, guardian):
-        await guardian.initialize()
-        status = guardian.status()
-        assert status["running"] is False
-        assert status["entries"] == []
-
-    def test_register_entry(self, guardian):
-        entry = WatchEntry(id="test-1", pid=os.getpid(), command="test process")
-        guardian.register(entry)
-        status = guardian.status()
-        assert len(status["entries"]) == 1
-        assert status["entries"][0]["id"] == "test-1"
-        assert status["entries"][0]["alive"] is True
-
-    def test_remove_entry(self, guardian):
-        entry = WatchEntry(id="test-2", pid=1, command="test")
-        guardian.register(entry)
-        assert guardian.remove("test-2")
-        assert not guardian.remove("nonexistent")
-
-    def test_register_restart(self, guardian, tmp_path):
-        config_path = Path(guardian.config.march_config_path)
-        config_path.write_text("test: config")
-
-        backup_path = guardian.register_restart()
-        assert backup_path
-        assert Path(backup_path).exists()
-
-    def test_is_pid_alive(self):
-        assert Guardian._is_pid_alive(os.getpid())
-        assert not Guardian._is_pid_alive(999999)  # Very unlikely to exist
 
 
 # ── Sub-agent Session Persistence Tests ──────────────────────────────────

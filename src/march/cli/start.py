@@ -10,19 +10,18 @@ import click
 @click.option("--all", "all_channels", is_flag=True, help="Start all enabled channels.")
 @click.option("--channel", multiple=True, help="Enable specific channel(s).")
 @click.option("--headless", is_flag=True, help="Plugins only, no channels.")
-@click.option("--no-guardian", is_flag=True, help="Don't start guardian.")
 @click.option("--no-dashboard", is_flag=True, help="Don't start dashboard.")
 @click.option("--dashboard-port", default=8200, help="Dashboard port.")
 def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: bool,
-          no_guardian: bool, no_dashboard: bool, dashboard_port: int) -> None:
+          no_dashboard: bool, dashboard_port: int) -> None:
     """Initialize (if needed) and start March.
 
     On first run, copies default templates to ~/.march/.
-    Then starts the agent, guardian, and dashboard.
+    Then starts the agent and dashboard.
 
     \b
     Examples:
-        march start                    # terminal + guardian + dashboard
+        march start                    # terminal + dashboard
         march start --channel matrix   # matrix channel
         march start --all              # all enabled channels
         march start --headless         # ws_proxy channel only
@@ -49,10 +48,9 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
     app = MarchApp(config=config_path)
 
     # Start services
-    guardian_pid = _start_subprocess("guardian", "start") if not no_guardian else None
     dashboard_pid = _start_subprocess("dashboard", "--port", str(dashboard_port), "--no-open") if not no_dashboard else None
 
-    child_pids = [p for p in (guardian_pid, dashboard_pid) if p]
+    child_pids = [p for p in (dashboard_pid,) if p]
 
     def _cleanup(signum=None, frame=None):
         for pid in child_pids:
@@ -69,7 +67,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
     try:
         if headless:
             click.echo("Starting March (headless)")
-            _print_services(guardian_pid, dashboard_pid, dashboard_port)
+            _print_services(dashboard_pid, dashboard_port)
             asyncio.run(app._run_headless())
             return
 
@@ -87,7 +85,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
             channels = ["terminal"]
 
         click.echo(f"Starting March — channels: {', '.join(channels)}")
-        _print_services(guardian_pid, dashboard_pid, dashboard_port)
+        _print_services(dashboard_pid, dashboard_port)
         app.run(channels=channels)
     finally:
         _cleanup()
@@ -95,7 +93,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
 
 @click.command("stop")
 def stop() -> None:
-    """Stop March and all its services (guardian, dashboard)."""
+    """Stop March and all its services (dashboard)."""
     import os
     import signal
 
@@ -108,7 +106,7 @@ def stop() -> None:
     for pid, cmdline in pids:
         try:
             os.kill(pid, signal.SIGTERM)
-            label = "guardian" if "guardian" in cmdline else "dashboard" if "dashboard" in cmdline else "agent"
+            label = "dashboard" if "dashboard" in cmdline else "agent"
             stopped.append(f"{label} (PID {pid})")
         except ProcessLookupError:
             pass
@@ -244,7 +242,7 @@ def _find_march_pids() -> list[tuple[int, str]]:
             if "march" not in cmdline:
                 continue
             if "march start" not in cmdline and "march.cli.main start" not in cmdline \
-               and "guardian" not in cmdline and "dashboard" not in cmdline:
+               and "dashboard" not in cmdline:
                 continue
             # Exclude management CLI commands
             if any(mc in cmdline for mc in mgmt_commands):
@@ -280,9 +278,7 @@ def _ensure_templates(config_dir) -> None:
         click.echo("")
 
 
-def _print_services(guardian_pid, dashboard_pid, dashboard_port) -> None:
-    if guardian_pid:
-        click.echo(f"  ✅ Guardian (PID {guardian_pid})")
+def _print_services(dashboard_pid, dashboard_port) -> None:
     if dashboard_pid:
         click.echo(f"  ✅ Dashboard: http://localhost:{dashboard_port}")
 

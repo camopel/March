@@ -1,9 +1,8 @@
-"""Tests for session memory, reset, and guardian.
+"""Tests for session memory and reset.
 
 Covers:
   - Session memory fields and MemoryStore interface
   - Session/orchestrator reset behavior (messages, DB, cache, cross-session isolation)
-  - Guardian module imports and configuration
   - Log structure expectations (xfail — not yet implemented)
 
 All tests run without external services. Uses pytest + pytest-asyncio.
@@ -349,43 +348,6 @@ class TestReset:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TestGuardian
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestGuardian:
-    """Guardian module imports and configuration."""
-
-    def test_guardian_module_imports(self):
-        """from march.cli.guardian_cmd import guardian works."""
-        from march.cli.guardian_cmd import guardian
-        assert guardian is not None
-        # Also verify the agent-side guardian imports
-        from march.agents.guardian import Guardian, GuardianConfig, run_guardian
-        assert Guardian is not None
-        assert GuardianConfig is not None
-        assert run_guardian is not None
-
-    def test_guardian_config(self):
-        """Guardian has configurable check_interval."""
-        from march.agents.guardian import GuardianConfig, Guardian
-
-        # Default check_interval
-        default_cfg = GuardianConfig()
-        assert hasattr(default_cfg, "check_interval")
-        assert isinstance(default_cfg.check_interval, int)
-        assert default_cfg.check_interval > 0
-
-        # Custom check_interval
-        custom_cfg = GuardianConfig(check_interval=60)
-        assert custom_cfg.check_interval == 60
-
-        # Guardian uses the config
-        g = Guardian(config=custom_cfg)
-        assert g.config.check_interval == 60
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # TestLogStructure (xfail — not yet implemented)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -394,11 +356,11 @@ class TestLogStructure:
     """Log directory structure and TTL cleanup verification."""
 
     def test_log_subdirectories(self):
-        """~/.march/logs/{agent,guardian,turns,metrics}/ should exist."""
+        """~/.march/logs/{agent,turns,metrics}/ should exist."""
         from march.core.log_maintenance import ensure_log_subdirectories
         log_base = Path.home() / ".march" / "logs"
         ensure_log_subdirectories(log_base)
-        expected_dirs = ["agent", "guardian", "turns", "metrics"]
+        expected_dirs = ["agent", "turns", "metrics"]
         for subdir in expected_dirs:
             d = log_base / subdir
             assert d.is_dir(), f"Expected log subdirectory {d} to exist"

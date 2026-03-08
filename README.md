@@ -4,7 +4,7 @@
 
 Most agent frameworks dump everything into the LLM context and you pay for every token. Sub-agents pollute shared memory. Crashes lose running tasks. Config changes break things at 3 AM.
 
-March fixes this. Plugin hooks control what enters context. Isolated memory so sub-agents can't corrupt the parent. A guardian that survives crashes and revives dead tasks. Multi-channel from a single `march start`.
+March fixes this. Plugin hooks control what enters context. Isolated memory so sub-agents can't corrupt the parent. Multi-channel from a single `march start`.
 
 ---
 
@@ -15,7 +15,7 @@ pip install git+https://github.com/camopel/March.git
 march start
 ```
 
-Two commands. Agent + guardian + dashboard running.
+Two commands. Agent + dashboard running.
 
 ```bash
 march enable                 # Install as systemd service (auto-start on boot)
@@ -25,7 +25,6 @@ march enable                 # Install as systemd service (auto-start on boot)
 
 - **Plugin pipeline** — before/after hooks on every step. Write a plugin in 10 lines.
 - **Isolated memory** — sub-agents can't pollute the parent session.
-- **Guardian process** — crash recovery, config rollback, restart protection.
 - **Multi-channel** — terminal, Matrix, WebSocket, IDE (ACP). One codebase.
 - **Cost tracking** — token counting on every LLM call.
 - **Pure Python** — Python 3.12+, no Node.js.
@@ -33,7 +32,7 @@ march enable                 # Install as systemd service (auto-start on boot)
 ## CLI
 
 ```
-march start                  Start agent + guardian + dashboard
+march start                  Start agent + dashboard
 march stop                   Stop all services
 march restart                Stop + start
 march enable / disable       Systemd service management
@@ -47,7 +46,6 @@ march config show            Show config path
 march agent list / show      Sub-agent management
 march skill list / install   Skill management
 march plugin list / enable   Plugin management
-march guardian status        Guardian watchdog
 ```
 
 ## Configuration
