@@ -10,18 +10,18 @@ import click
 @click.option("--all", "all_channels", is_flag=True, help="Start all enabled channels.")
 @click.option("--channel", multiple=True, help="Enable specific channel(s).")
 @click.option("--headless", is_flag=True, help="Plugins only, no channels.")
-@click.option("--no-dashboard", is_flag=True, help="Don't start dashboard.")
-@click.option("--dashboard-port", default=8200, help="Dashboard port.")
+@click.option("--no-dashboard", is_flag=True, help="Don't start dashboard (overrides config).")
+@click.option("--dashboard-port", default=None, type=int, help="Dashboard port (overrides config).")
 def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: bool,
-          no_dashboard: bool, dashboard_port: int) -> None:
+          no_dashboard: bool, dashboard_port: int | None) -> None:
     """Initialize (if needed) and start March.
 
     On first run, copies default templates to ~/.march/.
-    Then starts the agent and dashboard.
+    Then starts the agent and dashboard (if enabled in config).
 
     \b
     Examples:
-        march start                    # terminal + dashboard
+        march start                    # terminal + dashboard (if enabled)
         march start --channel matrix   # matrix channel
         march start --all              # all enabled channels
         march start --headless         # ws_proxy channel only
@@ -47,8 +47,14 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
     config_path = config_dir / "config.yaml"
     app = MarchApp(config=config_path)
 
-    # Start services
-    dashboard_pid = _start_subprocess("dashboard", "--port", str(dashboard_port), "--no-open") if not no_dashboard else None
+    # ── Dashboard: respect config, CLI flags override ──
+    dashboard_enabled = getattr(app.config.dashboard, "enabled", True) and not no_dashboard
+    resolved_dashboard_port = dashboard_port or getattr(app.config.dashboard, "port", 8200)
+    # Handle "auto" port string from config
+    if isinstance(resolved_dashboard_port, str):
+        resolved_dashboard_port = 8200 if resolved_dashboard_port == "auto" else int(resolved_dashboard_port)
+
+    dashboard_pid = _start_subprocess("dashboard", "--port", str(resolved_dashboard_port), "--no-open") if dashboard_enabled else None
 
     child_pids = [p for p in (dashboard_pid,) if p]
 
@@ -67,7 +73,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
     try:
         if headless:
             click.echo("Starting March (headless)")
-            _print_services(dashboard_pid, dashboard_port)
+            _print_services(dashboard_pid, resolved_dashboard_port)
             asyncio.run(app._run_headless())
             return
 
@@ -85,7 +91,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
             channels = ["terminal"]
 
         click.echo(f"Starting March — channels: {', '.join(channels)}")
-        _print_services(dashboard_pid, dashboard_port)
+        _print_services(dashboard_pid, resolved_dashboard_port)
         app.run(channels=channels)
     finally:
         _cleanup()
