@@ -720,8 +720,45 @@ class WSProxyPlugin(Plugin):
     async def _handle_list_sessions(self, request: Any) -> Any:
         import aiohttp.web as web
 
-        sessions = await self._db.list_sessions()
+        # Use synchronous sqlite to avoid event loop contention
+        # (aiosqlite can hang when the event loop is saturated by agent tasks)
+        try:
+            sessions = await asyncio.wait_for(self._db.list_sessions(), timeout=2.0)
+        except asyncio.TimeoutError:
+            sessions = self._list_sessions_sync()
         return web.json_response({"sessions": sessions})
+
+    def _list_sessions_sync(self) -> list[dict]:
+        """Synchronous fallback for listing sessions when event loop is busy."""
+        import sqlite3 as _sqlite3
+
+        db_path = str(self._db._store.db_path)
+        conn = _sqlite3.connect(db_path, timeout=1)
+        conn.row_factory = _sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE is_active = 1 ORDER BY last_active DESC"
+            ).fetchall()
+            results = []
+            for row in rows:
+                s = dict(row)
+                s["is_active"] = bool(s["is_active"])
+                msg = conn.execute(
+                    "SELECT content, role FROM messages WHERE session_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                s["last_message"] = msg["content"][:100] if msg else None
+                s["last_message_role"] = msg["role"] if msg else None
+                cnt = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                    (row["id"],),
+                ).fetchone()
+                s["message_count"] = cnt[0] if cnt else 0
+                results.append(s)
+            return results
+        finally:
+            conn.close()
 
     async def _handle_create_session(self, request: Any) -> Any:
         import aiohttp.web as web
@@ -729,8 +766,33 @@ class WSProxyPlugin(Plugin):
         body = await request.json()
         name = body.get("name", "New Chat")
         description = body.get("description", "")
-        result = await self._db.create_session(name, description)
+        try:
+            result = await asyncio.wait_for(
+                self._db.create_session(name, description), timeout=3.0
+            )
+        except asyncio.TimeoutError:
+            result = self._create_session_sync(name, description)
         return web.json_response(result, status=201)
+
+    def _create_session_sync(self, name: str, description: str = "") -> dict:
+        """Synchronous fallback for creating sessions."""
+        import sqlite3 as _sqlite3
+
+        db_path = str(self._db._store.db_path)
+        session_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _sqlite3.connect(db_path, timeout=1)
+        try:
+            conn.execute(
+                """INSERT INTO sessions (id, source_type, source_id, name, rolling_summary,
+                   compaction_summary, metadata, created_at, last_active, is_active)
+                   VALUES (?, 'ws', '', ?, '', '', ?, ?, ?, 1)""",
+                (session_id, name, json.dumps({"description": description}), now, now),
+            )
+            conn.commit()
+            return {"id": session_id, "name": name, "description": description, "created_at": now}
+        finally:
+            conn.close()
 
     async def _handle_delete_session(self, request: Any) -> Any:
         import aiohttp.web as web
