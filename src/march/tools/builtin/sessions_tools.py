@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import time
-import uuid
+from typing import Any
 
 from march.logging import get_logger
 from march.tools.base import tool
+from march.tools.context import current_session_id
 
 logger = get_logger("march.tools.sessions_tools")
+
+# Module-level reference set by MarchApp during initialization
+_agent_manager: Any = None
+
+
+def set_agent_manager(mgr: Any) -> None:
+    """Called by MarchApp to wire up the agent manager."""
+    global _agent_manager
+    _agent_manager = mgr
 
 
 @tool(name="sessions_list", description="List active agent sessions.")
@@ -24,13 +34,25 @@ async def sessions_list(
         active_only: Only show active sessions.
         label: Filter by session label.
     """
-    # In the full framework, this queries the session store.
-    # Stub implementation returns a formatted placeholder.
-    return (
-        "Sessions listing requires session store integration.\n"
-        f"Filters: kind={kind or 'all'}, active_only={active_only}, label={label or 'none'}\n\n"
-        "This tool will query SQLite session store when the full agent loop is connected."
-    )
+    if _agent_manager is None:
+        return (
+            "No active sessions (agent manager not initialized).\n"
+            f"Filters: kind={kind or 'all'}, active_only={active_only}, label={label or 'none'}"
+        )
+
+    statuses = await _agent_manager.list()
+    if kind:
+        statuses = [s for s in statuses if kind in s.child_key]
+    if active_only:
+        statuses = [s for s in statuses if s.status == "running"]
+
+    if not statuses:
+        return "No matching sessions."
+
+    lines = []
+    for s in statuses:
+        lines.append(f"- {s.child_key} ({s.status}, {s.duration_seconds:.0f}s) {s.task[:80]}")
+    return "\n".join(lines)
 
 
 @tool(name="sessions_history", description="Fetch message history from a session.")
@@ -67,16 +89,17 @@ async def sessions_send(
         session_id: Target session ID.
         message: Message text to inject.
     """
-    if not session_id:
-        return "Error: session_id is required"
-    if not message:
-        return "Error: message is required"
+    if not session_id or not message:
+        return "Error: session_id and message required"
+    if _agent_manager is None:
+        return (
+            f"Message queued for session: {session_id}\n"
+            f"Length: {len(message)} chars\n\n"
+            "Delivery requires active agent manager."
+        )
 
-    return (
-        f"Message queued for session: {session_id}\n"
-        f"Length: {len(message)} chars\n\n"
-        "Delivery requires active session store and agent loop."
-    )
+    ok = await _agent_manager.send(session_id, message)
+    return f"Message {'delivered' if ok else 'failed'}: {session_id}"
 
 
 @tool(name="sessions_spawn", description="Spawn a new sub-agent session for a task.")
@@ -96,16 +119,34 @@ async def sessions_spawn(
     """
     if not task:
         return "Error: task is required"
+    if _agent_manager is None:
+        import uuid as _uuid
+        session_id = f"subagent_{_uuid.uuid4().hex[:12]}"
+        return (
+            f"Sub-agent spawned (queued): {session_id}\n"
+            f"Label: {label or 'unlabeled'}\n"
+            f"Task: {task[:200]}\n\n"
+            "Agent manager not yet initialized. Sub-agent will run when ready."
+        )
 
-    session_id = f"subagent_{uuid.uuid4().hex[:12]}"
+    # Import here to avoid circular imports
+    from march.agents.manager import SpawnParams, SpawnContext
+
+    parent_session = current_session_id.get("")
+    result = await _agent_manager.spawn(
+        SpawnParams(task=task, label=label, model=model),
+        SpawnContext(requester_session=parent_session),
+    )
+
+    if result.status != "accepted":
+        return f"Error: {result.error}"
+
     return (
-        f"Sub-agent spawned: {session_id}\n"
+        f"Sub-agent spawned: {result.child_key}\n"
+        f"Run ID: {result.run_id}\n"
         f"Label: {label or 'unlabeled'}\n"
-        f"Model: {model or 'default'}\n"
-        f"Profile: {tool_profile}\n"
         f"Task: {task[:200]}\n\n"
-        "Sub-agent will run in the subagent lane. "
-        "Results auto-announce to the parent session."
+        "Auto-announces on completion, do not poll."
     )
 
 
@@ -122,23 +163,31 @@ async def subagents_tool(
         target: Sub-agent session ID (for steer/kill).
         message: Steering message (for steer action).
     """
+    if _agent_manager is None:
+        if action == "list":
+            return "No active or recent sub-agents (agent manager not initialized)."
+        return "Error: agent manager not initialized"
+
     if action == "list":
-        return (
-            "Sub-agent listing requires session registry integration.\n"
-            "This tool queries the sub-agent registry for the current session."
-        )
+        statuses = await _agent_manager.list()
+        if not statuses:
+            return "No active or recent sub-agents."
+        lines = []
+        for s in statuses:
+            lines.append(f"- {s.child_key} ({s.status}) task={s.task[:80]}")
+        return "\n".join(lines)
     elif action == "steer":
-        if not target:
-            return "Error: target session ID required"
-        if not message:
-            return "Error: message required for steer"
-        return f"Steering message sent to {target}: {message[:100]}"
+        if not target or not message:
+            return "Error: target and message required for steer"
+        ok = await _agent_manager.send(target, message)
+        return f"Steer {'sent' if ok else 'failed'}: {target}"
     elif action == "kill":
         if not target:
-            return "Error: target session ID required"
-        return f"Kill signal sent to sub-agent: {target}"
+            return "Error: target required for kill"
+        ok = await _agent_manager.kill(target)
+        return f"Kill {'sent' if ok else 'failed'}: {target}"
     else:
-        return f"Error: Unknown action '{action}'. Use: list, steer, kill"
+        return f"Error: Unknown action '{action}'"
 
 
 @tool(name="session_status", description="Get current session status: tokens, cost, model, runtime.")

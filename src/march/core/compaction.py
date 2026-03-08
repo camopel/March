@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 MIN_RECENT_KEEP = 10
 
 # When context exceeds this fraction of the window, trigger compaction
-COMPACTION_THRESHOLD = 0.90
+COMPACTION_THRESHOLD = 0.95
 
 # Reserve this fraction of the context window for the summary + new messages
 SUMMARY_BUDGET_RATIO = 0.15
@@ -97,9 +97,11 @@ def needs_compaction(
     messages: list[dict[str, Any]],
     context_window: int,
     system_tokens: int = 0,
+    threshold: float | None = None,
 ) -> bool:
     """Check if messages need compaction."""
-    available = int(context_window * COMPACTION_THRESHOLD) - system_tokens
+    _threshold = threshold if threshold is not None else COMPACTION_THRESHOLD
+    available = int(context_window * _threshold) - system_tokens
     total = estimate_messages_tokens(messages)
     return total > available and len(messages) > MIN_RECENT_KEEP
 
@@ -108,14 +110,16 @@ def split_for_compaction(
     messages: list[dict[str, Any]],
     context_window: int,
     system_tokens: int = 0,
+    summary_budget_ratio: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split messages into (old_to_summarize, recent_to_keep).
 
     Keeps enough recent messages to fit within the context window
     with room for the summary.
     """
+    _summary_budget_ratio = summary_budget_ratio if summary_budget_ratio is not None else SUMMARY_BUDGET_RATIO
     available = int(context_window * 0.8) - system_tokens
-    summary_budget = int(context_window * SUMMARY_BUDGET_RATIO)
+    summary_budget = int(context_window * _summary_budget_ratio)
     keep_budget = available - summary_budget
 
     # Walk backwards from the end, keeping messages until we hit the budget
@@ -193,38 +197,42 @@ Rules:
 - For conflicting/evolved facts, keep only the latest decision"""
 
 
-def _load_session_memory(session_id: str) -> tuple[str, str]:
-    """Load facts and plans from session memory separately.
+def _load_session_memory(session_id: str) -> dict[str, str]:
+    """Load all session memory types from disk.
+
+    Reads facts.md, plan.md, checkpoint.md, and progress.md from the
+    session memory directory. Also picks up any other .md/.txt files
+    and folds them into facts.
 
     Files are NOT cleared — they accumulate across compactions so every
     compaction sees the full facts and plans. This prevents important
     details from being lost across multiple compressions.
 
     Returns:
-        (facts_content, plan_content) — raw text from each file.
+        Dict with keys: "facts", "plan", "checkpoint", "progress" — raw text from each file.
     """
     from pathlib import Path
 
     memory_dir = Path.home() / ".march" / "memory" / session_id
+    result = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
+
     if not memory_dir.is_dir():
-        return "", ""
+        return result
 
-    facts = ""
-    plan = ""
+    known_files = {"facts.md", "plan.md", "checkpoint.md", "progress.md"}
 
-    facts_path = memory_dir / "facts.md"
-    plan_path = memory_dir / "plan.md"
-
-    if facts_path.exists():
-        facts = facts_path.read_text(encoding="utf-8", errors="replace").strip()
-    if plan_path.exists():
-        plan = plan_path.read_text(encoding="utf-8", errors="replace").strip()
+    for name, key in [("facts.md", "facts"), ("plan.md", "plan"),
+                      ("checkpoint.md", "checkpoint"), ("progress.md", "progress")]:
+        path = memory_dir / name
+        if path.exists():
+            result[key] = path.read_text(encoding="utf-8", errors="replace").strip()
 
     # Also pick up any other .md/.txt files as facts
+    extra_facts = ""
     for path in sorted(memory_dir.rglob("*")):
         if not path.is_file():
             continue
-        if path.name in ("facts.md", "plan.md"):
+        if path.name in known_files:
             continue
         if path.suffix.lower() not in (".md", ".txt"):
             continue
@@ -232,11 +240,14 @@ def _load_session_memory(session_id: str) -> tuple[str, str]:
             content = path.read_text(encoding="utf-8", errors="replace").strip()
             if content:
                 rel = path.relative_to(memory_dir)
-                facts += f"\n\n[{rel}]\n{content}"
+                extra_facts += f"\n\n[{rel}]\n{content}"
         except Exception:
             continue
 
-    return facts.strip(), plan.strip()
+    if extra_facts:
+        result["facts"] = (result["facts"] + extra_facts).strip()
+
+    return result
 
 
 async def _compress_facts(facts: str, max_tokens: int, summarize_fn, facts_path: str = "") -> str:
@@ -271,6 +282,151 @@ async def _compress_facts(facts: str, max_tokens: int, summarize_fn, facts_path:
         index += f"\n\n_Full details: `{facts_path}` (use read tool to access)_"
 
     return index
+
+
+MERGE_SESSION_MEMORY_PROMPT = """You are a memory deduplicator. You are given session memory (facts, plan, checkpoint, progress) and a new compaction summary.
+
+Your job: Deduplicate and merge, do NOT compress or lose detail. Remove only true duplicates and superseded entries.
+
+Rules:
+- If the same fact appears multiple times, keep only the latest version
+- If a fact was updated/evolved, keep only the final version
+- Merge overlapping information into single entries
+- Preserve ALL unique details, identifiers, paths, URLs, code snippets verbatim
+- Keep the structure organized with clear sections
+- Do NOT summarize or compress — maintain full detail level
+- Output clean markdown with sections: ## Facts, ## Plan, ## Checkpoint, ## Progress
+- Only include sections that have content
+- Target size: {target_tokens} tokens (~{target_chars} chars). Do not exceed this.
+
+Input:
+
+{memory_content}
+
+---
+New compaction summary:
+{new_summary}
+
+Output the merged, deduplicated session memory:"""
+
+
+async def merge_session_memory(
+    memory_dict: dict[str, str],
+    new_summary: str,
+    summarize_fn,
+    context_window: int,
+) -> str:
+    """Merge all session memory types with a new compaction summary.
+
+    Combines facts, plan, checkpoint, progress, and the new summary,
+    then asks the LLM to deduplicate (not compress) the result.
+
+    Args:
+        memory_dict: Dict with keys "facts", "plan", "checkpoint", "progress".
+        new_summary: The new compaction summary from summarizing old messages.
+        summarize_fn: Async function(prompt: str) -> str that calls the LLM.
+        context_window: Model's context window in tokens.
+
+    Returns:
+        Clean, merged carry-over summary string.
+    """
+    # Build combined memory content
+    parts = []
+    for section, key in [("Facts", "facts"), ("Plan", "plan"),
+                         ("Checkpoint", "checkpoint"), ("Progress", "progress")]:
+        content = memory_dict.get(key, "").strip()
+        if content:
+            parts.append(f"## {section}\n{content}")
+
+    memory_content = "\n\n".join(parts) if parts else "(no existing session memory)"
+
+    # Calculate size target: min(current_token_size, context_window * 0.30)
+    current_tokens = estimate_tokens(memory_content) + estimate_tokens(new_summary)
+    target_tokens = min(current_tokens, int(context_window * 0.30))
+    target_chars = target_tokens * 4
+
+    prompt = MERGE_SESSION_MEMORY_PROMPT.format(
+        target_tokens=target_tokens,
+        target_chars=target_chars,
+        memory_content=memory_content,
+        new_summary=new_summary,
+    )
+
+    try:
+        merged = await summarize_fn(prompt)
+        return merged.strip() if merged else new_summary
+    except Exception as e:
+        logger.error("merge_session_memory failed: %s — falling back to concatenation", e)
+        # Fallback: simple concatenation
+        fallback_parts = []
+        if memory_content and memory_content != "(no existing session memory)":
+            fallback_parts.append(memory_content)
+        if new_summary:
+            fallback_parts.append(f"## Recent Summary\n{new_summary}")
+        return "\n\n".join(fallback_parts)
+
+
+def _write_merged_session_memory(session_id: str, merged: str) -> None:
+    """Write merged session memory back to disk, overwriting existing files.
+
+    Parses the merged output into sections and writes each to the
+    corresponding file.
+    """
+    from pathlib import Path
+
+    memory_dir = Path.home() / ".march" / "memory" / session_id
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse sections from merged output
+    sections: dict[str, str] = {"facts": "", "plan": "", "checkpoint": "", "progress": ""}
+    current_section = None
+    current_lines: list[str] = []
+
+    for line in merged.split("\n"):
+        stripped = line.strip().lower()
+        if stripped.startswith("## fact"):
+            if current_section and current_lines:
+                sections[current_section] = "\n".join(current_lines).strip()
+            current_section = "facts"
+            current_lines = []
+        elif stripped.startswith("## plan"):
+            if current_section and current_lines:
+                sections[current_section] = "\n".join(current_lines).strip()
+            current_section = "plan"
+            current_lines = []
+        elif stripped.startswith("## checkpoint"):
+            if current_section and current_lines:
+                sections[current_section] = "\n".join(current_lines).strip()
+            current_section = "checkpoint"
+            current_lines = []
+        elif stripped.startswith("## progress"):
+            if current_section and current_lines:
+                sections[current_section] = "\n".join(current_lines).strip()
+            current_section = "progress"
+            current_lines = []
+        elif stripped.startswith("## recent summary"):
+            if current_section and current_lines:
+                sections[current_section] = "\n".join(current_lines).strip()
+            current_section = "facts"  # Fold recent summary into facts
+            current_lines = []
+        elif current_section is not None:
+            current_lines.append(line)
+
+    # Flush last section
+    if current_section and current_lines:
+        sections[current_section] = "\n".join(current_lines).strip()
+
+    # Write each section to its file (overwrite, not append)
+    file_map = {"facts": "facts.md", "plan": "plan.md",
+                "checkpoint": "checkpoint.md", "progress": "progress.md"}
+    for key, filename in file_map.items():
+        content = sections.get(key, "").strip()
+        path = memory_dir / filename
+        if content:
+            path.write_text(content, encoding="utf-8")
+        elif path.exists():
+            # Clear file if section is empty after merge
+            path.write_text("", encoding="utf-8")
 
 
 def delete_session_memory(session_id: str) -> bool:
@@ -385,6 +541,10 @@ async def compact_messages(
     summarize_fn,
     previous_summary: str | None = None,
     session_id: str | None = None,
+    threshold: float | None = None,
+    summary_budget_ratio: float | None = None,
+    facts_budget_ratio: float | None = None,
+    plan_budget_ratio: float | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Compact messages by summarizing old ones.
 
@@ -395,15 +555,20 @@ async def compact_messages(
         summarize_fn: Async function(prompt: str) -> str that calls the LLM.
         previous_summary: Previous compaction summary to include.
         session_id: Session ID for extracting facts/plans before compaction.
+        threshold: Optional compaction threshold (default from COMPACTION_THRESHOLD).
+        summary_budget_ratio: Optional summary budget ratio (default from SUMMARY_BUDGET_RATIO).
+        facts_budget_ratio: Optional facts budget ratio (default from FACTS_BUDGET_RATIO).
+        plan_budget_ratio: Optional plan budget ratio (default from PLAN_BUDGET_RATIO).
 
     Returns:
         (new_messages, summary_text) — new_messages starts with a summary
         message followed by recent messages.
     """
-    if not needs_compaction(messages, context_window, system_tokens):
+    if not needs_compaction(messages, context_window, system_tokens, threshold=threshold):
         return messages, previous_summary or ""
 
-    old, recent = split_for_compaction(messages, context_window, system_tokens)
+    old, recent = split_for_compaction(messages, context_window, system_tokens,
+                                       summary_budget_ratio=summary_budget_ratio)
 
     if not old:
         return messages, previous_summary or ""
@@ -431,39 +596,32 @@ async def compact_messages(
         # Fallback: just drop old messages without summary
         return recent, previous_summary or ""
 
-    # Fold session memory (facts + plans) into the summary with budget limits
-    # Facts: max 15% of context window, Plans: max 5% (plans never compressed)
+    # Smart merge: load all session memory types and merge with new summary
     if session_id:
-        facts, plan = _load_session_memory(session_id)
+        memory_dict = _load_session_memory(session_id)
 
-        if facts or plan:
-            facts_budget = int(context_window * FACTS_BUDGET_RATIO)
-            plan_budget = int(context_window * PLAN_BUDGET_RATIO)
-
-            # Compress facts if they exceed budget — creates an index, keeps original file
-            facts_tokens = estimate_tokens(facts) if facts else 0
-            if facts and facts_tokens > facts_budget:
-                logger.info(
-                    "Session facts exceed budget (%d > %d tokens), creating index",
-                    facts_tokens, facts_budget,
+        has_memory = any(v.strip() for v in memory_dict.values())
+        if has_memory:
+            try:
+                merged = await merge_session_memory(
+                    memory_dict, summary, summarize_fn, context_window,
                 )
-                from pathlib import Path
-                facts_path = str(Path.home() / ".march" / "memory" / session_id / "facts.md")
-                facts = await _compress_facts(facts, facts_budget, summarize_fn, facts_path)
-
-            # Truncate plan if it exceeds budget (no compression — just keep latest)
-            if plan and estimate_tokens(plan) > plan_budget:
-                max_chars = plan_budget * 4
-                plan = plan[-max_chars:]
-
-            memory_parts = []
-            if facts:
-                memory_parts.append(f"**Facts:**\n{facts}")
-            if plan:
-                memory_parts.append(f"**Plan:**\n{plan}")
-
-            if memory_parts:
-                summary = summary + "\n\n---\n\n**Preserved Session Memory:**\n" + "\n\n".join(memory_parts)
+                # Write merged result back to session memory files (overwrite)
+                _write_merged_session_memory(session_id, merged)
+                # Use the merged result as the carry-over summary
+                summary = merged
+            except Exception as e:
+                logger.error("Session memory merge failed (non-fatal): %s — using legacy fold", e)
+                # Fallback to legacy fold logic
+                summary = _legacy_fold_session_memory(
+                    summary, memory_dict, context_window,
+                    facts_budget_ratio or FACTS_BUDGET_RATIO,
+                    plan_budget_ratio or PLAN_BUDGET_RATIO,
+                    summarize_fn, session_id,
+                )
+        else:
+            # No session memory — just use the summary as-is
+            pass
 
     # Build the compacted message list
     summary_msg = {
@@ -482,3 +640,49 @@ async def compact_messages(
     )
 
     return compacted, summary
+
+
+async def _legacy_fold_session_memory(
+    summary: str,
+    memory_dict: dict[str, str],
+    context_window: int,
+    facts_budget_ratio: float,
+    plan_budget_ratio: float,
+    summarize_fn,
+    session_id: str,
+) -> str:
+    """Legacy fallback: fold session memory into summary with budget limits.
+
+    Used when merge_session_memory fails.
+    """
+    facts = memory_dict.get("facts", "")
+    plan = memory_dict.get("plan", "")
+
+    if not facts and not plan:
+        return summary
+
+    facts_budget = int(context_window * facts_budget_ratio)
+    plan_budget = int(context_window * plan_budget_ratio)
+
+    # Compress facts if they exceed budget
+    facts_tokens = estimate_tokens(facts) if facts else 0
+    if facts and facts_tokens > facts_budget:
+        from pathlib import Path
+        facts_path = str(Path.home() / ".march" / "memory" / session_id / "facts.md")
+        facts = await _compress_facts(facts, facts_budget, summarize_fn, facts_path)
+
+    # Truncate plan if it exceeds budget
+    if plan and estimate_tokens(plan) > plan_budget:
+        max_chars = plan_budget * 4
+        plan = plan[-max_chars:]
+
+    memory_parts = []
+    if facts:
+        memory_parts.append(f"**Facts:**\n{facts}")
+    if plan:
+        memory_parts.append(f"**Plan:**\n{plan}")
+
+    if memory_parts:
+        summary = summary + "\n\n---\n\n**Preserved Session Memory:**\n" + "\n\n".join(memory_parts)
+
+    return summary

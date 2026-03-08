@@ -140,6 +140,15 @@ class GlobalMemoryConfig(BaseModel):
     pass
 
 
+class CompactionConfig(BaseModel):
+    """Compaction configuration for context window management."""
+
+    threshold: float = 0.95  # Trigger compaction at this % of context window
+    summary_budget_ratio: float = 0.15
+    facts_budget_ratio: float = 0.15
+    plan_budget_ratio: float = 0.05
+
+
 class MemoryConfig(BaseModel):
     """Two-tier memory system configuration (FileMemory + SQLiteStore)."""
 
@@ -148,6 +157,7 @@ class MemoryConfig(BaseModel):
     tool_rules: str = "TOOLS.md"
     session: SessionMemoryConfig = Field(default_factory=SessionMemoryConfig)
     global_memory: GlobalMemoryConfig = Field(default_factory=GlobalMemoryConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
 
 # ─── Channel Configs ───

@@ -270,8 +270,16 @@ class Agent:
         context_window = self._get_context_window()
         system_tokens = context.estimated_tokens
 
-        if needs_compaction(messages, context_window, system_tokens):
-            old, recent = split_for_compaction(messages, context_window, system_tokens)
+        # Get compaction config if available
+        _compaction_threshold = None
+        _summary_budget_ratio = None
+        if self.config and hasattr(self.config, 'memory') and hasattr(self.config.memory, 'compaction'):
+            _compaction_threshold = self.config.memory.compaction.threshold
+            _summary_budget_ratio = self.config.memory.compaction.summary_budget_ratio
+
+        if needs_compaction(messages, context_window, system_tokens, threshold=_compaction_threshold):
+            old, recent = split_for_compaction(messages, context_window, system_tokens,
+                                                summary_budget_ratio=_summary_budget_ratio)
             if old:
                 # Extract facts/plans BEFORE compaction so nothing is lost
                 async def _summarize_sync(prompt: str) -> str:
@@ -689,7 +697,14 @@ class Agent:
         context_window = self._get_context_window()
         system_tokens = context.estimated_tokens
 
-        if needs_compaction(messages, context_window, system_tokens):
+        # Get compaction config if available
+        _compaction_threshold = None
+        _summary_budget_ratio = None
+        if self.config and hasattr(self.config, 'memory') and hasattr(self.config.memory, 'compaction'):
+            _compaction_threshold = self.config.memory.compaction.threshold
+            _summary_budget_ratio = self.config.memory.compaction.summary_budget_ratio
+
+        if needs_compaction(messages, context_window, system_tokens, threshold=_compaction_threshold):
             # Summarize old messages and permanently compact the session
             async def _summarize(prompt: str) -> str:
                 result = ""
@@ -702,7 +717,8 @@ class Agent:
                         result += chunk.delta
                 return result
 
-            old, recent = split_for_compaction(messages, context_window, system_tokens)
+            old, recent = split_for_compaction(messages, context_window, system_tokens,
+                                                summary_budget_ratio=_summary_budget_ratio)
             if old:
                 # Extract facts/plans BEFORE compaction so nothing is lost
                 try:

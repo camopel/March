@@ -166,6 +166,23 @@ class Orchestrator:
                 error=str(exc),
             )
 
+        # 2b. Deliver any pending sub-agent announcements
+        agent_manager = getattr(self.agent, "agent_manager", None)
+        if agent_manager is not None:
+            announcer = getattr(agent_manager, "announcer", None)
+            if announcer is not None and hasattr(announcer, "get_pending"):
+                try:
+                    pending = announcer.get_pending(session_id)
+                    if pending:
+                        for announcement in pending:
+                            session.add_system_message(announcement)
+                except Exception as exc:
+                    logger.warning(
+                        "failed to deliver pending announcements (non-fatal)",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
+
         # 3. Check for early cancellation
         if cancel.is_set():
             self._turn_log.turn_cancelled(turn_id=turn_id, session_id=session_id, partial_content_length=0)
@@ -337,6 +354,19 @@ class Orchestrator:
                 session_id=session_id,
                 error=str(exc),
             )
+
+        # 5. Reset sub-agent data: kill active children, delete their sessions/memory
+        agent_manager = getattr(self.agent, "agent_manager", None)
+        if agent_manager is not None:
+            try:
+                children_cleaned = await agent_manager.reset_children(session_id)
+                result["children_cleaned"] = children_cleaned
+            except Exception as exc:
+                logger.warning(
+                    "session reset children cleanup failed (non-fatal)",
+                    session_id=session_id,
+                    error=str(exc),
+                )
 
         return result
 

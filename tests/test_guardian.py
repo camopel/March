@@ -6,6 +6,7 @@ Covers:
   - Sub-agent & PID registration, deregistration, timeout notifications
   - Recovery (completion notification, crash handling, stale log detection)
   - Health-check loop behaviour
+  - Event persistence (events.jsonl) and notification file (notifications.jsonl)
 
 All tests run without external services. Uses pytest + pytest-asyncio.
 Each test is independent — no shared mutable state between tests.
@@ -29,11 +30,15 @@ import pytest
 from march.agents.guardian import (
     CONFIG_BACKUP_DIR,
     DEFAULT_STALE_THRESHOLD,
+    EVENTS_FILE,
     GUARDIAN_STATE_DIR,
+    NOTIFICATIONS_FILE,
+    GuardianEvent,
     REGISTRY_FILE,
     Guardian,
     GuardianConfig,
     WatchEntry,
+    MAX_PERSISTED_EVENTS,
     run_guardian,
 )
 
@@ -49,12 +54,16 @@ def tmp_guardian_dirs(tmp_path, monkeypatch):
     state_dir = tmp_path / "guardian"
     backup_dir = state_dir / "config_backups"
     registry = state_dir / "watched.json"
+    events_file = state_dir / "events.jsonl"
+    notifications_file = state_dir / "notifications.jsonl"
     state_dir.mkdir(parents=True)
     backup_dir.mkdir(parents=True)
 
     monkeypatch.setattr("march.agents.guardian.GUARDIAN_STATE_DIR", state_dir)
     monkeypatch.setattr("march.agents.guardian.CONFIG_BACKUP_DIR", backup_dir)
     monkeypatch.setattr("march.agents.guardian.REGISTRY_FILE", registry)
+    monkeypatch.setattr("march.agents.guardian.EVENTS_FILE", events_file)
+    monkeypatch.setattr("march.agents.guardian.NOTIFICATIONS_FILE", notifications_file)
 
     return state_dir, backup_dir, registry
 
@@ -172,8 +181,10 @@ class TestGuardianLifecycle:
 
     @pytest.mark.asyncio
     async def test_guardian_detects_main_crash(self, guardian, tmp_guardian_dirs):
-        """If a watched PID dies, guardian detects it and notifies."""
+        """If a watched PID dies, guardian detects it and writes notification."""
         await guardian.initialize()
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         # Register a fake PID that doesn't exist
         entry = WatchEntry(
@@ -184,16 +195,17 @@ class TestGuardianLifecycle:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            # Should have been notified about the dead PID
-            mock_notify.assert_called_once()
-            call_args = mock_notify.call_args
-            assert "room:!test:example.com" in call_args.args
-            assert "died" in call_args.args[1].lower() or "process" in call_args.args[1].lower()
+        # Should have written a notification
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert "pid_died" in data["event_type"]
+        assert "march main" in data["message"]
 
-        # Entry should have been removed
+        # Entry should have been removed (dead PID auto-removed)
         assert "main-proc" not in guardian._entries
 
     def test_is_pid_alive_with_current_process(self):
@@ -241,6 +253,8 @@ class TestGuardianConfigBackup:
         """If restart fails, recover_from_failed_restart tries config backups."""
         guardian.config.march_config_path = str(config_file)
         _, backup_dir, _ = tmp_guardian_dirs
+        state_dir = tmp_guardian_dirs[0]
+        notifications_file = state_dir / "notifications.jsonl"
 
         # Create a backup
         guardian.register_restart()
@@ -252,8 +266,7 @@ class TestGuardianConfigBackup:
 
         # Mock subprocess.run to simulate recovery success on backup
         with patch("subprocess.run") as mock_run, \
-             patch.object(guardian, "verify_after_restart", new_callable=AsyncMock, return_value=True), \
-             patch.object(guardian, "_notify", new_callable=AsyncMock):
+             patch.object(guardian, "verify_after_restart", new_callable=AsyncMock, return_value=True):
 
             mock_run.return_value = MagicMock(returncode=0)
             result = await guardian.recover_from_failed_restart()
@@ -264,25 +277,33 @@ class TestGuardianConfigBackup:
         assert "INVALID" not in restored_content
         assert "litellm" in restored_content
 
+        # Should have written a restart_recovered notification
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert any("restart_recovered" in line for line in lines)
+
     @pytest.mark.asyncio
     async def test_config_rollback_all_fail(self, guardian, config_file, tmp_guardian_dirs):
         """If all backups fail, recover_from_failed_restart returns False."""
         guardian.config.march_config_path = str(config_file)
+        state_dir = tmp_guardian_dirs[0]
+        notifications_file = state_dir / "notifications.jsonl"
 
         # Create a backup
         guardian.register_restart()
 
         # Mock everything to fail
-        with patch("subprocess.run", side_effect=Exception("fail")), \
-             patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-
+        with patch("subprocess.run", side_effect=Exception("fail")):
             result = await guardian.recover_from_failed_restart()
 
         assert result is False
-        # Should have sent failure notification
-        mock_notify.assert_called()
-        last_msg = mock_notify.call_args.args[1]
-        assert "failed" in last_msg.lower() or "❌" in last_msg
+        # Should have written a restart_failed notification
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) >= 1
+        last = json.loads(lines[-1])
+        assert last["event_type"] == "restart_failed"
+        assert "failed" in last["message"].lower()
 
     def test_backup_rotation(self, guardian, config_file, tmp_guardian_dirs):
         """Old backups beyond config_backup_count are pruned."""
@@ -398,9 +419,10 @@ class TestGuardianSubAgentRegistration:
 
     @pytest.mark.asyncio
     async def test_timeout_notification(self, guardian, tmp_guardian_dirs):
-        """If a registered task's log goes stale beyond timeout, guardian notifies."""
+        """If a registered task's log goes stale beyond timeout, guardian writes notification."""
         await guardian.initialize()
         state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         # Create a stale log file (modified long ago)
         log_file = state_dir / "stale_task.log"
@@ -419,20 +441,25 @@ class TestGuardianSubAgentRegistration:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            mock_notify.assert_called_once()
-            msg = mock_notify.call_args.args[1]
-            assert "stale" in msg.lower() or "Log" in msg
+        # Notification should be written
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["event_type"] == "log_stale"
+        assert "frozen" in data["message"].lower() or "stale" in data["message"].lower()
 
-        # Entry should be removed after notification
-        assert "stale-task" not in guardian._entries
+        # Stale log entries are NOT auto-removed (might recover)
+        assert "stale-task" in guardian._entries
 
     @pytest.mark.asyncio
     async def test_notification_target(self, guardian, tmp_guardian_dirs):
-        """Notification goes to the correct target channel/room."""
+        """Events include the correct entry_id for the triggering entry."""
         await guardian.initialize()
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         entry = WatchEntry(
             id="targeted-task",
@@ -442,17 +469,21 @@ class TestGuardianSubAgentRegistration:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            mock_notify.assert_called_once()
-            target_arg = mock_notify.call_args.args[0]
-            assert target_arg == "room:!specific-room:matrix.org"
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["entry_id"] == "targeted-task"
+        assert data["event_type"] == "pid_died"
 
     @pytest.mark.asyncio
     async def test_multiple_entries_independent(self, guardian, tmp_guardian_dirs):
         """Multiple registered entries are checked independently."""
         await guardian.initialize()
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         # One alive, one dead
         guardian.register(WatchEntry(
@@ -462,12 +493,18 @@ class TestGuardianSubAgentRegistration:
             id="dead-task", pid=999999, command="dead"
         ))
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock):
-            await guardian._check_entries()
+        await guardian._check_entries()
 
         # Alive should remain, dead should be removed
         assert "alive-task" in guardian._entries
         assert "dead-task" not in guardian._entries
+
+        # Should have one notification for the dead task
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["entry_id"] == "dead-task"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -480,11 +517,10 @@ class TestGuardianRecovery:
 
     @pytest.mark.asyncio
     async def test_parent_receives_completion(self, guardian, tmp_guardian_dirs):
-        """When a watched PID dies (completes), guardian notifies the target.
-
-        This is the mechanism by which the parent session learns a sub-agent finished.
-        """
+        """When a watched PID dies (completes), guardian writes notification."""
         await guardian.initialize()
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         entry = WatchEntry(
             id="completed-subagent",
@@ -494,19 +530,18 @@ class TestGuardianRecovery:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            mock_notify.assert_called_once()
-            target = mock_notify.call_args.args[0]
-            assert target == "room:!parent:example.com"
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["event_type"] == "pid_died"
+        assert data["entry_id"] == "completed-subagent"
 
     @pytest.mark.asyncio
     async def test_parent_continues_after_subagent_crash(self, guardian, tmp_guardian_dirs):
-        """If a sub-agent dies, the entry is removed so the parent can handle failure.
-
-        The guardian's job is detection + notification; the parent handles recovery.
-        """
+        """If a sub-agent dies, the entry is removed so the parent can handle failure."""
         await guardian.initialize()
 
         guardian.register(WatchEntry(
@@ -518,8 +553,7 @@ class TestGuardianRecovery:
             target="room:!parent:example.com",
         ))
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock):
-            await guardian._check_entries()
+        await guardian._check_entries()
 
         # Crashed entry removed, healthy remains
         assert "crashed-agent" not in guardian._entries
@@ -527,9 +561,10 @@ class TestGuardianRecovery:
 
     @pytest.mark.asyncio
     async def test_stale_log_detection(self, guardian, tmp_guardian_dirs):
-        """If a registered task's log goes stale, guardian detects and notifies."""
+        """If a registered task's log goes stale, guardian detects and writes notification."""
         await guardian.initialize()
         state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         log_file = state_dir / "stale.log"
         log_file.write_text("output")
@@ -546,18 +581,22 @@ class TestGuardianRecovery:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            mock_notify.assert_called_once()
-            msg = mock_notify.call_args.args[1]
-            assert "stale" in msg.lower() or "Log" in msg
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["event_type"] == "log_stale"
+        assert data["entry_id"] == "stale-log-task"
+        assert "frozen" in data["message"].lower() or "stale" in data["message"].lower()
 
     @pytest.mark.asyncio
     async def test_fresh_log_not_flagged(self, guardian, tmp_guardian_dirs):
         """A recently-modified log should NOT trigger stale detection."""
         await guardian.initialize()
         state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         log_file = state_dir / "fresh.log"
         log_file.write_text("recent output")
@@ -573,17 +612,19 @@ class TestGuardianRecovery:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            mock_notify.assert_not_called()
-
+        # No notification should be written
+        if notifications_file.exists():
+            assert notifications_file.read_text().strip() == ""
         assert "fresh-log-task" in guardian._entries
 
     @pytest.mark.asyncio
     async def test_missing_log_treated_as_stale(self, guardian, tmp_guardian_dirs):
         """If the log file doesn't exist, it's treated as stale."""
         await guardian.initialize()
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
 
         entry = WatchEntry(
             id="missing-log",
@@ -595,12 +636,54 @@ class TestGuardianRecovery:
         )
         guardian.register(entry)
 
-        with patch.object(guardian, "_notify", new_callable=AsyncMock) as mock_notify:
-            await guardian._check_entries()
+        await guardian._check_entries()
 
-            mock_notify.assert_called_once()
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["event_type"] == "log_stale"
 
-        assert "missing-log" not in guardian._entries
+        # Stale log entries are NOT auto-removed (might recover)
+        assert "missing-log" in guardian._entries
+
+    @pytest.mark.asyncio
+    async def test_stale_log_not_auto_removed(self, guardian, tmp_guardian_dirs):
+        """Stale log entries stay registered — they might recover."""
+        await guardian.initialize()
+        state_dir, _, _ = tmp_guardian_dirs
+
+        log_file = state_dir / "maybe_stale.log"
+        log_file.write_text("output")
+        old_time = time.time() - 1000
+        os.utime(log_file, (old_time, old_time))
+
+        entry = WatchEntry(
+            id="recoverable",
+            pid=os.getpid(),
+            log_path=str(log_file),
+            command="recoverable task",
+            timeout=60,
+        )
+        guardian.register(entry)
+
+        await guardian._check_entries()
+
+        # Entry should still be registered
+        assert "recoverable" in guardian._entries
+
+    @pytest.mark.asyncio
+    async def test_dead_pid_auto_removed(self, guardian, tmp_guardian_dirs):
+        """Dead PID entries are auto-removed — no point watching a gone process."""
+        await guardian.initialize()
+
+        guardian.register(WatchEntry(
+            id="gone-process", pid=999999, command="dead task"
+        ))
+
+        await guardian._check_entries()
+
+        assert "gone-process" not in guardian._entries
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -695,6 +778,226 @@ class TestGuardianHealthCheck:
                 if "memory" in str(c).lower()
             ]
             assert len(warning_calls) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestGuardianEventPersistence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGuardianEventPersistence:
+    """Event persistence (events.jsonl) and notification file (notifications.jsonl)."""
+
+    @pytest.mark.asyncio
+    async def test_send_to_main_agent_persists_event(self, guardian, tmp_guardian_dirs):
+        """_send_to_main_agent writes to events.jsonl."""
+        state_dir, _, _ = tmp_guardian_dirs
+        events_file = state_dir / "events.jsonl"
+        await guardian.initialize()
+
+        event = GuardianEvent(
+            ts=time.time(),
+            level="warning",
+            event_type="pid_died",
+            message="disk event",
+            entry_id="d1",
+        )
+        await guardian._send_to_main_agent(event)
+
+        assert events_file.exists()
+        lines = events_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["event_type"] == "pid_died"
+        assert data["entry_id"] == "d1"
+        assert data["message"] == "disk event"
+
+    @pytest.mark.asyncio
+    async def test_send_to_main_agent_writes_notification(self, guardian, tmp_guardian_dirs):
+        """_send_to_main_agent writes to notifications.jsonl."""
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
+        await guardian.initialize()
+
+        event = GuardianEvent(
+            ts=time.time(),
+            level="warning",
+            event_type="pid_died",
+            message="test notification",
+            entry_id="n1",
+        )
+        await guardian._send_to_main_agent(event)
+
+        assert notifications_file.exists()
+        lines = notifications_file.read_text().strip().splitlines()
+        assert len(lines) == 1
+        data = json.loads(lines[0])
+        assert data["event_type"] == "pid_died"
+        assert data["entry_id"] == "n1"
+        assert "[Guardian]" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_events_persisted(self, guardian, tmp_guardian_dirs):
+        """Multiple events are all persisted to events.jsonl and notifications.jsonl."""
+        state_dir, _, _ = tmp_guardian_dirs
+        events_file = state_dir / "events.jsonl"
+        notifications_file = state_dir / "notifications.jsonl"
+        await guardian.initialize()
+
+        for i in range(3):
+            event = GuardianEvent(
+                ts=time.time(),
+                level="warning",
+                event_type="pid_died",
+                message=f"event-{i}",
+                entry_id=f"e{i}",
+            )
+            await guardian._send_to_main_agent(event)
+
+        # All persisted to events.jsonl
+        lines = events_file.read_text().strip().splitlines()
+        assert len(lines) == 3
+
+        # All written to notifications.jsonl
+        nlines = notifications_file.read_text().strip().splitlines()
+        assert len(nlines) == 3
+
+    @pytest.mark.asyncio
+    async def test_event_rotation(self, guardian, tmp_guardian_dirs):
+        """Events file is rotated to keep at most MAX_PERSISTED_EVENTS."""
+        state_dir, _, _ = tmp_guardian_dirs
+        events_file = state_dir / "events.jsonl"
+        await guardian.initialize()
+
+        # Write more than MAX_PERSISTED_EVENTS
+        for i in range(MAX_PERSISTED_EVENTS + 20):
+            event = GuardianEvent(
+                ts=time.time(),
+                level="warning",
+                event_type="pid_died",
+                message=f"event-{i}",
+                entry_id=f"e{i}",
+            )
+            await guardian._send_to_main_agent(event)
+
+        lines = events_file.read_text().strip().splitlines()
+        assert len(lines) <= MAX_PERSISTED_EVENTS
+
+        # The newest events should be kept
+        last_data = json.loads(lines[-1])
+        assert last_data["message"] == f"event-{MAX_PERSISTED_EVENTS + 19}"
+
+    @pytest.mark.asyncio
+    async def test_guardian_event_dataclass(self):
+        """GuardianEvent serializes and deserializes correctly."""
+        event = GuardianEvent(
+            ts=1234567890.0,
+            level="warning",
+            event_type="pid_died",
+            message="test",
+            entry_id="e1",
+        )
+        d = event.to_dict()
+        restored = GuardianEvent.from_dict(d)
+        assert restored.ts == event.ts
+        assert restored.level == event.level
+        assert restored.event_type == event.event_type
+        assert restored.message == event.message
+        assert restored.entry_id == event.entry_id
+
+    @pytest.mark.asyncio
+    async def test_no_callback_pattern(self):
+        """Guardian no longer accepts on_event callback — uses file-based notifications."""
+        import inspect
+        sig = inspect.signature(Guardian.__init__)
+        param_names = list(sig.parameters.keys())
+        assert "on_event" not in param_names, "Guardian should not accept on_event parameter"
+
+    @pytest.mark.asyncio
+    async def test_check_interval_default_is_30(self):
+        """GuardianConfig.check_interval defaults to 30 seconds."""
+        cfg = GuardianConfig()
+        assert cfg.check_interval == 30
+
+    @pytest.mark.asyncio
+    async def test_main_session_id_field_exists(self):
+        """GuardianConfig has main_session_id field."""
+        cfg = GuardianConfig()
+        assert hasattr(cfg, "main_session_id")
+        assert cfg.main_session_id == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestDrainNotifications
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDrainNotifications:
+    """Test Guardian.drain_notifications() static method."""
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_notifications(self, guardian, tmp_guardian_dirs):
+        """drain_notifications reads and clears notifications.jsonl."""
+        state_dir, _, _ = tmp_guardian_dirs
+        notifications_file = state_dir / "notifications.jsonl"
+        await guardian.initialize()
+
+        # Write some notifications
+        for i in range(3):
+            event = GuardianEvent(
+                ts=time.time(),
+                level="warning",
+                event_type="pid_died",
+                message=f"msg-{i}",
+                entry_id=f"e{i}",
+            )
+            await guardian._send_to_main_agent(event)
+
+        # Drain them
+        notifications = Guardian.drain_notifications()
+        assert len(notifications) == 3
+        assert notifications[0]["entry_id"] == "e0"
+        assert notifications[2]["entry_id"] == "e2"
+        assert "[Guardian]" in notifications[0]["message"]
+
+        # File should be empty after drain
+        assert notifications_file.read_text().strip() == ""
+
+    @pytest.mark.asyncio
+    async def test_drain_empty_file(self, guardian, tmp_guardian_dirs):
+        """drain_notifications returns empty list when no notifications."""
+        await guardian.initialize()
+        notifications = Guardian.drain_notifications()
+        assert notifications == []
+
+    @pytest.mark.asyncio
+    async def test_drain_nonexistent_file(self, tmp_guardian_dirs, monkeypatch):
+        """drain_notifications returns empty list when file doesn't exist."""
+        state_dir, _, _ = tmp_guardian_dirs
+        # Make sure the file doesn't exist
+        nf = state_dir / "notifications.jsonl"
+        if nf.exists():
+            nf.unlink()
+        notifications = Guardian.drain_notifications()
+        assert notifications == []
+
+    @pytest.mark.asyncio
+    async def test_drain_clears_file(self, guardian, tmp_guardian_dirs):
+        """After drain, subsequent drain returns empty."""
+        state_dir, _, _ = tmp_guardian_dirs
+        await guardian.initialize()
+
+        event = GuardianEvent(
+            ts=time.time(), level="warning", event_type="pid_died",
+            message="once", entry_id="x",
+        )
+        await guardian._send_to_main_agent(event)
+
+        first = Guardian.drain_notifications()
+        assert len(first) == 1
+
+        second = Guardian.drain_notifications()
+        assert len(second) == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

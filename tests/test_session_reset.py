@@ -260,6 +260,80 @@ class TestReset:
         # When delete_session_memory returns True, the key should be set
         assert result.get("session_memory_deleted") is True
 
+    async def test_reset_calls_reset_children(self):
+        """reset_session calls agent_manager.reset_children when available."""
+        from march.core.agent import AgentResponse
+
+        agent = MockAgent([
+            StreamChunk(delta="Z"),
+            AgentResponse(content="Z"),
+        ])
+        # Set up a mock agent_manager on the agent
+        mock_manager = AsyncMock()
+        mock_manager.reset_children = AsyncMock(return_value=3)
+        agent.agent_manager = mock_manager
+
+        store = InMemorySessionStore()
+        orch = Orchestrator(agent=agent, session_store=store)
+
+        await _collect_events(orch, "sess-children-test", "Hello")
+
+        with patch("march.core.compaction.delete_session_memory", return_value=False):
+            result = await orch.reset_session("sess-children-test")
+
+        # Should have called reset_children with the session_id
+        mock_manager.reset_children.assert_called_once_with("sess-children-test")
+        assert result.get("children_cleaned") == 3
+
+    async def test_reset_without_agent_manager(self):
+        """reset_session works fine when agent has no agent_manager."""
+        from march.core.agent import AgentResponse
+
+        agent = MockAgent([
+            StreamChunk(delta="W"),
+            AgentResponse(content="W"),
+        ])
+        # Ensure no agent_manager attribute
+        assert not hasattr(agent, "agent_manager")
+
+        store = InMemorySessionStore()
+        orch = Orchestrator(agent=agent, session_store=store)
+
+        await _collect_events(orch, "sess-no-mgr", "Hello")
+
+        with patch("march.core.compaction.delete_session_memory", return_value=False):
+            result = await orch.reset_session("sess-no-mgr")
+
+        # Should succeed without children_cleaned key
+        assert isinstance(result, dict)
+        assert "children_cleaned" not in result
+
+    async def test_reset_children_failure_nonfatal(self):
+        """reset_session continues even if reset_children raises."""
+        from march.core.agent import AgentResponse
+
+        agent = MockAgent([
+            StreamChunk(delta="V"),
+            AgentResponse(content="V"),
+        ])
+        mock_manager = AsyncMock()
+        mock_manager.reset_children = AsyncMock(side_effect=RuntimeError("boom"))
+        agent.agent_manager = mock_manager
+
+        store = InMemorySessionStore()
+        orch = Orchestrator(agent=agent, session_store=store)
+
+        await _collect_events(orch, "sess-children-fail", "Hello")
+
+        with patch("march.core.compaction.delete_session_memory", return_value=True):
+            result = await orch.reset_session("sess-children-fail")
+
+        # Should still succeed (non-fatal)
+        assert isinstance(result, dict)
+        assert result.get("session_memory_deleted") is True
+        # children_cleaned should not be set since it failed
+        assert "children_cleaned" not in result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TestGuardian

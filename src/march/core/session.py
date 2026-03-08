@@ -92,6 +92,11 @@ class Session:
         self.history.append(message)
         self.last_active = time.time()
 
+    def add_system_message(self, content: str) -> None:
+        """Add a system message (e.g., sub-agent completion) to history."""
+        self.history.append(Message.system(content))
+        self.last_active = time.time()
+
     def add_exchange(self, user_message: str | list, assistant_content: str) -> None:
         """Add a user/assistant exchange to history."""
         self.history.append(Message.user(user_message))

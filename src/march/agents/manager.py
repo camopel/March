@@ -396,6 +396,8 @@ class AgentManager:
         Returns:
             Number of child records cleaned up.
         """
+        from march.core.compaction import delete_session_memory
+
         records = self.registry.list_for_requester(parent_session_key)
         cleaned = 0
 
@@ -403,6 +405,15 @@ class AgentManager:
             # Kill if still running
             if record.is_active:
                 await self.kill(record.run_id)
+
+            # Delete child's session memory files on disk
+            try:
+                delete_session_memory(record.child_key)
+            except Exception as e:
+                logger.warning(
+                    "reset_children: failed to delete session memory for %s: %s",
+                    record.child_key, e,
+                )
 
             # Delete child session if session store available
             if self._session_store:

@@ -151,8 +151,9 @@ class MarchApp:
         if skills_dir.is_dir():
             self.skill_loader.load_directory(skills_dir, registry=self.tool_registry)
 
-        # Initialize agent manager with task queue
+        # Initialize agent manager with task queue, announcer, and agent factory
         from march.agents.manager import AgentManager, AgentManagerConfig
+        from march.agents.announce import SubagentAnnouncer
         from march.agents.task_queue import TaskQueue
 
         agent_mgr_config = AgentManagerConfig(
@@ -164,15 +165,86 @@ class MarchApp:
             announce_timeout_seconds=self.config.agents.subagents.announce_timeout_seconds,
         )
         self.task_queue = TaskQueue()
+
+        # --- SubagentAnnouncer callbacks ---
+
+        async def _read_child_output(child_key: str) -> str:
+            """Read the last assistant message from a child session."""
+            if self.session_store is None:
+                return ""
+            messages = await self.session_store.get_messages(child_key)
+            # Find last assistant message
+            for msg in reversed(messages):
+                role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+                role_str = role.value if hasattr(role, "value") else str(role)
+                content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+                if role_str == "assistant":
+                    return str(content) if content else ""
+            return ""
+
+        async def _try_steer(requester_key: str, message: str) -> bool:
+            """Try to inject into parent's active turn — not implemented yet."""
+            return False
+
+        async def _try_queue(requester_key: str, message: str) -> bool:
+            """Queue message for delivery after parent's current turn."""
+            return False
+
+        async def _send_direct(requester_key: str, origin: str, message: str) -> None:
+            """Start a new agent turn with the completion message."""
+            orchestrator = getattr(self, "orchestrator", None)
+            if orchestrator:
+                session = orchestrator.get_cached_session(requester_key)
+                if session:
+                    session.add_system_message(message)
+                    return
+            raise RuntimeError("No orchestrator available for direct delivery")
+
+        announcer = SubagentAnnouncer(
+            read_child_output=_read_child_output,
+            try_steer=_try_steer,
+            try_queue=_try_queue,
+            send_direct=_send_direct,
+        )
+
+        # --- Agent factory ---
+
+        async def _create_child_agent(
+            task: str,
+            model: str,
+            tools: list[str] | None,
+            child_key: str,
+            parent_key: str,
+        ) -> str:
+            """Factory function to create and run a child agent."""
+            if self.session_store is None:
+                raise RuntimeError("session_store not initialized")
+            # Create a child session
+            child_session = await self.session_store.create_session(
+                source_type="subagent",
+                source_id=child_key,
+                name=f"subagent-{child_key}",
+                session_id=child_key,
+            )
+            # Run the agent with the task as user message
+            response = await self.agent.run(task, child_session)
+            return response.content
+
         self.agent_manager = AgentManager(
             config=agent_mgr_config,
             task_queue=self.task_queue,
             session_store=self.session_store,
+            agent_factory=_create_child_agent,
+            announcer=announcer,
         )
         await self.agent_manager.initialize()
 
         # Expose agent manager to the agent for sub-agent spawning
         self.agent.agent_manager = self.agent_manager
+
+        # Wire sessions tools to the real agent manager
+        from march.tools.builtin.sessions_tools import set_agent_manager
+        set_agent_manager(self.agent_manager)
 
         # Fire on_start hook
         await self.plugin_manager.dispatch_simple("on_start", self)

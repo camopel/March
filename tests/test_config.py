@@ -22,6 +22,7 @@ from march.config.schema import (
     AgentIdentityConfig,
     AgentsConfig,
     ChannelsConfig,
+    CompactionConfig,
     DashboardConfig,
     I18nConfig,
     LLMConfig,
@@ -117,6 +118,32 @@ class TestSchemaDefaults:
         assert config.system_rules == "SYSTEM.md"
         assert config.agent_profile == "AGENT.md"
         assert config.tool_rules == "TOOLS.md"
+
+    def test_compaction_config_defaults(self):
+        config = CompactionConfig()
+        assert config.threshold == 0.95
+        assert config.summary_budget_ratio == 0.15
+        assert config.facts_budget_ratio == 0.15
+        assert config.plan_budget_ratio == 0.05
+
+    def test_compaction_config_override(self):
+        config = CompactionConfig(threshold=0.80, summary_budget_ratio=0.20)
+        assert config.threshold == 0.80
+        assert config.summary_budget_ratio == 0.20
+        # Unset fields keep defaults
+        assert config.facts_budget_ratio == 0.15
+        assert config.plan_budget_ratio == 0.05
+
+    def test_memory_config_has_compaction(self):
+        config = MemoryConfig()
+        assert hasattr(config, "compaction")
+        assert isinstance(config.compaction, CompactionConfig)
+        assert config.compaction.threshold == 0.95
+
+    def test_march_config_compaction_access(self):
+        config = MarchConfig()
+        assert config.memory.compaction.threshold == 0.95
+        assert config.memory.compaction.summary_budget_ratio == 0.15
 
     def test_channels_config_defaults(self):
         config = ChannelsConfig()
