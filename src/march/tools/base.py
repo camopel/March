@@ -166,7 +166,7 @@ class Tool:
         description: Description for the LLM.
         parameters: JSON Schema for parameters.
         fn: The async callable to execute.
-        source: Where this tool comes from (e.g. "builtin", "mcp:server_name", "skill:name").
+        source: Where this tool comes from (e.g. "builtin", "mcp:server_name").
     """
 
     name: str

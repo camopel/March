@@ -2,7 +2,7 @@
 
 Two-tier facade:
   Tier 1: FileMemory (human-readable markdown files)
-  Tier 2: SQLiteStore (structured data — sessions, messages, analytics, skill state)
+  Tier 2: SQLiteStore (structured data — sessions, messages, analytics)
 
 MEMORY.md is loaded into context every turn and written to directly via /rmb.
 Agent session logs serve as detailed memory.
@@ -26,7 +26,7 @@ class MemoryStore:
     """Unified memory interface (facade).
 
     Two-tier: FileMemory for human-readable markdown, SQLiteStore for
-    structured data (sessions, messages, analytics, skill state).
+    structured data (sessions, messages, analytics).
     """
 
     def __init__(
@@ -192,11 +192,3 @@ class MemoryStore:
             cost=cost,
             provider=provider,
         )
-
-    # ── Skill state passthrough ──
-
-    async def get_skill_state(self, skill_name: str, key: str) -> str | None:
-        return await self.sqlite.get_skill_state(skill_name, key)
-
-    async def set_skill_state(self, skill_name: str, key: str, value: str) -> None:
-        await self.sqlite.set_skill_state(skill_name, key, value)

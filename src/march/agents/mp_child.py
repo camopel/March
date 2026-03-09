@@ -516,13 +516,6 @@ async def _async_child_main(
     from march.tools.builtin import register_all_builtin_tools
     register_all_builtin_tools(tool_registry)
 
-    # Load skills
-    from march.tools.skills.loader import SkillLoader
-    skills_dir = Path.cwd() / "skills"
-    skill_loader = SkillLoader()
-    if skills_dir.is_dir():
-        skill_loader.load_directory(skills_dir, registry=tool_registry)
-
     # Plugin manager (empty — mpAgent runs without plugins for isolation)
     plugin_manager = PluginManager()
 

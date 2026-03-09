@@ -39,12 +39,11 @@ march enable / disable       Systemd service management
 
 march chat                   Interactive terminal session
 march chat "prompt"          One-shot mode
-march status                 Health, version, model, plugins, skills
+march status                 Health, version, model, plugins, channels
 march log                    Follow log stream
 
 march config show            Show config path
 march agent list / show      Sub-agent management
-march skill list / install   Skill management
 march plugin list / enable   Plugin management
 ```
 

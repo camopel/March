@@ -1,7 +1,7 @@
 """MarchApp — The main entry point and framework API.
 
 Wires together all components: config, logging, LLM router, tool registry,
-plugin manager, memory store, skill loader, agent, and channels.
+plugin manager, memory store, agent, and channels.
 
 Provides the decorator-based framework API (@app.plugin, @app.tool, app.run()).
 """
@@ -26,8 +26,6 @@ from march.plugins._base import Plugin
 from march.plugins._manager import PluginManager
 from march.tools.base import tool as tool_decorator
 from march.tools.registry import ToolRegistry
-from march.tools.skills.loader import SkillLoader
-from march.tools.skills.base import Skill
 
 logger = get_logger("march.app")
 
@@ -49,7 +47,6 @@ class MarchApp:
             async def before_llm(self, context, message):
                 return context, message
 
-        app.load_skill("./skills/my-skill/")
         app.run(channels=["terminal"])
     """
 
@@ -74,7 +71,6 @@ class MarchApp:
         self.llm_router = LLMRouter(config=router_config, providers={})
         self.tool_registry = ToolRegistry()
         self.plugin_manager = PluginManager()
-        self.skill_loader = SkillLoader()
         self.memory_store = MemoryStore(
             workspace=Path.cwd(),
             config_dir=Path.home() / ".march",
@@ -146,11 +142,6 @@ class MarchApp:
         # Register all builtin tools
         from march.tools.builtin import register_all_builtin_tools
         register_all_builtin_tools(self.tool_registry)
-
-        # Load skills from directory
-        skills_dir = Path.cwd() / "skills"
-        if skills_dir.is_dir():
-            self.skill_loader.load_directory(skills_dir, registry=self.tool_registry)
 
         # Initialize agent manager with task queue, announcer, and agent factory
         from march.agents.manager import AgentManager, AgentManagerConfig
@@ -421,27 +412,6 @@ class MarchApp:
         self.llm_router.providers[name] = provider
         if name not in self.llm_router.config.fallback_chain:
             self.llm_router.config.fallback_chain.append(name)
-
-    def load_skill(self, path: str | Path) -> Skill | None:
-        """Load a skill from a directory.
-
-        Args:
-            path: Path to the skill directory.
-
-        Returns:
-            The loaded Skill, or None if loading failed.
-        """
-        skill_path = Path(path)
-        if not skill_path.is_dir():
-            logger.warning("Skill directory not found: %s", skill_path)
-            return None
-
-        try:
-            skill = self.skill_loader.load(skill_path, registry=self.tool_registry)
-            return skill
-        except Exception as e:
-            logger.error("Failed to load skill from %s: %s", skill_path, e)
-            return None
 
     # ── Framework API: Run ──
 

@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import structlog
 
-from march.logging.audit import AuditTrail
 from march.logging.formatters import format_for_audit, get_console_processor, get_json_processor
 from march.logging.handlers import SQLiteAuditHandler, get_file_handler
 from march.logging.logger import (
@@ -46,12 +45,6 @@ def audit_db(tmp_path: Path) -> Path:
 def audit_handler(audit_db: Path) -> SQLiteAuditHandler:
     """Create a SQLiteAuditHandler with a temp database."""
     return SQLiteAuditHandler(audit_db)
-
-
-@pytest.fixture
-def audit_trail(audit_db: Path) -> AuditTrail:
-    """Create an AuditTrail with a temp database."""
-    return AuditTrail(audit_db)
 
 
 @pytest.fixture
@@ -359,94 +352,3 @@ class TestMarchLogger:
         configure_logging()
         logger = MarchLogger(session_id="test")
         logger.config_loaded(path="/home/user/.march/config.yaml")
-
-
-# ─── Audit Trail Tests ───
-
-
-class TestAuditTrail:
-    """Test the high-level audit trail interface."""
-
-    def test_create_audit_trail(self, audit_trail: AuditTrail):
-        assert audit_trail.db_path.name == "audit.db"
-
-    def test_record_tool_execution(self, audit_trail: AuditTrail):
-        audit_trail.record_tool_execution(
-            tool="exec",
-            args={"command": "ls -la"},
-            result_summary="12 files",
-            duration_ms=45.0,
-            session_id="test-session",
-        )
-        results = audit_trail.query(event="tool.call")
-        assert len(results) == 1
-        assert results[0]["data"]["tool"] == "exec"
-
-    def test_record_blocked_action(self, audit_trail: AuditTrail):
-        audit_trail.record_blocked_action(
-            action="rm -rf /",
-            reason="dangerous command",
-            plugin="safety",
-            session_id="test-session",
-        )
-        results = audit_trail.query(event="security.blocked")
-        assert len(results) == 1
-        assert results[0]["data"]["action"] == "rm -rf /"
-
-    def test_record_config_change(self, audit_trail: AuditTrail):
-        audit_trail.record_config_change(
-            key="llm.default",
-            old_value="bedrock",
-            new_value="openai",
-        )
-        results = audit_trail.query(event="config.change")
-        assert len(results) == 1
-        assert results[0]["data"]["key"] == "llm.default"
-
-    def test_query_empty(self, audit_trail: AuditTrail):
-        results = audit_trail.query()
-        assert results == []
-
-    def test_clear(self, audit_trail: AuditTrail):
-        audit_trail.record_tool_execution(
-            tool="exec", args={}, result_summary="ok",
-            duration_ms=10.0,
-        )
-        assert len(audit_trail.query()) == 1
-        count = audit_trail.clear()
-        assert count == 1
-        assert len(audit_trail.query()) == 0
-
-    def test_multiple_records(self, audit_trail: AuditTrail):
-        for i in range(5):
-            audit_trail.record_tool_execution(
-                tool=f"tool_{i}",
-                args={"index": i},
-                result_summary=f"result {i}",
-                duration_ms=float(i * 10),
-                session_id=f"session-{i % 2}",
-            )
-        all_results = audit_trail.query()
-        assert len(all_results) == 5
-
-        session_0 = audit_trail.query(session_id="session-0")
-        assert len(session_0) == 3  # i=0,2,4
-
-        session_1 = audit_trail.query(session_id="session-1")
-        assert len(session_1) == 2  # i=1,3
-
-    def test_handler_property(self, audit_trail: AuditTrail):
-        """The handler should be attachable to a stdlib logger."""
-        handler = audit_trail.handler
-        assert isinstance(handler, SQLiteAuditHandler)
-
-    def test_direct_record(self, audit_trail: AuditTrail):
-        """Direct record() method should store events."""
-        audit_trail.record(
-            "security.blocked",
-            session_id="s1",
-            action="bad_thing",
-            reason="not allowed",
-        )
-        results = audit_trail.query(event="security.blocked")
-        assert len(results) == 1

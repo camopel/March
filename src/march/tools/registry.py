@@ -1,6 +1,6 @@
 """Tool registry for the March agent framework.
 
-Unified registry for builtin, MCP, and skill tools. Handles registration,
+Unified registry for builtin and MCP tools. Handles registration,
 schema generation for LLM APIs, and tool call execution.
 """
 

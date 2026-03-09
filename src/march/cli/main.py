@@ -14,7 +14,6 @@ from march import __version__
 from march.cli.chat import chat
 from march.cli.config_cmd import config
 from march.cli.agent_cmd import agent
-from march.cli.skill_cmd import skill
 from march.cli.plugin_cmd import plugin
 from march.cli.log_cmd import log_group
 from march.cli.start import start, stop, restart, enable, disable
@@ -40,7 +39,6 @@ def cli(ctx: click.Context) -> None:
 cli.add_command(chat)
 cli.add_command(config)
 cli.add_command(agent)
-cli.add_command(skill)
 cli.add_command(plugin)
 cli.add_command(log_group, name="log")
 cli.add_command(start)
@@ -76,16 +74,13 @@ INTERACTIVE
 
 CONFIGURATION
   march config show            Show config file path
-  march status                 Health, version, model, plugins, skills
+  march status                 Health, version, model, plugins, channels
 
 AGENTS
   march agent list             List active sub-agents
   march agent show             Show agent details (db, logs, memory, files)
 
-SKILLS & PLUGINS
-  march skill list             List installed skills
-  march skill install PATH     Install a skill from path
-  march skill show NAME        Show skill details
+PLUGINS
   march plugin list            List active plugins
   march plugin enable NAME     Enable a plugin
   march plugin disable NAME    Disable a plugin
@@ -100,7 +95,7 @@ Run 'march <command> -h' for detailed help.""")
 
 @cli.command()
 def status() -> None:
-    """Health, version, model, plugins, skills, channels."""
+    """Health, version, model, plugins, channels."""
     import yaml
     from pathlib import Path
 
@@ -138,16 +133,6 @@ def status() -> None:
     # Plugins
     plugins = raw.get("plugins", {}).get("enabled", [])
     click.echo(f"  Plugins:   {', '.join(plugins) if plugins else 'none'}")
-
-    # Skills
-    skills_dirs = [Path.cwd() / "skills", Path.home() / ".march" / "skills"]
-    skill_names = []
-    for sd in skills_dirs:
-        if sd.is_dir():
-            for child in sd.iterdir():
-                if child.is_dir() and (child / "SKILL.md").exists():
-                    skill_names.append(child.name)
-    click.echo(f"  Skills:    {', '.join(skill_names) if skill_names else 'none'}")
 
     # Process check
     from march.cli.start import _find_march_pids

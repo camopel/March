@@ -53,11 +53,3 @@ class SQLiteStore:
     ) -> None:
         """No-op — cost tracking is handled by the CostPlugin in-memory."""
         pass
-
-    async def get_skill_state(self, skill_name: str, key: str) -> str | None:
-        """No-op — skill state not currently used."""
-        return None
-
-    async def set_skill_state(self, skill_name: str, key: str, value: str) -> None:
-        """No-op — skill state not currently used."""
-        pass

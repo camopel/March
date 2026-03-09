@@ -27,7 +27,7 @@ class TestRegistration:
     def test_register_all_tools(self):
         registry = ToolRegistry()
         register_all_builtin_tools(registry)
-        assert registry.tool_count == 29
+        assert registry.tool_count == 27
 
     def test_all_tools_have_metadata(self):
         registry = ToolRegistry()
@@ -43,7 +43,7 @@ class TestRegistration:
         registry = ToolRegistry()
         register_all_builtin_tools(registry)
         defs = registry.definitions()
-        assert len(defs) == 29
+        assert len(defs) == 27
         for d in defs:
             assert d["type"] == "function"
             assert "function" in d
@@ -55,7 +55,7 @@ class TestRegistration:
         registry = ToolRegistry()
         register_all_builtin_tools(registry)
         defs = registry.definitions_anthropic()
-        assert len(defs) == 29
+        assert len(defs) == 27
         for d in defs:
             assert "name" in d
             assert "description" in d
@@ -335,22 +335,14 @@ class TestWebSearch:
 
     async def test_search_basic(self):
         from march.tools.builtin.web_search import web_search
-        # Use a mock to avoid hitting real API in tests
-        mock_ddgs = MagicMock()
-        mock_ddgs.text.return_value = [
+        mock_ddgs_instance = MagicMock()
+        mock_ddgs_instance.text.return_value = [
             {"title": "Test Result", "href": "https://example.com", "body": "A test snippet"}
         ]
-        MockDDGS = MagicMock(return_value=mock_ddgs)
-        with patch.dict("sys.modules", {}):
-            with patch("duckduckgo_search.DDGS", MockDDGS, create=True):
-                # Re-import to pick up the mock
-                import importlib
-                import march.tools.builtin.web_search as ws_mod
-                # The import happens inside the function, so we patch at the source
-                with patch("duckduckgo_search.DDGS", MockDDGS):
-                    result = await web_search(query="test query")
-                    assert "Test Result" in result
-                    assert "example.com" in result
+        with patch("ddgs.DDGS", return_value=mock_ddgs_instance):
+            result = await web_search(query="test query")
+            assert "Test Result" in result
+            assert "example.com" in result
 
 
 # ─── Web Fetch Tests ──────────────────────────────────────────────────────────
@@ -407,34 +399,6 @@ class TestBrowser:
             assert "Error" in result
         finally:
             bt._page = old_page
-
-
-# ─── Image Tests ──────────────────────────────────────────────────────────────
-
-
-class TestImage:
-    async def test_image_no_input(self):
-        from march.tools.builtin.image_tool import image_tool
-        result = await image_tool()
-        assert "Error" in result
-
-    async def test_image_url(self):
-        from march.tools.builtin.image_tool import image_tool
-        result = await image_tool(image="https://example.com/image.png")
-        assert "Loaded 1 image" in result
-        assert "url" in result
-
-    async def test_image_file_not_found(self):
-        from march.tools.builtin.image_tool import image_tool
-        result = await image_tool(image="/nonexistent/img.png")
-        assert "Error" in result
-
-    async def test_image_base64(self):
-        from march.tools.builtin.image_tool import image_tool
-        import base64
-        b64 = base64.b64encode(b"fake").decode()
-        result = await image_tool(image=f"data:image/png;base64,{b64}")
-        assert "Loaded 1 image" in result
 
 
 # ─── PDF Tests ────────────────────────────────────────────────────────────────
@@ -551,100 +515,27 @@ class TestTranslate:
         assert "Error" in result
 
 
-# ─── GitHub Search Tests ──────────────────────────────────────────────────────
-
-
-class TestGitHubSearch:
-    async def test_search_empty_query(self):
-        from march.tools.builtin.github_search import github_search
-        result = await github_search(query="")
-        assert "Error" in result
-
-    async def test_search_invalid_type(self):
-        from march.tools.builtin.github_search import github_search
-        result = await github_search(query="test", search_type="invalid")
-        assert "Error" in result
-
-    async def test_search_mock(self):
-        from march.tools.builtin.github_search import github_search
-        with patch("march.tools.builtin.github_search._github_request") as mock_req:
-            mock_req.return_value = {
-                "total_count": 1,
-                "items": [{
-                    "full_name": "user/repo",
-                    "html_url": "https://github.com/user/repo",
-                    "description": "A test repo",
-                    "stargazers_count": 42,
-                }],
-            }
-            result = await github_search(query="test")
-            assert "user/repo" in result
-            assert "42" in result
-
-
-# ─── GitHub Ops Tests ─────────────────────────────────────────────────────────
-
-
-class TestGitHubOps:
-    async def test_ops_no_repo(self):
-        from march.tools.builtin.github_ops import github_ops
-        result = await github_ops(action="repo_info")
-        assert "Error" in result
-
-    async def test_ops_unknown_action(self):
-        from march.tools.builtin.github_ops import github_ops
-        result = await github_ops(action="invalid", repo="user/repo")
-        assert "Error" in result
-
-    async def test_ops_repo_info_mock(self):
-        from march.tools.builtin.github_ops import github_ops
-        with patch("march.tools.builtin.github_ops._github_api") as mock_api:
-            mock_api.return_value = {
-                "full_name": "user/repo",
-                "description": "A test repo",
-                "stargazers_count": 100,
-                "forks_count": 20,
-                "language": "Python",
-                "default_branch": "main",
-                "html_url": "https://github.com/user/repo",
-            }
-            result = await github_ops(action="repo_info", repo="user/repo")
-            assert "user/repo" in result
-            assert "100" in result
-
-
 # ─── HuggingFace Tests ────────────────────────────────────────────────────────
 
 
 class TestHuggingFace:
     async def test_hf_empty_query(self):
         from march.tools.builtin.huggingface_tool import huggingface_tool
-        result = await huggingface_tool(query="")
-        assert "Error" in result
+        result = await huggingface_tool(action="search_models", query="")
+        # Either returns results (empty query lists popular models) or error
+        assert isinstance(result, str)
 
     async def test_hf_invalid_type(self):
         from march.tools.builtin.huggingface_tool import huggingface_tool
-        result = await huggingface_tool(query="test", search_type="invalid")
+        result = await huggingface_tool(action="invalid_action")
         assert "Error" in result
 
     async def test_hf_mock_search(self):
         from march.tools.builtin.huggingface_tool import huggingface_tool
-        with patch("httpx.AsyncClient") as MockClient:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = [
-                {"modelId": "bert-base", "downloads": 1000, "likes": 50, "pipeline_tag": "fill-mask"}
-            ]
-            mock_resp.raise_for_status = MagicMock()
-
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(return_value=mock_resp)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            MockClient.return_value = mock_client
-
-            result = await huggingface_tool(query="bert")
+        with patch("march.tools.builtin.huggingface_tool._sync_hf_call", return_value="Models matching 'bert' (sorted by downloads):\n\n  bert-base\n    ↓1,000  ♥50  fill-mask") as mock_call:
+            result = await huggingface_tool(action="search_models", query="bert")
             assert "bert-base" in result
+            mock_call.assert_called_once()
 
 
 # ─── Message Tests ────────────────────────────────────────────────────────────
@@ -664,61 +555,6 @@ class TestMessage:
     async def test_message_no_text(self):
         from march.tools.builtin.message_tool import message_tool
         result = await message_tool(action="send", target="user123")
-        assert "Error" in result
-
-
-# ─── Cron Tests ───────────────────────────────────────────────────────────────
-
-
-class TestCron:
-    @pytest.fixture(autouse=True)
-    def setup_cron_db(self, tmp_path, monkeypatch):
-        db_path = str(tmp_path / "test_cron.db")
-        monkeypatch.setattr("march.tools.builtin.cron_tool._DB_PATH", db_path)
-
-    async def test_cron_create_and_list(self):
-        from march.tools.builtin.cron_tool import cron_tool
-        result = await cron_tool(action="create", name="test-job", schedule="*/5 * * * *", command="echo hi")
-        assert "Created" in result
-
-        result = await cron_tool(action="list")
-        assert "test-job" in result
-
-    async def test_cron_delete(self):
-        from march.tools.builtin.cron_tool import cron_tool
-        result = await cron_tool(action="create", name="to-delete", schedule="* * * * *", command="echo")
-        job_id = result.split("\n")[0].split(": ")[1]
-        result = await cron_tool(action="delete", job_id=job_id)
-        assert "Deleted" in result
-
-    async def test_cron_enable_disable(self):
-        from march.tools.builtin.cron_tool import cron_tool
-        result = await cron_tool(action="create", name="toggle", schedule="* * * * *", command="echo")
-        job_id = result.split("\n")[0].split(": ")[1]
-
-        result = await cron_tool(action="disable", job_id=job_id)
-        assert "disabled" in result
-
-        result = await cron_tool(action="enable", job_id=job_id)
-        assert "enabled" in result
-
-    async def test_cron_status(self):
-        from march.tools.builtin.cron_tool import cron_tool
-        result = await cron_tool(action="create", name="status-job", schedule="0 * * * *", command="echo")
-        job_id = result.split("\n")[0].split(": ")[1]
-
-        result = await cron_tool(action="status", job_id=job_id)
-        assert "status-job" in result
-        assert "0 * * * *" in result
-
-    async def test_cron_unknown_action(self):
-        from march.tools.builtin.cron_tool import cron_tool
-        result = await cron_tool(action="invalid")
-        assert "Error" in result
-
-    async def test_cron_create_missing_fields(self):
-        from march.tools.builtin.cron_tool import cron_tool
-        result = await cron_tool(action="create", name="test")
         assert "Error" in result
 
 

@@ -107,26 +107,6 @@ class TestAgentCommands:
         assert "March Agent" in result.output
 
 
-# ─── Skill Commands ───
-
-
-class TestSkillCommands:
-    def test_skill_list(self, runner: CliRunner) -> None:
-        """march skill list runs."""
-        result = runner.invoke(cli, ["skill", "list"])
-        assert result.exit_code == 0
-
-    def test_skill_show_not_found(self, runner: CliRunner) -> None:
-        """march skill show for missing skill fails."""
-        result = runner.invoke(cli, ["skill", "show", "nonexistent"])
-        assert result.exit_code == 1
-
-    def test_skill_install_not_found(self, runner: CliRunner) -> None:
-        """march skill install with bad path fails."""
-        result = runner.invoke(cli, ["skill", "install", "/tmp/nonexistent-skill"])
-        assert result.exit_code == 1
-
-
 # ─── Plugin Commands ───
 
 
