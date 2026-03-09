@@ -172,6 +172,7 @@ class WSProxyChannelConfig(BaseModel):
     Runs an embedded HTTP/WS server for the frontend chat app.
     """
 
+    enabled: bool = True
     port: int = 8101
     host: str = "0.0.0.0"
     cors_origins: list[str] = Field(default_factory=list)

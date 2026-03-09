@@ -83,6 +83,10 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
                 channels.append("terminal")
             if app.config.channels.matrix.enabled:
                 channels.append("matrix")
+            if app.config.channels.ws_proxy.enabled:
+                channels.append("ws_proxy")
+            if app.config.channels.acp.enabled:
+                channels.append("acp")
             if not channels:
                 channels = ["terminal"]
         elif channel:

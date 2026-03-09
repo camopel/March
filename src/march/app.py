@@ -440,15 +440,10 @@ class MarchApp:
         await self.initialize()
         # on_start is already dispatched by initialize()
 
-        # Start ws_proxy channel if configured
+        # Start ws_proxy channel if enabled
         ws_channel = None
         ws_config = self.config.channels.ws_proxy
-        # Also check backward compat: plugins.enabled containing ws_proxy
-        ws_enabled = (
-            (ws_config and ws_config.port)
-            or "ws_proxy" in (self.config.plugins.enabled or [])
-        )
-        if ws_enabled:
+        if getattr(ws_config, "enabled", True):
             from march.channels.ws_channel import WSChannel
             ws_channel = WSChannel(config=ws_config)
             await ws_channel.start(
