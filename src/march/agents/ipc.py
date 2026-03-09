@@ -56,6 +56,15 @@ MSG_PROGRESS = "progress"
 MSG_RESULT = "result"
 MSG_LOG = "log"
 
+# Child → Parent (spawn proxy)
+MSG_SPAWN_REQUEST = "spawn_request"    # Child requests parent to spawn grandchild
+MSG_SPAWN_STEER = "spawn_steer"        # Child forwards steer to grandchild
+MSG_SPAWN_KILL = "spawn_kill"          # Child requests kill of grandchild
+
+# Parent → Child (spawn proxy)
+MSG_SPAWN_RESULT = "spawn_result"      # Spawn result (child_key, run_id or error)
+MSG_CHILD_COMPLETED = "child_completed"  # Grandchild completion notification
+
 # Length-prefix format: 4-byte unsigned big-endian
 _HEADER_FMT = "!I"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
@@ -128,6 +137,56 @@ class LogMessage(TypedDict):
     type: str  # MSG_LOG
     level: str
     message: str
+
+
+# ── Spawn proxy messages (IPC spawn delegation) ─────────────────────
+
+
+class SpawnRequestMessage(TypedDict):
+    """Child → Parent: request to spawn a grandchild agent."""
+
+    type: str  # MSG_SPAWN_REQUEST
+    task: str
+    agent_id: str  # Optional — empty string means auto-generate
+    model: str
+    timeout: int
+    request_id: str  # Used to match response
+
+
+class SpawnResultMessage(TypedDict):
+    """Parent → Child: result of a spawn request."""
+
+    type: str  # MSG_SPAWN_RESULT
+    request_id: str
+    status: str  # "accepted" or "error"
+    child_key: str
+    run_id: str
+    error: str
+
+
+class ChildCompletedMessage(TypedDict):
+    """Parent → Child: grandchild completion notification."""
+
+    type: str  # MSG_CHILD_COMPLETED
+    child_key: str
+    status: str  # "ok", "error", "timeout", "cancelled"
+    output: str
+    error: str
+
+
+class SpawnSteerMessage(TypedDict):
+    """Child → Parent: forward steer to a grandchild."""
+
+    type: str  # MSG_SPAWN_STEER
+    child_key: str
+    message: str
+
+
+class SpawnKillMessage(TypedDict):
+    """Child → Parent: request kill of a grandchild."""
+
+    type: str  # MSG_SPAWN_KILL
+    child_key: str
 
 
 # ── Socket pair creation ─────────────────────────────────────────────

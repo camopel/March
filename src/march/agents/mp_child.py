@@ -33,6 +33,11 @@ from march.agents.ipc import (
     MSG_LOG,
     MSG_RESULT,
     MSG_STEER,
+    MSG_SPAWN_REQUEST,
+    MSG_SPAWN_RESULT,
+    MSG_SPAWN_STEER,
+    MSG_SPAWN_KILL,
+    MSG_CHILD_COMPLETED,
     recv_message_sync,
     send_message_sync,
 )
@@ -85,6 +90,187 @@ def _safe_send(sock: socket.socket, msg: dict, logger: logging.Logger | None = N
         return False
 
 
+# ── Spawn proxy (delegates spawn to parent via IPC) ──────────────────
+
+
+class _SpawnProxy:
+    """Proxy spawn requests to the parent process via IPC.
+
+    The child process has no AgentManager. When it needs to spawn a
+    grandchild agent, it sends a request to the parent via IPC and
+    waits for the result. The parent's AgentManager handles the actual
+    spawn and notifies the child when the grandchild completes.
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        session_id: str,
+        execution: str,
+        logger: logging.Logger,
+    ) -> None:
+        self._sock = sock
+        self._session_id = session_id
+        self._execution = execution
+        self._logger = logger
+        # request_id → Future[tuple[str, str, str, str]]  (status, child_key, run_id, error)
+        self._pending_spawns: dict[str, asyncio.Future[tuple[str, str, str, str]]] = {}
+        # child_key → Future[tuple[str, str, str]]  (status, output, error)
+        self._child_results: dict[str, asyncio.Future[tuple[str, str, str]]] = {}
+        self._lock = threading.Lock()
+
+    async def spawn(
+        self, task: str, agent_id: str = "", model: str = "", timeout: int = 0
+    ) -> tuple[str, str]:
+        """Request the parent to spawn a grandchild agent.
+
+        Args:
+            task: Task description for the grandchild.
+            agent_id: Optional agent ID (empty = auto-generate).
+            model: Optional model override.
+            timeout: Optional timeout in seconds.
+
+        Returns:
+            (child_key, run_id) of the spawned grandchild.
+
+        Raises:
+            RuntimeError: If the spawn request was rejected or failed.
+        """
+        import uuid
+
+        request_id = uuid.uuid4().hex[:16]
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, str, str, str]] = loop.create_future()
+
+        with self._lock:
+            self._pending_spawns[request_id] = future
+
+        msg = {
+            "type": MSG_SPAWN_REQUEST,
+            "task": task,
+            "agent_id": agent_id,
+            "model": model,
+            "timeout": timeout,
+            "request_id": request_id,
+        }
+
+        if not _safe_send(self._sock, msg, self._logger):
+            with self._lock:
+                self._pending_spawns.pop(request_id, None)
+            raise RuntimeError("IPC send failed — parent may be gone")
+
+        status, child_key, run_id, error = await future
+
+        if status != "accepted":
+            raise RuntimeError(f"Spawn rejected: {error}")
+
+        return child_key, run_id
+
+    async def wait_child(self, child_key: str) -> tuple[str, str]:
+        """Wait for a grandchild agent to complete.
+
+        Args:
+            child_key: Session key of the grandchild to wait for.
+
+        Returns:
+            (status, output) of the completed grandchild.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, str, str]] = loop.create_future()
+
+        with self._lock:
+            self._child_results[child_key] = future
+
+        status, output, error = await future
+
+        if status not in ("ok",):
+            if error:
+                return status, f"Error: {error}"
+        return status, output
+
+    async def steer_child(self, child_key: str, message: str) -> None:
+        """Send a steer message to a grandchild via the parent.
+
+        Args:
+            child_key: Session key of the grandchild.
+            message: Steering message text.
+        """
+        msg = {
+            "type": MSG_SPAWN_STEER,
+            "child_key": child_key,
+            "message": message,
+        }
+        if not _safe_send(self._sock, msg, self._logger):
+            raise RuntimeError("IPC send failed — parent may be gone")
+
+    async def kill_child(self, child_key: str) -> None:
+        """Request the parent to kill a grandchild.
+
+        Args:
+            child_key: Session key of the grandchild to kill.
+        """
+        msg = {
+            "type": MSG_SPAWN_KILL,
+            "child_key": child_key,
+        }
+        if not _safe_send(self._sock, msg, self._logger):
+            raise RuntimeError("IPC send failed — parent may be gone")
+
+    def handle_spawn_result(self, msg: dict) -> None:
+        """Handle a spawn_result message from the parent.
+
+        Called from the heartbeat thread when a MSG_SPAWN_RESULT is received.
+        Resolves the corresponding pending Future.
+        """
+        request_id = msg.get("request_id", "")
+        with self._lock:
+            future = self._pending_spawns.pop(request_id, None)
+
+        if future is None:
+            self._logger.warning("spawn_result for unknown request_id: %s", request_id)
+            return
+
+        result = (
+            msg.get("status", "error"),
+            msg.get("child_key", ""),
+            msg.get("run_id", ""),
+            msg.get("error", ""),
+        )
+
+        # Resolve from the event loop thread (future belongs to asyncio)
+        try:
+            loop = future.get_loop()
+            loop.call_soon_threadsafe(future.set_result, result)
+        except Exception as exc:
+            self._logger.error("Failed to resolve spawn_result future: %s", exc)
+
+    def handle_child_completed(self, msg: dict) -> None:
+        """Handle a child_completed message from the parent.
+
+        Called from the heartbeat thread when a MSG_CHILD_COMPLETED is received.
+        Resolves the corresponding wait_child Future.
+        """
+        child_key = msg.get("child_key", "")
+        with self._lock:
+            future = self._child_results.pop(child_key, None)
+
+        if future is None:
+            self._logger.warning("child_completed for unknown child_key: %s", child_key)
+            return
+
+        result = (
+            msg.get("status", "error"),
+            msg.get("output", ""),
+            msg.get("error", ""),
+        )
+
+        try:
+            loop = future.get_loop()
+            loop.call_soon_threadsafe(future.set_result, result)
+        except Exception as exc:
+            self._logger.error("Failed to resolve child_completed future: %s", exc)
+
+
 # ── Heartbeat thread ─────────────────────────────────────────────────
 
 
@@ -102,6 +288,7 @@ class _HeartbeatThread(threading.Thread):
         session_id: str,
         start_time: float,
         logger: logging.Logger,
+        spawn_proxy: _SpawnProxy | None = None,
     ) -> None:
         super().__init__(daemon=True, name=f"hb-{session_id[:12]}")
         self._sock = sock
@@ -110,6 +297,7 @@ class _HeartbeatThread(threading.Thread):
         self._start_time = start_time
         self._logger = logger
         self._stop_event = threading.Event()
+        self._spawn_proxy = spawn_proxy
 
         # Mutable stats updated by the agent loop (via thread-safe attrs)
         self.tokens_used: int = 0
@@ -199,6 +387,16 @@ class _HeartbeatThread(threading.Thread):
                     self.kill_requested = True
                     self._stop_event.set()
                     return
+                elif msg_type == MSG_SPAWN_RESULT:
+                    if self._spawn_proxy:
+                        self._spawn_proxy.handle_spawn_result(incoming)
+                    else:
+                        self._logger.warning("Received spawn_result but no spawn_proxy")
+                elif msg_type == MSG_CHILD_COMPLETED:
+                    if self._spawn_proxy:
+                        self._spawn_proxy.handle_child_completed(incoming)
+                    else:
+                        self._logger.warning("Received child_completed but no spawn_proxy")
                 else:
                     self._logger.warning("Unknown IPC message type: %s", msg_type)
 
@@ -357,17 +555,77 @@ async def _async_child_main(
 
     logger.info("Agent initialized, starting task execution")
 
-    # ── 2. Start heartbeat thread ──
+    # ── 2. Create spawn proxy for grandchild delegation ──
+    spawn_proxy = _SpawnProxy(
+        sock=child_sock,
+        session_id=session_id,
+        execution="mp",
+        logger=logger,
+    )
+
+    # ── 3. Start heartbeat thread ──
     hb_thread = _HeartbeatThread(
         sock=child_sock,
         interval_seconds=heartbeat_interval_seconds,
         session_id=session_id,
         start_time=start_time,
         logger=logger,
+        spawn_proxy=spawn_proxy,
     )
     hb_thread.start()
 
-    # ── 3. Hook into agent metrics for heartbeat reporting ──
+    # ── 4. Register spawn_agent tool for grandchild delegation ──
+    from march.tools.base import Tool as _Tool
+
+    async def _spawn_agent_tool(
+        task: str,
+        agent_id: str = "",
+        model: str = "",
+        timeout: int = 0,
+        wait: bool = True,
+    ) -> str:
+        """Spawn a child agent via the parent process.
+
+        Args:
+            task: Task description for the child agent.
+            agent_id: Optional agent ID (empty = auto-generate).
+            model: Optional model override.
+            timeout: Optional timeout in seconds.
+            wait: If True, wait for the child to complete and return its output.
+
+        Returns:
+            If wait=True: the child's output.
+            If wait=False: a JSON string with child_key and run_id.
+        """
+        import json as _json
+
+        child_key, run_id = await spawn_proxy.spawn(task, agent_id, model, timeout)
+
+        if not wait:
+            return _json.dumps({"child_key": child_key, "run_id": run_id})
+
+        status, output = await spawn_proxy.wait_child(child_key)
+        return output
+
+    tool_registry.register(_Tool(
+        name="spawn_agent",
+        description="Spawn a child agent to handle a subtask. The child runs in an isolated process.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Task description for the child agent"},
+                "agent_id": {"type": "string", "description": "Optional agent ID", "default": ""},
+                "model": {"type": "string", "description": "Optional model override", "default": ""},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (0 = no timeout)", "default": 0},
+                "wait": {"type": "boolean", "description": "Wait for completion", "default": True},
+            },
+            "required": ["task"],
+        },
+        fn=_spawn_agent_tool,
+        source="builtin",
+    ))
+
+    # ── 5. Hook into agent metrics for heartbeat reporting ──
     # We wrap the agent's tool execution to track progress
     _original_tools_execute = agent.tools.execute
 
@@ -411,7 +669,7 @@ async def _async_child_main(
 
     agent.tools.execute = _tracked_execute  # type: ignore[assignment]
 
-    # ── 4. Inject steering messages into the agent ──
+    # ── 6. Inject steering messages into the agent ──
     # The heartbeat thread collects steer messages; we inject them into
     # the agent's steering queue before each LLM call via a plugin-like hook.
     # Since we're using the standard Agent.run(), we feed steering via
@@ -427,7 +685,7 @@ async def _async_child_main(
 
     steering_task = asyncio.create_task(_steering_pump())
 
-    # ── 5. Run the task ──
+    # ── 7. Run the task ──
     result_status = "ok"
     result_output = ""
     result_error = ""
@@ -463,18 +721,18 @@ async def _async_child_main(
         result_error = str(exc)
         logger.error("Task failed: %s", exc, exc_info=True)
 
-    # ── 6. Stop steering pump ──
+    # ── 8. Stop steering pump ──
     steering_task.cancel()
     try:
         await steering_task
     except asyncio.CancelledError:
         pass
 
-    # ── 7. Stop heartbeat thread ──
+    # ── 9. Stop heartbeat thread ──
     hb_thread.stop()
     hb_thread.join(timeout=5.0)
 
-    # ── 8. Send result via IPC ──
+    # ── 10. Send result via IPC ──
     result_msg = {
         "type": MSG_RESULT,
         "status": result_status,

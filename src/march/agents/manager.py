@@ -155,6 +155,19 @@ class AgentManager:
             )
 
         execution = params.execution or "mt"
+
+        # Enforce execution consistency: if parent is a sub-agent,
+        # child must use the same execution mode as parent.
+        parent_record = self.registry.get_by_child_key(ctx.requester_session)
+        if parent_record:
+            # Parent is a sub-agent — enforce consistency
+            if execution != parent_record.execution:
+                logger.warning(
+                    "spawn: forcing execution=%s→%s to match parent %s",
+                    execution, parent_record.execution, parent_record.child_key,
+                )
+                execution = parent_record.execution
+
         run_id = str(uuid4())
 
         # Session key format: {agent_id}:mtagent:{uuid[:12]} or {agent_id}:mpagent:{uuid[:12]}
@@ -280,6 +293,43 @@ class AgentManager:
 
         logger.info("kill run_id=%s child=%s execution=%s", record.run_id, record.child_key, record.execution)
         return True
+
+    async def kill_recursive(self, agent_id: str) -> int:
+        """Recursively kill an agent and all its descendants.
+
+        Depth-first: kills the deepest descendants first, then works up.
+        This avoids orphaned children when a parent is killed first.
+
+        Args:
+            agent_id: run_id or child_key of the root agent.
+
+        Returns:
+            Total number of agents killed.
+        """
+        # Find the root record
+        record = self.registry.get(agent_id)
+        if not record:
+            record = self.registry.get_by_child_key(agent_id)
+        if not record:
+            return 0
+
+        killed = 0
+
+        # Get all descendants (depth-first order)
+        descendants = self.registry.get_subtree(record.child_key)
+
+        # Kill in reverse order (deepest first)
+        for desc in reversed(descendants):
+            if desc.is_active:
+                await self.kill(desc.run_id)
+                killed += 1
+
+        # Kill the root itself
+        if record.is_active:
+            await self.kill(record.run_id)
+            killed += 1
+
+        return killed
 
     async def send(self, agent_id: str, message: str) -> bool:
         """Send a steering message to a running agent.
@@ -444,8 +494,37 @@ class AgentManager:
             # Determine config path for the child process
             config_path = str(Path.home() / ".march" / "config.yaml")
 
-            # Create and spawn runner
-            runner = MpRunner()
+            # Build spawn proxy handlers for grandchild delegation
+            async def _handle_spawn_request(
+                task: str, agent_id: str, model: str, timeout: int, request_id: str
+            ) -> tuple[str, str, str, str]:
+                spawn_params = SpawnParams(
+                    task=task,
+                    agent_id=agent_id or "",
+                    model=model,
+                    timeout=timeout,
+                    execution="mp",  # Force mp — no mixed execution modes
+                )
+                child_ctx = SpawnContext(
+                    requester_session=child_key,  # The mpAgent is the requester
+                    origin=ctx.origin,
+                    caller_depth=ctx.caller_depth + 1,
+                )
+                result = await self.spawn(spawn_params, child_ctx)
+                return (result.status, result.child_key, result.run_id, result.error)
+
+            async def _handle_steer(grandchild_key: str, message: str) -> bool:
+                return await self.send(grandchild_key, message)
+
+            async def _handle_kill(grandchild_key: str) -> bool:
+                return await self.kill(grandchild_key)
+
+            # Create and spawn runner with spawn proxy handlers
+            runner = MpRunner(
+                spawn_handler=_handle_spawn_request,
+                steer_handler=_handle_steer,
+                kill_handler=_handle_kill,
+            )
             self._active_runners[run_id] = runner
 
             handle = await runner.spawn(
@@ -512,7 +591,15 @@ class AgentManager:
     # ── Shared helpers ───────────────────────────────────────────────
 
     async def _announce(self, record: RunRecord, outcome: RunOutcome) -> None:
-        """Announce completion to the parent session."""
+        """Announce completion to the parent session.
+
+        If the parent is an mpAgent (requester_key matches an active mpAgent's
+        child_key), also notify via IPC so the child process can resolve
+        its wait_child() future.
+        """
+        # Check if the parent is an active mpAgent — notify via IPC
+        await self._notify_mp_parent(record, outcome)
+
         try:
             await asyncio.wait_for(
                 self.announcer.announce_completion(record, outcome),
@@ -523,6 +610,41 @@ class AgentManager:
             logger.warning("announce timed out for run_id=%s", record.run_id)
         except Exception as e:
             logger.error("announce failed for run_id=%s: %s", record.run_id, e)
+
+    async def _notify_mp_parent(self, record: RunRecord, outcome: RunOutcome) -> None:
+        """If the requester is an active mpAgent, send child_completed via IPC.
+
+        This allows the mpAgent child process to resolve its wait_child() future
+        when a grandchild completes.
+        """
+        requester_key = record.requester_key
+
+        # Find the parent's run record by child_key matching requester_key
+        parent_record = self.registry.get_by_child_key(requester_key)
+        if not parent_record or parent_record.execution != "mp" or not parent_record.is_active:
+            return
+
+        # Find the MpRunner for the parent
+        runner = self._active_runners.get(parent_record.run_id)
+        if not runner:
+            return
+
+        try:
+            await runner.notify_child_completed(
+                child_key=record.child_key,
+                status=outcome.status,
+                output=outcome.output,
+                error=outcome.error,
+            )
+            logger.debug(
+                "Notified mpAgent %s that grandchild %s completed",
+                requester_key, record.child_key,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to notify mpAgent %s of grandchild completion: %s",
+                requester_key, e,
+            )
 
     async def _retry_announce(self, record: RunRecord) -> None:
         """Retry announcing a completed run that was interrupted."""
@@ -563,9 +685,9 @@ class AgentManager:
         cleaned = 0
 
         for record in records:
-            # Kill if still running
+            # Recursively kill if still running (kills descendants first)
             if record.is_active:
-                await self.kill(record.run_id)
+                await self.kill_recursive(record.run_id)
 
             # Delete child's session memory files on disk
             try:

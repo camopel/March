@@ -23,6 +23,11 @@ from march.agents.ipc import (
     MSG_PROGRESS,
     MSG_RESULT,
     MSG_STEER,
+    MSG_SPAWN_REQUEST,
+    MSG_SPAWN_RESULT,
+    MSG_SPAWN_STEER,
+    MSG_SPAWN_KILL,
+    MSG_CHILD_COMPLETED,
     _HEADER_FMT,
     _HEADER_SIZE,
     _pack,
@@ -1037,3 +1042,911 @@ class TestAnnouncer:
         assert len(messages_sent) == 1
         assert "mpAgent" in messages_sent[0]
         assert "🚫" in messages_sent[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Agent Tree Tests (recursive depth > 1)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+from march.agents.manager import AgentManager, AgentManagerConfig, SpawnParams, SpawnContext
+
+
+class TestAgentTree:
+    """Recursive agent tree tests."""
+
+    def _make_record(
+        self,
+        run_id: str,
+        child_key: str,
+        requester_key: str,
+        execution: str = "mt",
+        active: bool = True,
+    ) -> RunRecord:
+        """Helper to create a RunRecord."""
+        record = RunRecord(
+            run_id=run_id,
+            child_key=child_key,
+            requester_key=requester_key,
+            task=f"task for {run_id}",
+            started_at=time.time(),
+            execution=execution,
+        )
+        if not active:
+            record.ended_at = time.time()
+            record.outcome = RunOutcome(status="ok", output="done")
+        return record
+
+    def test_get_subtree_empty(self):
+        """No descendants returns empty list."""
+        reg = AgentRegistry()
+        reg.register(self._make_record("r1", "child-A", "main-session"))
+
+        result = reg.get_subtree("child-A")
+        assert result == []
+
+    def test_get_subtree_single_child(self):
+        """Single child is returned."""
+        reg = AgentRegistry()
+        parent = self._make_record("r1", "child-A", "main-session")
+        child = self._make_record("r2", "child-B", "child-A")
+        reg.register(parent)
+        reg.register(child)
+
+        result = reg.get_subtree("child-A")
+        assert len(result) == 1
+        assert result[0].run_id == "r2"
+
+    def test_get_subtree_deep_tree(self):
+        """depth=3 tree, verify depth-first order."""
+        reg = AgentRegistry()
+        # Tree structure:
+        #   main-session
+        #     └─ A (r1)
+        #         ├─ B (r2)
+        #         │   └─ D (r4)
+        #         └─ C (r3)
+        reg.register(self._make_record("r1", "A", "main-session"))
+        reg.register(self._make_record("r2", "B", "A"))
+        reg.register(self._make_record("r3", "C", "A"))
+        reg.register(self._make_record("r4", "D", "B"))
+
+        result = reg.get_subtree("A")
+        run_ids = [r.run_id for r in result]
+        # Depth-first: B, D (child of B), then C
+        assert run_ids == ["r2", "r4", "r3"]
+
+    def test_get_tree_with_depth(self):
+        """Verify each node's depth value is correct."""
+        reg = AgentRegistry()
+        # Tree:
+        #   root
+        #     └─ A (depth 0)
+        #         └─ B (depth 1)
+        #             └─ C (depth 2)
+        reg.register(self._make_record("r1", "A", "root"))
+        reg.register(self._make_record("r2", "B", "A"))
+        reg.register(self._make_record("r3", "C", "B"))
+
+        result = reg.get_tree_with_depth("root")
+        assert len(result) == 3
+        assert result[0] == (0, reg.get("r1"))
+        assert result[1] == (1, reg.get("r2"))
+        assert result[2] == (2, reg.get("r3"))
+
+    @pytest.mark.asyncio
+    async def test_kill_recursive_kills_all(self):
+        """kill_recursive kills all descendants."""
+        reg = AgentRegistry()
+        mgr = AgentManager(
+            config=AgentManagerConfig(max_spawn_depth=5),
+            registry=reg,
+        )
+        await mgr.initialize()
+
+        # Build tree: A → B → C (all active)
+        reg.register(self._make_record("r1", "A", "main-session"))
+        reg.register(self._make_record("r2", "B", "A"))
+        reg.register(self._make_record("r3", "C", "B"))
+
+        killed = await mgr.kill_recursive("r1")
+        assert killed == 3
+
+        # All should be marked completed
+        for rid in ["r1", "r2", "r3"]:
+            record = reg.get(rid)
+            assert not record.is_active
+            assert record.outcome.status == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_kill_recursive_depth_first(self):
+        """Verify depth-first order: deepest killed first."""
+        reg = AgentRegistry()
+        mgr = AgentManager(
+            config=AgentManagerConfig(max_spawn_depth=5),
+            registry=reg,
+        )
+        await mgr.initialize()
+
+        # Tree: A → B → C
+        reg.register(self._make_record("r1", "A", "main-session"))
+        reg.register(self._make_record("r2", "B", "A"))
+        reg.register(self._make_record("r3", "C", "B"))
+
+        # Track kill order by patching kill
+        kill_order: list[str] = []
+        original_kill = mgr.kill
+
+        async def tracking_kill(agent_id: str) -> bool:
+            kill_order.append(agent_id)
+            return await original_kill(agent_id)
+
+        mgr.kill = tracking_kill  # type: ignore[assignment]
+
+        await mgr.kill_recursive("r1")
+
+        # C (deepest) should be killed first, then B, then A
+        assert kill_order == ["r3", "r2", "r1"]
+
+    @pytest.mark.asyncio
+    async def test_execution_consistency_enforced(self):
+        """When parent is mp, child must also be mp."""
+        reg = AgentRegistry()
+        mgr = AgentManager(
+            config=AgentManagerConfig(max_spawn_depth=5),
+            registry=reg,
+        )
+        await mgr.initialize()
+
+        # Register parent as an mp agent
+        reg.register(self._make_record("r1", "parent-agent", "main-session", execution="mp"))
+
+        # Spawn child with execution="mt" — should be forced to "mp"
+        result = await mgr.spawn(
+            SpawnParams(task="child task", execution="mt"),
+            SpawnContext(requester_session="parent-agent", caller_depth=1),
+        )
+        assert result.status == "accepted"
+
+        # Find the child record and verify execution was forced to mp
+        child_record = reg.get_by_child_key(result.child_key)
+        assert child_record is not None
+        assert child_record.execution == "mp"
+
+    @pytest.mark.asyncio
+    async def test_execution_consistency_main_session_allows_any(self):
+        """Main session (not a sub-agent) allows any execution mode."""
+        reg = AgentRegistry()
+        mgr = AgentManager(
+            config=AgentManagerConfig(max_spawn_depth=5),
+            registry=reg,
+        )
+        await mgr.initialize()
+
+        # No parent record for "main-session" in registry — it's a main session
+
+        # Spawn with mt — should be allowed
+        result_mt = await mgr.spawn(
+            SpawnParams(task="mt task", execution="mt"),
+            SpawnContext(requester_session="main-session", caller_depth=0),
+        )
+        assert result_mt.status == "accepted"
+        child_mt = reg.get_by_child_key(result_mt.child_key)
+        assert child_mt.execution == "mt"
+
+        # Spawn with mp — should also be allowed
+        result_mp = await mgr.spawn(
+            SpawnParams(task="mp task", execution="mp"),
+            SpawnContext(requester_session="main-session", caller_depth=0),
+        )
+        assert result_mp.status == "accepted"
+        child_mp = reg.get_by_child_key(result_mp.child_key)
+        assert child_mp.execution == "mp"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# IPC Spawn Proxy Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestIPCSpawnProxy:
+    """IPC spawn proxy message tests."""
+
+    def test_spawn_request_message_roundtrip(self):
+        """spawn_request message survives msgpack serialization/deserialization."""
+        msg = {
+            "type": MSG_SPAWN_REQUEST,
+            "task": "analyze this data",
+            "agent_id": "agent-abc123",
+            "model": "gpt-4",
+            "timeout": 300,
+            "request_id": "req-001",
+        }
+        packed = _pack(msg)
+        assert isinstance(packed, bytes)
+        restored = _unpack(packed)
+        assert restored == msg
+        assert restored["type"] == MSG_SPAWN_REQUEST
+        assert restored["task"] == "analyze this data"
+        assert restored["agent_id"] == "agent-abc123"
+        assert restored["model"] == "gpt-4"
+        assert restored["timeout"] == 300
+        assert restored["request_id"] == "req-001"
+
+    def test_spawn_result_message_roundtrip(self):
+        """spawn_result message survives msgpack serialization/deserialization."""
+        msg = {
+            "type": MSG_SPAWN_RESULT,
+            "request_id": "req-001",
+            "status": "accepted",
+            "child_key": "agent-abc:mpagent:def456789012",
+            "run_id": "run-uuid-123",
+            "error": "",
+        }
+        packed = _pack(msg)
+        restored = _unpack(packed)
+        assert restored == msg
+        assert restored["type"] == MSG_SPAWN_RESULT
+        assert restored["status"] == "accepted"
+        assert restored["child_key"] == "agent-abc:mpagent:def456789012"
+
+        # Also test error case
+        msg_err = {
+            "type": MSG_SPAWN_RESULT,
+            "request_id": "req-002",
+            "status": "error",
+            "child_key": "",
+            "run_id": "",
+            "error": "max spawn depth reached",
+        }
+        packed_err = _pack(msg_err)
+        restored_err = _unpack(packed_err)
+        assert restored_err == msg_err
+        assert restored_err["status"] == "error"
+        assert restored_err["error"] == "max spawn depth reached"
+
+    def test_child_completed_message_roundtrip(self):
+        """child_completed message survives msgpack serialization/deserialization."""
+        msg = {
+            "type": MSG_CHILD_COMPLETED,
+            "child_key": "agent-abc:mpagent:def456789012",
+            "status": "ok",
+            "output": "Task completed successfully with detailed results.",
+            "error": "",
+        }
+        packed = _pack(msg)
+        restored = _unpack(packed)
+        assert restored == msg
+        assert restored["type"] == MSG_CHILD_COMPLETED
+        assert restored["status"] == "ok"
+        assert restored["output"] == "Task completed successfully with detailed results."
+
+        # Test error status
+        msg_err = {
+            "type": MSG_CHILD_COMPLETED,
+            "child_key": "agent-xyz:mpagent:abc123456789",
+            "status": "error",
+            "output": "",
+            "error": "RuntimeError: something went wrong",
+        }
+        packed_err = _pack(msg_err)
+        restored_err = _unpack(packed_err)
+        assert restored_err == msg_err
+
+    def test_spawn_steer_message_roundtrip(self):
+        """spawn_steer message survives msgpack serialization/deserialization."""
+        msg = {
+            "type": MSG_SPAWN_STEER,
+            "child_key": "agent-abc:mpagent:def456789012",
+            "message": "Focus on the unit tests first",
+        }
+        packed = _pack(msg)
+        restored = _unpack(packed)
+        assert restored == msg
+        assert restored["type"] == MSG_SPAWN_STEER
+        assert restored["child_key"] == "agent-abc:mpagent:def456789012"
+        assert restored["message"] == "Focus on the unit tests first"
+
+    def test_spawn_kill_message_roundtrip(self):
+        """spawn_kill message survives msgpack serialization/deserialization."""
+        msg = {
+            "type": MSG_SPAWN_KILL,
+            "child_key": "agent-abc:mpagent:def456789012",
+        }
+        packed = _pack(msg)
+        restored = _unpack(packed)
+        assert restored == msg
+        assert restored["type"] == MSG_SPAWN_KILL
+        assert restored["child_key"] == "agent-abc:mpagent:def456789012"
+
+    @pytest.mark.asyncio
+    async def test_spawn_request_ipc_transfer(self):
+        """spawn_request sent from child (sync) and received by parent (async)."""
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+        try:
+            msg = {
+                "type": MSG_SPAWN_REQUEST,
+                "task": "run analysis",
+                "agent_id": "",
+                "model": "claude-3",
+                "timeout": 120,
+                "request_id": "req-transfer-001",
+            }
+            send_message_sync(child_sock, msg)
+            received = await recv_message(parent_sock)
+            assert received["type"] == MSG_SPAWN_REQUEST
+            assert received["task"] == "run analysis"
+            assert received["request_id"] == "req-transfer-001"
+        finally:
+            parent_sock.close()
+            child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_result_ipc_transfer(self):
+        """spawn_result sent from parent (async) and received by child (sync)."""
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+        try:
+            msg = {
+                "type": MSG_SPAWN_RESULT,
+                "request_id": "req-transfer-001",
+                "status": "accepted",
+                "child_key": "agent-test:mpagent:abc123",
+                "run_id": "run-456",
+                "error": "",
+            }
+            await send_message(parent_sock, msg)
+            received = recv_message_sync(child_sock, timeout=5.0)
+            assert received is not None
+            assert received["type"] == MSG_SPAWN_RESULT
+            assert received["status"] == "accepted"
+            assert received["child_key"] == "agent-test:mpagent:abc123"
+        finally:
+            parent_sock.close()
+            child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_child_completed_ipc_transfer(self):
+        """child_completed sent from parent (async) and received by child (sync)."""
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+        try:
+            msg = {
+                "type": MSG_CHILD_COMPLETED,
+                "child_key": "agent-test:mpagent:abc123",
+                "status": "ok",
+                "output": "Analysis complete: found 42 issues.",
+                "error": "",
+            }
+            await send_message(parent_sock, msg)
+            received = recv_message_sync(child_sock, timeout=5.0)
+            assert received is not None
+            assert received["type"] == MSG_CHILD_COMPLETED
+            assert received["output"] == "Analysis complete: found 42 issues."
+        finally:
+            parent_sock.close()
+            child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_steer_ipc_transfer(self):
+        """spawn_steer sent from child (sync) and received by parent (async)."""
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+        try:
+            msg = {
+                "type": MSG_SPAWN_STEER,
+                "child_key": "agent-test:mpagent:abc123",
+                "message": "Hurry up!",
+            }
+            send_message_sync(child_sock, msg)
+            received = await recv_message(parent_sock)
+            assert received["type"] == MSG_SPAWN_STEER
+            assert received["message"] == "Hurry up!"
+        finally:
+            parent_sock.close()
+            child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_kill_ipc_transfer(self):
+        """spawn_kill sent from child (sync) and received by parent (async)."""
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+        try:
+            msg = {
+                "type": MSG_SPAWN_KILL,
+                "child_key": "agent-test:mpagent:abc123",
+            }
+            send_message_sync(child_sock, msg)
+            received = await recv_message(parent_sock)
+            assert received["type"] == MSG_SPAWN_KILL
+            assert received["child_key"] == "agent-test:mpagent:abc123"
+        finally:
+            parent_sock.close()
+            child_sock.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MpRunner Spawn Handler Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestMpRunnerSpawnHandler:
+    """Tests for MpRunner spawn proxy handler integration."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_handler_called_on_request(self):
+        """MpRunner calls spawn_handler when it receives MSG_SPAWN_REQUEST."""
+        from march.agents.mp_runner import MpRunner
+
+        handler_calls: list[tuple] = []
+
+        async def mock_spawn_handler(task, agent_id, model, timeout, request_id):
+            handler_calls.append((task, agent_id, model, timeout, request_id))
+            return ("accepted", "child-key-123", "run-456", "")
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        runner = MpRunner(spawn_handler=mock_spawn_handler)
+        runner._parent_sock = parent_sock
+        runner._session_id = "test-session"
+        runner._done = False
+
+        # Send spawn_request from child side
+        send_message_sync(child_sock, {
+            "type": MSG_SPAWN_REQUEST,
+            "task": "analyze data",
+            "agent_id": "agent-test",
+            "model": "gpt-4",
+            "timeout": 60,
+            "request_id": "req-001",
+        })
+
+        # Run one iteration of recv
+        msg = await recv_message(parent_sock)
+        assert msg["type"] == MSG_SPAWN_REQUEST
+
+        # Simulate the handler dispatch
+        await runner._handle_spawn_request(msg)
+
+        # Verify handler was called
+        assert len(handler_calls) == 1
+        assert handler_calls[0] == ("analyze data", "agent-test", "gpt-4", 60, "req-001")
+
+        # Verify spawn_result was sent back
+        result = recv_message_sync(child_sock, timeout=5.0)
+        assert result is not None
+        assert result["type"] == MSG_SPAWN_RESULT
+        assert result["status"] == "accepted"
+        assert result["child_key"] == "child-key-123"
+        assert result["run_id"] == "run-456"
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_no_spawn_handler_returns_error(self):
+        """MpRunner without spawn_handler returns error on spawn_request."""
+        from march.agents.mp_runner import MpRunner
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        runner = MpRunner()  # No spawn_handler
+        runner._parent_sock = parent_sock
+        runner._session_id = "test-session"
+        runner._done = False
+
+        msg = {
+            "type": MSG_SPAWN_REQUEST,
+            "task": "analyze data",
+            "agent_id": "",
+            "model": "",
+            "timeout": 0,
+            "request_id": "req-002",
+        }
+
+        await runner._handle_spawn_request(msg)
+
+        # Verify error result was sent back
+        result = recv_message_sync(child_sock, timeout=5.0)
+        assert result is not None
+        assert result["type"] == MSG_SPAWN_RESULT
+        assert result["status"] == "error"
+        assert "not configured" in result["error"]
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_notify_child_completed(self):
+        """MpRunner.notify_child_completed sends MSG_CHILD_COMPLETED via IPC."""
+        from march.agents.mp_runner import MpRunner
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        runner = MpRunner()
+        runner._parent_sock = parent_sock
+        runner._session_id = "test-session"
+        runner._done = False
+
+        await runner.notify_child_completed(
+            child_key="grandchild-key-123",
+            status="ok",
+            output="Grandchild finished successfully",
+            error="",
+        )
+
+        # Verify message was sent
+        result = recv_message_sync(child_sock, timeout=5.0)
+        assert result is not None
+        assert result["type"] == MSG_CHILD_COMPLETED
+        assert result["child_key"] == "grandchild-key-123"
+        assert result["status"] == "ok"
+        assert result["output"] == "Grandchild finished successfully"
+        assert result["error"] == ""
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_steer_handler_called(self):
+        """MpRunner calls steer_handler when it receives MSG_SPAWN_STEER."""
+        from march.agents.mp_runner import MpRunner
+
+        steer_calls: list[tuple] = []
+
+        async def mock_steer_handler(child_key, message):
+            steer_calls.append((child_key, message))
+            return True
+
+        runner = MpRunner(steer_handler=mock_steer_handler)
+        runner._session_id = "test-session"
+        runner._done = False
+
+        msg = {
+            "type": MSG_SPAWN_STEER,
+            "child_key": "grandchild-key",
+            "message": "Focus on tests",
+        }
+
+        await runner._handle_spawn_steer(msg)
+
+        assert len(steer_calls) == 1
+        assert steer_calls[0] == ("grandchild-key", "Focus on tests")
+
+    @pytest.mark.asyncio
+    async def test_kill_handler_called(self):
+        """MpRunner calls kill_handler when it receives MSG_SPAWN_KILL."""
+        from march.agents.mp_runner import MpRunner
+
+        kill_calls: list[str] = []
+
+        async def mock_kill_handler(child_key):
+            kill_calls.append(child_key)
+            return True
+
+        runner = MpRunner(kill_handler=mock_kill_handler)
+        runner._session_id = "test-session"
+        runner._done = False
+
+        msg = {
+            "type": MSG_SPAWN_KILL,
+            "child_key": "grandchild-key",
+        }
+
+        await runner._handle_spawn_kill(msg)
+
+        assert len(kill_calls) == 1
+        assert kill_calls[0] == "grandchild-key"
+
+    @pytest.mark.asyncio
+    async def test_spawn_handler_exception_returns_error(self):
+        """If spawn_handler raises, MpRunner sends error result."""
+        from march.agents.mp_runner import MpRunner
+
+        async def failing_handler(task, agent_id, model, timeout, request_id):
+            raise ValueError("handler exploded")
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        runner = MpRunner(spawn_handler=failing_handler)
+        runner._parent_sock = parent_sock
+        runner._session_id = "test-session"
+        runner._done = False
+
+        msg = {
+            "type": MSG_SPAWN_REQUEST,
+            "task": "will fail",
+            "agent_id": "",
+            "model": "",
+            "timeout": 0,
+            "request_id": "req-fail",
+        }
+
+        await runner._handle_spawn_request(msg)
+
+        result = recv_message_sync(child_sock, timeout=5.0)
+        assert result is not None
+        assert result["type"] == MSG_SPAWN_RESULT
+        assert result["status"] == "error"
+        assert "handler exploded" in result["error"]
+
+        parent_sock.close()
+        child_sock.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SpawnProxy Tests (child-side)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSpawnProxy:
+    """Tests for _SpawnProxy in the child process."""
+
+    @pytest.mark.asyncio
+    async def test_spawn_proxy_spawn_and_result(self):
+        """SpawnProxy.spawn sends request and resolves on result."""
+        import logging
+        from march.agents.mp_child import _SpawnProxy
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        proxy = _SpawnProxy(
+            sock=child_sock,
+            session_id="test-child",
+            execution="mp",
+            logger=logging.getLogger("test"),
+        )
+
+        async def simulate_parent():
+            """Simulate parent receiving spawn_request and sending result."""
+            msg = await recv_message(parent_sock)
+            assert msg["type"] == MSG_SPAWN_REQUEST
+            assert msg["task"] == "do something"
+            await send_message(parent_sock, {
+                "type": MSG_SPAWN_RESULT,
+                "request_id": msg["request_id"],
+                "status": "accepted",
+                "child_key": "grandchild-key-abc",
+                "run_id": "run-xyz",
+                "error": "",
+            })
+
+        async def simulate_child():
+            """Child calls spawn and waits for result."""
+            # We need to receive the spawn_result in a separate thread
+            # since the child uses sync recv. For testing, we'll manually
+            # resolve the future.
+            child_key, run_id = await proxy.spawn("do something")
+            return child_key, run_id
+
+        # We need a way to receive the spawn_result on the child side.
+        # In production, the heartbeat thread does this. For testing,
+        # we'll use a background task to read from child_sock and dispatch.
+        import threading
+
+        def recv_and_dispatch():
+            """Read from child_sock and dispatch to proxy."""
+            result = recv_message_sync(child_sock, timeout=5.0)
+            if result and result.get("type") == MSG_SPAWN_RESULT:
+                proxy.handle_spawn_result(result)
+
+        recv_thread = threading.Thread(target=recv_and_dispatch)
+        recv_thread.start()
+
+        parent_task = asyncio.create_task(simulate_parent())
+        child_key, run_id = await asyncio.wait_for(
+            proxy.spawn("do something"), timeout=5.0
+        )
+        await parent_task
+        recv_thread.join(timeout=5.0)
+
+        assert child_key == "grandchild-key-abc"
+        assert run_id == "run-xyz"
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_proxy_wait_child(self):
+        """SpawnProxy.wait_child resolves when child_completed arrives."""
+        import logging
+        from march.agents.mp_child import _SpawnProxy
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        proxy = _SpawnProxy(
+            sock=child_sock,
+            session_id="test-child",
+            execution="mp",
+            logger=logging.getLogger("test"),
+        )
+
+        async def simulate_parent():
+            """Parent sends child_completed."""
+            await asyncio.sleep(0.1)  # Small delay
+            await send_message(parent_sock, {
+                "type": MSG_CHILD_COMPLETED,
+                "child_key": "grandchild-abc",
+                "status": "ok",
+                "output": "task done",
+                "error": "",
+            })
+
+        import threading
+
+        def recv_and_dispatch():
+            """Read from child_sock and dispatch to proxy."""
+            result = recv_message_sync(child_sock, timeout=5.0)
+            if result and result.get("type") == MSG_CHILD_COMPLETED:
+                proxy.handle_child_completed(result)
+
+        recv_thread = threading.Thread(target=recv_and_dispatch)
+        recv_thread.start()
+
+        parent_task = asyncio.create_task(simulate_parent())
+        status, output = await asyncio.wait_for(
+            proxy.wait_child("grandchild-abc"), timeout=5.0
+        )
+        await parent_task
+        recv_thread.join(timeout=5.0)
+
+        assert status == "ok"
+        assert output == "task done"
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_proxy_steer_child(self):
+        """SpawnProxy.steer_child sends MSG_SPAWN_STEER via IPC."""
+        import logging
+        from march.agents.mp_child import _SpawnProxy
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        proxy = _SpawnProxy(
+            sock=child_sock,
+            session_id="test-child",
+            execution="mp",
+            logger=logging.getLogger("test"),
+        )
+
+        await proxy.steer_child("grandchild-abc", "Focus on tests")
+
+        msg = await recv_message(parent_sock)
+        assert msg["type"] == MSG_SPAWN_STEER
+        assert msg["child_key"] == "grandchild-abc"
+        assert msg["message"] == "Focus on tests"
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_proxy_kill_child(self):
+        """SpawnProxy.kill_child sends MSG_SPAWN_KILL via IPC."""
+        import logging
+        from march.agents.mp_child import _SpawnProxy
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        proxy = _SpawnProxy(
+            sock=child_sock,
+            session_id="test-child",
+            execution="mp",
+            logger=logging.getLogger("test"),
+        )
+
+        await proxy.kill_child("grandchild-abc")
+
+        msg = await recv_message(parent_sock)
+        assert msg["type"] == MSG_SPAWN_KILL
+        assert msg["child_key"] == "grandchild-abc"
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_proxy_spawn_rejected(self):
+        """SpawnProxy.spawn raises RuntimeError when spawn is rejected."""
+        import logging
+        from march.agents.mp_child import _SpawnProxy
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        proxy = _SpawnProxy(
+            sock=child_sock,
+            session_id="test-child",
+            execution="mp",
+            logger=logging.getLogger("test"),
+        )
+
+        async def simulate_parent():
+            msg = await recv_message(parent_sock)
+            await send_message(parent_sock, {
+                "type": MSG_SPAWN_RESULT,
+                "request_id": msg["request_id"],
+                "status": "error",
+                "child_key": "",
+                "run_id": "",
+                "error": "max spawn depth reached",
+            })
+
+        import threading
+
+        def recv_and_dispatch():
+            result = recv_message_sync(child_sock, timeout=5.0)
+            if result and result.get("type") == MSG_SPAWN_RESULT:
+                proxy.handle_spawn_result(result)
+
+        recv_thread = threading.Thread(target=recv_and_dispatch)
+        recv_thread.start()
+
+        parent_task = asyncio.create_task(simulate_parent())
+
+        with pytest.raises(RuntimeError, match="Spawn rejected"):
+            await asyncio.wait_for(proxy.spawn("will be rejected"), timeout=5.0)
+
+        await parent_task
+        recv_thread.join(timeout=5.0)
+
+        parent_sock.close()
+        child_sock.close()
+
+    @pytest.mark.asyncio
+    async def test_spawn_proxy_wait_child_error(self):
+        """SpawnProxy.wait_child returns error status and message."""
+        import logging
+        from march.agents.mp_child import _SpawnProxy
+
+        parent_sock, child_sock = create_socket_pair()
+        parent_sock.setblocking(False)
+
+        proxy = _SpawnProxy(
+            sock=child_sock,
+            session_id="test-child",
+            execution="mp",
+            logger=logging.getLogger("test"),
+        )
+
+        async def simulate_parent():
+            await asyncio.sleep(0.1)
+            await send_message(parent_sock, {
+                "type": MSG_CHILD_COMPLETED,
+                "child_key": "grandchild-fail",
+                "status": "error",
+                "output": "",
+                "error": "OOM killed",
+            })
+
+        import threading
+
+        def recv_and_dispatch():
+            result = recv_message_sync(child_sock, timeout=5.0)
+            if result and result.get("type") == MSG_CHILD_COMPLETED:
+                proxy.handle_child_completed(result)
+
+        recv_thread = threading.Thread(target=recv_and_dispatch)
+        recv_thread.start()
+
+        parent_task = asyncio.create_task(simulate_parent())
+        status, output = await asyncio.wait_for(
+            proxy.wait_child("grandchild-fail"), timeout=5.0
+        )
+        await parent_task
+        recv_thread.join(timeout=5.0)
+
+        assert status == "error"
+        assert "OOM killed" in output
+
+        parent_sock.close()
+        child_sock.close()

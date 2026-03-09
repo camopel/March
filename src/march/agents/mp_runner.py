@@ -16,7 +16,7 @@ import signal
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from march.agents.ipc import (
     MSG_HEARTBEAT,
@@ -25,6 +25,11 @@ from march.agents.ipc import (
     MSG_PROGRESS,
     MSG_RESULT,
     MSG_STEER,
+    MSG_SPAWN_REQUEST,
+    MSG_SPAWN_RESULT,
+    MSG_SPAWN_STEER,
+    MSG_SPAWN_KILL,
+    MSG_CHILD_COMPLETED,
     create_socket_pair,
     recv_message,
     send_message,
@@ -87,7 +92,12 @@ class MpRunner:
         # outcome is always a RunOutcome, never None
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        spawn_handler: Callable[[str, str, str, int, str], Awaitable[tuple[str, str, str, str]]] | None = None,
+        steer_handler: Callable[[str, str], Awaitable[bool]] | None = None,
+        kill_handler: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> None:
         self._process: multiprocessing.Process | None = None
         self._parent_sock: socket.socket | None = None
         self._child_sock: socket.socket | None = None
@@ -95,6 +105,11 @@ class MpRunner:
         self._pgid: int | None = None
         self._session_id: str = ""
         self._mp_config: MpConfig = MpConfig()
+
+        # Spawn proxy handlers (for grandchild delegation via IPC)
+        self._spawn_handler = spawn_handler
+        self._steer_handler = steer_handler
+        self._kill_handler = kill_handler
 
         # Latest heartbeat data (thread-safe via asyncio — single writer)
         self._latest_heartbeat: dict | None = None
@@ -273,6 +288,24 @@ class MpRunner:
                         )
                     self._resolve_result(outcome)
                     return
+
+                elif msg_type == MSG_SPAWN_REQUEST:
+                    asyncio.create_task(
+                        self._handle_spawn_request(msg),
+                        name=f"mp-spawn-{self._session_id[:12]}",
+                    )
+
+                elif msg_type == MSG_SPAWN_STEER:
+                    asyncio.create_task(
+                        self._handle_spawn_steer(msg),
+                        name=f"mp-steer-{self._session_id[:12]}",
+                    )
+
+                elif msg_type == MSG_SPAWN_KILL:
+                    asyncio.create_task(
+                        self._handle_spawn_kill(msg),
+                        name=f"mp-kill-{self._session_id[:12]}",
+                    )
 
                 else:
                     logger.warning(
@@ -490,6 +523,111 @@ class MpRunner:
             Heartbeat data dict, or ``None`` if no heartbeat received yet.
         """
         return self._latest_heartbeat
+
+    # ── Spawn proxy handlers ────────────────────────────────────────
+
+    async def _handle_spawn_request(self, msg: dict) -> None:
+        """Handle a spawn_request from the child process."""
+        request_id = msg.get("request_id", "")
+        if not self._spawn_handler:
+            # No handler configured — return error (backward compat)
+            await self._send_spawn_result(
+                request_id, "error", "", "", "spawn_handler not configured"
+            )
+            return
+
+        try:
+            status, child_key, run_id, error = await self._spawn_handler(
+                msg.get("task", ""),
+                msg.get("agent_id", ""),
+                msg.get("model", ""),
+                msg.get("timeout", 0),
+                request_id,
+            )
+            await self._send_spawn_result(request_id, status, child_key, run_id, error)
+        except Exception as exc:
+            logger.error(
+                "spawn_handler error for %s: %s", self._session_id, exc, exc_info=True
+            )
+            await self._send_spawn_result(
+                request_id, "error", "", "", f"spawn_handler error: {exc}"
+            )
+
+    async def _handle_spawn_steer(self, msg: dict) -> None:
+        """Handle a spawn_steer from the child process."""
+        if not self._steer_handler:
+            logger.warning("steer_handler not configured, ignoring spawn_steer")
+            return
+
+        try:
+            await self._steer_handler(msg.get("child_key", ""), msg.get("message", ""))
+        except Exception as exc:
+            logger.error(
+                "steer_handler error for %s: %s", self._session_id, exc, exc_info=True
+            )
+
+    async def _handle_spawn_kill(self, msg: dict) -> None:
+        """Handle a spawn_kill from the child process."""
+        if not self._kill_handler:
+            logger.warning("kill_handler not configured, ignoring spawn_kill")
+            return
+
+        try:
+            await self._kill_handler(msg.get("child_key", ""))
+        except Exception as exc:
+            logger.error(
+                "kill_handler error for %s: %s", self._session_id, exc, exc_info=True
+            )
+
+    async def _send_spawn_result(
+        self, request_id: str, status: str, child_key: str, run_id: str, error: str
+    ) -> None:
+        """Send a spawn_result message back to the child."""
+        if not self._parent_sock or self._done:
+            return
+        try:
+            await send_message(self._parent_sock, {
+                "type": MSG_SPAWN_RESULT,
+                "request_id": request_id,
+                "status": status,
+                "child_key": child_key,
+                "run_id": run_id,
+                "error": error,
+            })
+        except (BrokenPipeError, ConnectionError, OSError) as exc:
+            logger.warning("Failed to send spawn_result to %s: %s", self._session_id, exc)
+
+    async def notify_child_completed(
+        self, child_key: str, status: str, output: str, error: str
+    ) -> None:
+        """Notify the child process that a grandchild has completed.
+
+        Called by the parent (AgentManager) when a grandchild agent finishes.
+
+        Args:
+            child_key: Session key of the completed grandchild.
+            status: Outcome status ("ok", "error", "timeout", "cancelled").
+            output: Grandchild's output text.
+            error: Error message (if any).
+        """
+        if not self._parent_sock or self._done:
+            return
+        try:
+            await send_message(self._parent_sock, {
+                "type": MSG_CHILD_COMPLETED,
+                "child_key": child_key,
+                "status": status,
+                "output": output,
+                "error": error,
+            })
+            logger.debug(
+                "child_completed sent to %s for grandchild %s",
+                self._session_id, child_key,
+            )
+        except (BrokenPipeError, ConnectionError, OSError) as exc:
+            logger.warning(
+                "Failed to send child_completed to %s: %s", self._session_id, exc
+            )
 
     # ── Internal helpers ─────────────────────────────────────────────
 

@@ -192,6 +192,41 @@ class AgentRegistry:
         """Remove a run record entirely."""
         self._runs.pop(run_id, None)
 
+    def get_subtree(self, root_key: str) -> list[RunRecord]:
+        """Recursively get all descendants of a session (children, grandchildren, ...).
+
+        Args:
+            root_key: The child_key of the root session (not run_id).
+
+        Returns:
+            All descendant RunRecords in depth-first order.
+        """
+        result: list[RunRecord] = []
+        # Find direct children: records whose requester_key == root_key
+        children = [r for r in self._runs.values() if r.requester_key == root_key]
+        for child in children:
+            result.append(child)
+            # Recurse: use child's child_key as the next root
+            result.extend(self.get_subtree(child.child_key))
+        return result
+
+    def get_tree_with_depth(self, root_key: str, depth: int = 0) -> list[tuple[int, RunRecord]]:
+        """Tree traversal with depth level for each node.
+
+        Args:
+            root_key: The child_key of the root session.
+            depth: Starting depth (usually 0).
+
+        Returns:
+            List of (depth, RunRecord) tuples in depth-first order.
+        """
+        result: list[tuple[int, RunRecord]] = []
+        children = [r for r in self._runs.values() if r.requester_key == root_key]
+        for child in children:
+            result.append((depth, child))
+            result.extend(self.get_tree_with_depth(child.child_key, depth + 1))
+        return result
+
     def cleanup_old(self, max_age_seconds: float = 3600) -> int:
         """Remove completed records older than max_age_seconds.
 
