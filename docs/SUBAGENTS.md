@@ -1,384 +1,319 @@
-# SUBAGENTS.md — March Agent 系统技术文档
+# SUBAGENTS.md — March Agent System
 
-> March 框架的 agent 子系统：mtAgent（asyncio 协程）与 mpAgent（隔离进程）的完整技术参考。
-
----
-
-## 目录
-
-1. [概述](#1-概述)
-2. [两种执行模式](#2-两种执行模式)
-3. [架构图](#3-架构图)
-4. [核心组件](#4-核心组件)
-5. [生命周期](#5-生命周期)
-6. [故障处理](#6-故障处理)
-7. [心跳与监控](#7-心跳与监控)
-8. [配置参考](#8-配置参考)
-9. [Session ID 和日志](#9-session-id-和日志)
-10. [与其他框架的不同](#10-与其他框架的不同)
+> Technical reference for March's agent orchestration layer: mtAgent (asyncio tasks) and mpAgent (isolated processes).
 
 ---
 
-## 1. 概述
+## Table of Contents
 
-March 的 agent 系统允许主 agent 将复杂任务分解为多个子任务，并行派发给独立的 sub-agent 执行。它解决的核心问题是：
-
-- **并行执行**：多个子任务同时运行，不阻塞主 agent 的交互循环
-- **故障隔离**：子任务崩溃（OOM、死循环、异常）不影响主进程
-- **资源控制**：通过 lane 并发限制防止资源耗尽
-- **结果推送**：子任务完成后自动将结果推送给父 agent，无需轮询
-
-系统提供两种执行模式——**mtAgent**（asyncio 协程，轻量快速）和 **mpAgent**（独立进程，完全隔离）——由调用方根据任务特性选择。
-
-### 设计哲学
-
-- **Push-based**：所有结果通过 `AgentAnnouncer` 主动推送，父 agent 永远不需要轮询
-- **保证交付**：`MpRunner.wait_result()` 承诺**永远返回** `RunOutcome`，无论子进程如何崩溃
-- **纯内存追踪**：`AgentRegistry` 不做磁盘持久化，crash recovery 依赖日志
+1. [Overview](#1-overview)
+2. [Execution Modes](#2-execution-modes)
+3. [Architecture](#3-architecture)
+4. [Core Components](#4-core-components)
+5. [Lifecycle](#5-lifecycle)
+6. [Failure Handling](#6-failure-handling)
+7. [Heartbeat & Monitoring](#7-heartbeat--monitoring)
+8. [Configuration](#8-configuration)
+9. [Session IDs & Logging](#9-session-ids--logging)
+10. [Nested Agents (Depth > 1)](#10-nested-agents-depth--1)
+11. [Comparison with Other Systems](#11-comparison-with-other-systems)
 
 ---
 
-## 2. 两种执行模式
+## 1. Overview
 
-### 2.1 mtAgent（Multi-Thread / Asyncio）
+March lets a main agent break work into subtasks and hand them off to independent sub-agents that run in parallel. The system is built around three principles:
 
-mtAgent 在主进程的 asyncio 事件循环中作为一个 `asyncio.Task` 运行。它与主 agent 共享进程内存空间。
+1. **Push, don't poll.** When a child finishes, `AgentAnnouncer` delivers the result to the parent automatically. The parent never busy-waits.
+2. **Always get an answer.** `MpRunner.wait_result()` is contractually guaranteed to return a `RunOutcome` no matter what happens to the child — crash, OOM, signal, IPC failure, or timeout.
+3. **In-memory only.** `AgentRegistry` keeps all run state in RAM. There is no disk persistence; crash recovery relies on logs.
 
-**原理：**
+Two execution modes are available:
+
+| | mtAgent | mpAgent |
+|---|---------|---------|
+| Runs as | `asyncio.Task` in the main event loop | `multiprocessing.Process` (start method `spawn`) |
+| Isolation | None — shares the main process | Full — independent process group via `os.setpgrp()` |
+| Best for | I/O-bound work, chat, file ops, API calls | Heavy compute, GPU, simulations, anything that might OOM |
+
+When in doubt, use mpAgent. The overhead is higher, but a crash stays contained.
+
+---
+
+## 2. Execution Modes
+
+### 2.1 mtAgent
+
+An mtAgent is an `asyncio.Task` on the main event loop. It shares memory with the main agent and every other mtAgent.
 
 ```
-主进程 event loop
-  ├── 主 agent turn（处理用户消息）
-  ├── mtAgent-1（asyncio.Task）
-  ├── mtAgent-2（asyncio.Task）
+Main process event loop
+  ├── Main agent turn
+  ├── mtAgent-1 (asyncio.Task)
+  ├── mtAgent-2 (asyncio.Task)
   └── ...
 ```
 
-每个 mtAgent 通过 `TaskQueue` 的 `mt` lane 排队执行。当 lane 有空闲 slot 时，task 被 drain 出来并创建为 `asyncio.Task`。
+Tasks enter through the `TaskQueue`'s `mt` lane. When a slot opens, the queue drains the next entry and wraps it in `asyncio.create_task()`.
 
-**适用场景：**
-- 对话式任务（聊天、问答）
-- 文件 I/O 操作（读写、编辑）
-- API 调用（web search、LLM 调用）
-- 消息发送
-- 任何 I/O-bound 的轻量任务
+**Steering** works through a per-child `asyncio.Queue`. The parent calls `AgentManager.send()`, which puts a message on the queue; the child consumes it before its next LLM call.
 
-**限制：**
-- 共享进程内存 → 子任务崩溃会拖垮主进程
-- Python GIL → 无法利用多核 CPU 做计算密集任务
-- 无进程级隔离 → OOM 会杀死整个主进程
-- 无心跳监控 → 只能通过 asyncio 超时检测问题
+**Limitations:** No process isolation. No heartbeat monitoring. An OOM or segfault kills the entire main process. The GIL prevents CPU parallelism.
 
-**Steering 机制：**
-mtAgent 通过 `asyncio.Queue` 接收 steering 消息。父 agent 调用 `AgentManager.send()` 将消息放入队列，mtAgent 在下一次 LLM 调用前消费。
+### 2.2 mpAgent
 
-### 2.2 mpAgent（Multi-Process / Isolated）
+An mpAgent is a fully independent child process created with `multiprocessing.get_context("spawn").Process()`. The child immediately calls `os.setpgrp()` to form its own process group, which lets the parent `os.killpg()` the entire tree in one shot.
 
-mpAgent 通过 `multiprocessing.Process(start_method="spawn")` 创建独立子进程。父子进程通过 Unix socketpair + msgpack 序列化的 IPC 协议通信。
-
-**原理：**
+Parent and child communicate over a Unix socketpair using msgpack-serialized messages with a 4-byte big-endian length prefix.
 
 ```
-主进程                          子进程（独立 process group）
-  │                                │
-  ├── MpRunner                     ├── os.setpgrp()
-  │   ├── _recv_loop (IPC 接收)    ├── Agent 实例（独立 LLM/Tools）
-  │   ├── _monitor (心跳监控)      ├── HeartbeatThread（心跳+steering 接收）
-  │   └── parent_sock ◄──────────► child_sock
+Main process                         Child process
+  │                                    │
+  ├── MpRunner                         ├── os.setpgrp()
+  │   ├── _recv_loop (IPC recv)        ├── Agent (own LLM, tools, memory)
+  │   ├── _monitor (heartbeat watch)   ├── _HeartbeatThread (heartbeat + steer recv)
+  │   └── parent_sock ◄──────────────► child_sock
   │       (Unix socketpair, msgpack + 4-byte length prefix)
 ```
 
-**适用场景：**
-- 大数据处理（文件解析、ETL）
-- GPU 任务（ML 训练、推理）
-- 仿真任务（物理模拟、机器人仿真）
-- 3D 资产处理（模型转换、渲染）
-- 任何可能 OOM 或 hang 的任务
+The child loads `config.yaml` from scratch, creates its own LLM providers, tool registry, and memory store. It runs the task via `Agent.run()` with a pure in-memory `Session` — it never touches `SessionStore`. Results travel back over IPC; the parent persists them if needed.
 
-**限制：**
-- 启动开销较高（需要重新加载 config、初始化 LLM provider）
-- 子进程**不访问 SessionStore**（结果通过 IPC 返回，由父进程持久化）
-- 子进程有独立的 session memory（存储在自己的 session ID 目录下）
-- 无法直接共享父进程的内存状态
+**Steering** goes through IPC: the parent sends a `steer` message, the `_HeartbeatThread` in the child picks it up, and a `_steering_pump` asyncio task injects it into the agent's steering queue.
 
-**选择规则：不确定用哪个 → 用 mpAgent。安全第一。**
+### 2.3 Side-by-Side
 
-### 2.3 对比表格
-
-| 特性 | mtAgent | mpAgent |
-|------|---------|---------|
-| **执行方式** | asyncio.Task（主进程内） | multiprocessing.Process（独立进程） |
-| **隔离级别** | 无（共享内存） | 进程级（独立 process group） |
-| **启动开销** | 极低（创建 coroutine） | 较高（spawn 进程 + 初始化 Agent） |
-| **故障影响** | 崩溃影响主进程 | 崩溃仅影响子进程 |
-| **OOM 保护** | 无 | 有（SIGKILL 仅杀子进程组） |
-| **心跳监控** | 无 | 有（周期性 heartbeat + 超时检测） |
-| **IPC 方式** | asyncio.Queue（内存） | Unix socketpair + msgpack |
-| **Steering** | asyncio.Queue 直接注入 | IPC `steer` 消息 → HeartbeatThread → Agent |
-| **Kill 方式** | asyncio.Task.cancel() | os.killpg(SIGTERM → SIGKILL) |
-| **SessionStore** | 共享主进程的 | 无（结果由父进程持久化） |
-| **Session ID 格式** | `{agent_id}:mtagent:{uuid[:12]}` | `{agent_id}:mpagent:{uuid[:12]}` |
-| **默认并发上限** | 8 | 8 |
-| **适用任务** | I/O-bound、轻量、低风险 | CPU-bound、高风险、可能 OOM |
+| | mtAgent | mpAgent |
+|---|---------|---------|
+| Execution | `asyncio.Task` in main process | `multiprocessing.Process` (own process group) |
+| Startup cost | Negligible (coroutine creation) | Higher (process spawn + full Agent init) |
+| Crash blast radius | Main process dies | Only child process group affected |
+| OOM protection | None | Yes — SIGKILL hits child group only |
+| Heartbeat | None | Periodic, with RSS/tokens/cost/tool metrics |
+| IPC | `asyncio.Queue` (in-memory) | Unix socketpair + msgpack |
+| Steering | Queue injection | IPC `steer` → HeartbeatThread → Agent |
+| Kill | `asyncio.Task.cancel()` | `os.killpg(SIGTERM)` → grace → `os.killpg(SIGKILL)` |
+| SessionStore access | Shared with parent | None (parent persists results) |
+| Session key format | `{id}:mtagent:{hex12}` | `{id}:mpagent:{hex12}` |
+| Default max concurrency | 8 | 8 |
 
 ---
 
-## 3. 架构图
+## 3. Architecture
 
-### 3.1 整体架构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        AgentManager                             │
-│  ┌──────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │ spawn()  │  │   kill()     │  │      send() / steer      │  │
-│  │ list()   │  │   logs()     │  │  reset_children()        │  │
-│  └────┬─────┘  └──────┬───────┘  └────────────┬─────────────┘  │
-│       │               │                       │                 │
-│  ┌────▼───────────────▼───────────────────────▼──────────────┐  │
-│  │                    TaskQueue                               │  │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐  │  │
-│  │  │ main    │  │ mt      │  │ mp      │  │ cron        │  │  │
-│  │  │ lane    │  │ lane    │  │ lane    │  │ lane        │  │  │
-│  │  │ (auto)  │  │ (max:8) │  │ (max:8) │  │ (max:1)    │  │  │
-│  │  └─────────┘  └────┬────┘  └────┬────┘  └─────────────┘  │  │
-│  └─────────────────────┼───────────┼─────────────────────────┘  │
-│                        │           │                            │
-│  ┌─────────────────────┼───────────┼─────────────────────────┐  │
-│  │              AgentRegistry (纯内存)                        │  │
-│  │  RunRecord: run_id, child_key, status, outcome, pid ...   │  │
-│  └─────────────────────┼───────────┼─────────────────────────┘  │
-│                        │           │                            │
-│  ┌─────────────────────▼───────────▼─────────────────────────┐  │
-│  │              AgentAnnouncer                                │  │
-│  │  策略: steer → queue → direct → pending_queue             │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 3.2 mtAgent 数据流
+### 3.1 Component Map
 
 ```
-父 Agent (主进程)
+┌──────────────────────────────────────────────────────────────────┐
+│                         AgentManager                             │
+│  ┌──────────┐  ┌───────────────┐  ┌───────────────────────────┐  │
+│  │ spawn()  │  │ kill()        │  │ send() / steer            │  │
+│  │ list()   │  │ kill_recursive│  │ reset_children()          │  │
+│  │ logs()   │  │               │  │ get_child_sessions()      │  │
+│  └────┬─────┘  └──────┬────────┘  └────────────┬──────────────┘  │
+│       │               │                        │                 │
+│  ┌────▼───────────────▼────────────────────────▼──────────────┐  │
+│  │                     TaskQueue                               │  │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐   │  │
+│  │  │ main     │ │ mt       │ │ mp       │ │ cron         │   │  │
+│  │  │ (auto)   │ │ (max: 8) │ │ (max: 8) │ │ (max: 1)    │   │  │
+│  │  └──────────┘ └────┬─────┘ └────┬─────┘ └──────────────┘   │  │
+│  └──────────────────────┼──────────┼──────────────────────────┘  │
+│                         │          │                             │
+│  ┌──────────────────────┼──────────┼──────────────────────────┐  │
+│  │               AgentRegistry (in-memory)                     │  │
+│  │  RunRecord: run_id, child_key, status, outcome, pid, ...   │  │
+│  │  get_subtree() / get_tree_with_depth()                     │  │
+│  └──────────────────────┼──────────┼──────────────────────────┘  │
+│                         │          │                             │
+│  ┌──────────────────────▼──────────▼──────────────────────────┐  │
+│  │               AgentAnnouncer                                │  │
+│  │  Delivery: steer → queue → direct → pending_queue           │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 mtAgent Data Flow
+
+```
+Parent Agent
     │
     │ spawn(execution="mt")
     ▼
 AgentManager.spawn()
-    │
-    │ 1. 创建 RunRecord → AgentRegistry.register()
-    │ 2. 创建 asyncio.Queue (steer)
-    │ 3. TaskQueue.enqueue("mt", _execute_child)
+    │  1. Create RunRecord → Registry.register()
+    │  2. Create asyncio.Queue for steering
+    │  3. TaskQueue.enqueue("mt", _execute_child)
     ▼
-TaskQueue (mt lane)
-    │
-    │ drain → asyncio.create_task()
+TaskQueue mt lane
+    │  drain → asyncio.create_task()
     ▼
-_execute_child()                     父 Agent
-    │                                    │
-    │ agent_factory(task, model, ...)    │ send(message)
-    │         │                          │     │
-    │         ▼                          │     ▼
-    │   Child Agent.run()                │ asyncio.Queue.put()
-    │         │                          │     │
-    │         │ (完成)                    │     │
-    │         ▼                          │     │
-    │   RunOutcome                       │     │
-    │         │                          │     │
-    ▼         ▼                          │     │
-AgentRegistry.complete()               │     │
-    │                                    │     │
-    ▼                                    │     │
-AgentAnnouncer.announce_completion()    │     │
-    │                                    │     │
-    │ try_steer ──────────────────────►  │     │
-    │ try_queue ──────────────────────►  │     │
-    │ send_direct ────────────────────►  │     │
-    ▼                                    ▼     ▼
-  (结果推送到父 session)
-```
-
-### 3.3 mpAgent 数据流（含 IPC）
-
-```
-父进程 (MpRunner)                    子进程 (mp_child_main)
-    │                                    │
-    │ spawn(execution="mp")              │
-    ▼                                    │
-create_socket_pair()                     │
-    │                                    │
-    ├── parent_sock (non-blocking)       │
-    └── child_sock ──────────────────►   │
-                                         │
-multiprocessing.Process.start() ─────►   │ os.setpgrp()
-    │                                    │ 加载 config.yaml
-    │                                    │ 初始化 Agent (LLM, Tools, Memory)
-    │                                    │ 创建 in-memory Session
-    │                                    │
-    │                                    ▼
-    │                              HeartbeatThread.start()
-    │                                    │
-    │   ┌────────────────────────────────┤
-    │   │                                │
-    │   │  IPC 消息流                     │
-    │   │                                │
-    │   │  heartbeat ◄───────────────── 周期性心跳 (每 60s)
-    │   │  {type:"heartbeat",            │ {memory_rss_mb, elapsed_seconds,
-    │   │   ts:..., data:{...}}          │  tokens_used, total_cost,
-    │   │                                │  tool_calls_made, summary, ...}
-    │   │                                │
-    │   │  steer ──────────────────────► 注入 steering 消息
-    │   │  {type:"steer",                │ → Agent.steer(session_id, msg)
-    │   │   message:"..."}               │
-    │   │                                │
-    │   │  kill ───────────────────────► 请求优雅退出
-    │   │  {type:"kill"}                 │ → kill_requested = True
-    │   │                                │
-    │   │  progress ◄──────────────────  工具执行进度
-    │   │  {type:"progress",             │
-    │   │   tool_name, status, ...}      │
-    │   │                                │
-    │   │  result ◄────────────────────  最终结果
-    │   │  {type:"result",               │ Agent.run() 完成
-    │   │   status, output, error,       │
-    │   │   tokens, cost}                │
-    │   │                                │
-    │   └────────────────────────────────┘
-    │                                    │
-    ▼                                    ▼
-_recv_loop() 处理消息               子进程退出
-_monitor() 检测心跳超时
-    │
+_execute_child()
+    │  agent_factory(task, model, tools, child_key, parent_key)
+    │  → Child Agent.run()
+    │  → RunOutcome (ok / error / timeout / cancelled)
     ▼
-RunOutcome → AgentRegistry.complete()
+Registry.complete(run_id, outcome)
     │
     ▼
 AgentAnnouncer.announce_completion()
-    │
+    │  try_steer → try_queue → send_direct → pending_queue
     ▼
-(可选) SessionStore 持久化子 agent 结果
+Result delivered to parent session
+```
+
+### 3.3 mpAgent Data Flow
+
+```
+Parent (MpRunner)                     Child (mp_child_main)
+    │                                    │
+    │  create_socket_pair()              │
+    │  Process.start() ──────────────►   │ os.setpgrp()
+    │                                    │ load_config()
+    │                                    │ init Agent, LLM, Tools, Memory
+    │                                    │ create in-memory Session
+    │                                    │ create _SpawnProxy
+    │                                    │ start _HeartbeatThread
+    │                                    │ start _steering_pump
+    │                                    │
+    │  start _recv_loop                  │ Agent.run(task, session)
+    │  start _monitor                    │
+    │                                    │
+    │  ◄── heartbeat (every 60s) ──────  │ {rss, tokens, cost, tools, ...}
+    │  ── steer ──────────────────────►  │ → Agent.steer(session_id, msg)
+    │  ── kill ───────────────────────►  │ → kill_requested = True
+    │  ◄── progress ───────────────────  │ tool execution updates
+    │  ◄── result ─────────────────────  │ Agent.run() finished
+    │                                    │
+    │  _recv_loop → _resolve_result()    │ HeartbeatThread.stop()
+    │  wait_result() returns             │ child exits
+    │                                    │
+    ▼                                    ▼
+Registry.complete() → Announcer → parent session
 ```
 
 ---
 
-## 4. 核心组件
+## 4. Core Components
 
-### 4.1 AgentManager — 统一入口
+### 4.1 AgentManager
 
-`AgentManager` 是 agent 子系统的唯一公开接口，封装了 spawn、kill、steer、list 等所有操作。
+**File:** `src/march/agents/manager.py`
 
-**文件：** `src/march/agents/manager.py`
-
-**核心方法：**
+The single public entry point. Everything goes through here.
 
 ```python
 class AgentManager:
     async def spawn(self, params: SpawnParams, ctx: SpawnContext) -> SpawnResult
     async def list(self) -> list[AgentStatus]
     async def kill(self, agent_id: str) -> bool
+    async def kill_recursive(self, agent_id: str) -> int
     async def send(self, agent_id: str, message: str) -> bool
     async def logs(self, agent_id: str, tail: int = 50) -> list[str]
     async def reset_children(self, parent_session_key: str) -> int
     def get_child_sessions(self, parent_session_key: str) -> list[RunRecord]
 ```
 
-**SpawnParams 参数：**
+**`SpawnParams`** controls what gets spawned:
 
-```python
-@dataclass
-class SpawnParams:
-    task: str                    # 任务描述
-    agent_id: str = ""           # 自动生成 "agent-{uuid[:8]}"
-    model: str = ""              # LLM 模型（空则用默认）
-    tools: list[str] | None = None  # 可用工具列表
-    timeout: int = 0             # 超时秒数（0=无限）
-    mode: str = "run"            # "run"（一次性）或 "session"（保持活跃）
-    cleanup: str = "keep"        # "keep" 或 "delete"
-    label: str = ""              # 可读标签
-    execution: str = "mt"        # "mt" 或 "mp"
-```
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `task` | str | (required) | Task description |
+| `agent_id` | str | `"agent-{uuid[:8]}"` | Identifier; auto-generated if empty |
+| `model` | str | `""` | LLM model override (empty = default) |
+| `tools` | list[str] \| None | None | Restrict available tools |
+| `timeout` | int | 0 | Timeout in seconds (0 = none) |
+| `mode` | str | `"run"` | `"run"` (one-shot) or `"session"` (keep alive) |
+| `cleanup` | str | `"keep"` | `"keep"` or `"delete"` |
+| `label` | str | `""` | Human-readable label |
+| `execution` | str | `"mt"` | `"mt"` (asyncio) or `"mp"` (process) |
 
-**SpawnContext 上下文：**
+**`SpawnContext`** carries the caller's identity:
 
-```python
-@dataclass
-class SpawnContext:
-    requester_session: str       # 父 session key
-    origin: str = ""             # 父的 channel/source
-    caller_depth: int = 0        # 当前 spawn 深度
-```
+| Field | Type | Purpose |
+|-------|------|---------|
+| `requester_session` | str | Parent's session key |
+| `origin` | str | Parent's channel/source |
+| `caller_depth` | int | Current nesting depth |
 
-**关键行为：**
-- `spawn()` 检查 `caller_depth >= max_spawn_depth` 防止无限递归
-- mtAgent 和 mpAgent 走不同的执行路径（`_execute_child` vs `_execute_child_mp`）
-- `kill()` 对 mtAgent 调用 `task.cancel()`，对 mpAgent 调用 `runner.kill()`（killpg 整个进程组）
-- `send()` 对 mtAgent 写入 `asyncio.Queue`，对 mpAgent 通过 `MpRunner.send_steer()` 发送 IPC 消息
-- `reset_children()` 在父 session `/reset` 时清理所有子 agent（先 kill 活跃的，再删除 session 数据）
+**Key behaviors:**
 
-### 4.2 AgentRegistry — 内存追踪
+- `spawn()` rejects the call if `caller_depth >= max_spawn_depth`.
+- When the parent is itself a sub-agent, `spawn()` enforces **execution consistency**: the child must use the same execution mode as its parent. If they differ, the child's mode is silently forced to match.
+- `kill()` resolves by either `run_id` or `child_key`. For mtAgents it cancels the asyncio task; for mpAgents it calls `MpRunner.kill()` which sends SIGKILL to the process group.
+- `kill_recursive()` collects all descendants via `registry.get_subtree()`, then kills them bottom-up (deepest first) to avoid orphans.
+- `reset_children()` is called when the parent session does `/reset`. It recursively kills active children, deletes their session memory from disk, removes their sessions from the store, and clears their registry entries.
+- `send()` routes steering messages: `asyncio.Queue` for mtAgents, `MpRunner.send_steer()` (IPC) for mpAgents.
 
-`AgentRegistry` 是纯内存的 agent 运行记录存储。不做磁盘持久化。
+**mpAgent spawn internals (`_execute_child_mp`):**
 
-**文件：** `src/march/agents/registry.py`
+The manager builds three async closures — `_handle_spawn_request`, `_handle_steer`, `_handle_kill` — and passes them to `MpRunner` as spawn proxy handlers. These closures let the child process delegate spawn/steer/kill operations back to the parent's `AgentManager` over IPC (see [Section 10](#10-nested-agents-depth--1)).
 
-**核心数据结构：**
+After the child completes, the manager optionally persists the result to `SessionStore` by creating a session record and storing the output as an assistant message.
 
-```python
-@dataclass
-class RunRecord:
-    run_id: str              # UUID，唯一标识
-    child_key: str           # 子 agent 的 session key
-    requester_key: str       # 父 session key
-    requester_origin: str    # 父的 channel（用于 announce 投递）
-    task: str                # 任务描述
-    started_at: float        # Unix 时间戳
-    ended_at: float          # 0.0 = 仍在运行
-    mode: str                # "run" | "session"
-    cleanup: str             # "delete" | "keep"
-    outcome: RunOutcome | None  # 完成后的结果
-    cleanup_done: bool       # announce 是否已投递
-    execution: str           # "mt" | "mp"
-    pid: int                 # mpAgent 的进程 PID（mtAgent 为 0）
-    log_path: str            # 日志目录路径
+The `_announce()` helper has special logic for nested agents: if the parent is itself an active mpAgent, it calls `runner.notify_child_completed()` to push a `child_completed` IPC message so the grandchild's result reaches the mpAgent child process directly.
 
-@dataclass
-class RunOutcome:
-    status: str              # "ok" | "error" | "timeout" | "cancelled"
-    error: str = ""
-    output: str = ""
-    duration_ms: float = 0.0
-```
+### 4.2 AgentRegistry
 
-**关键属性：**
-- `RunRecord.is_active` → `ended_at == 0.0`（判断是否仍在运行）
-- `RunRecord.duration_seconds` → 实时计算已运行时长
+**File:** `src/march/agents/registry.py`
 
-**清理策略：**
-- `cleanup_old()` 只移除 `cleanup_done=True` 且超过 `max_age_seconds` 的记录（安全网，处理孤儿记录）
-- 正常清理通过 `AgentManager.reset_children()` 在父 session `/reset` 时触发
+Pure in-memory run tracking. No disk persistence.
 
-### 4.3 AgentAnnouncer — 结果推送
+**`RunRecord`** fields:
 
-`AgentAnnouncer` 负责将子 agent 的完成结果推送给父 session。采用三级降级策略：
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | str | UUID, unique per run |
+| `child_key` | str | Child's session key |
+| `requester_key` | str | Parent's session key |
+| `requester_origin` | str | Parent's channel (for announce routing) |
+| `task` | str | Task description |
+| `started_at` | float | Unix timestamp |
+| `ended_at` | float | Unix timestamp (0.0 = still running) |
+| `mode` | str | `"run"` or `"session"` |
+| `cleanup` | str | `"delete"` or `"keep"` |
+| `outcome` | RunOutcome \| None | Set on completion |
+| `cleanup_done` | bool | True once announce has been delivered |
+| `execution` | str | `"mt"` or `"mp"` |
+| `pid` | int | Process ID (mpAgent only; 0 for mt) |
+| `log_path` | str | Log directory |
 
-**文件：** `src/march/agents/announce.py`
+**`RunOutcome`:** `status` is one of `"ok"`, `"error"`, `"timeout"`, `"cancelled"`. Plus `error`, `output`, and `duration_ms` fields.
 
-**投递策略（按优先级）：**
+**Properties:** `is_active` checks `ended_at == 0.0`. `duration_seconds` computes elapsed time in real time.
 
-| 优先级 | 策略 | 说明 |
-|--------|------|------|
-| 1 | **Steer** | 注入到父 agent 当前正在执行的 turn 中 |
-| 2 | **Queue** | 排队到父 agent 当前 turn 结束后投递 |
-| 3 | **Direct** | 启动一个新的 agent turn 来处理结果 |
-| 4 | **Pending** | 所有方式都失败时，存入内存 pending queue |
+**Tree operations:**
 
-**消息格式：**
+- `get_subtree(root_key)` — depth-first recursive traversal following `requester_key` → `child_key` links. Returns all descendants.
+- `get_tree_with_depth(root_key)` — same traversal but returns `(depth, RunRecord)` tuples.
+- `list_for_requester(key)` — direct children only.
+
+**Cleanup:** `cleanup_old(max_age_seconds)` is a safety net that only removes records where `cleanup_done=True` AND the record has been complete for longer than `max_age_seconds`. Normal cleanup happens through `AgentManager.reset_children()`.
+
+### 4.3 AgentAnnouncer
+
+**File:** `src/march/agents/announce.py`
+
+Delivers completion results to the parent session. Connected to session infrastructure via callbacks (to avoid circular imports).
+
+**Delivery cascade:**
+
+| Priority | Method | When it works |
+|----------|--------|---------------|
+| 1 | **Steer** | Parent is mid-turn — inject result into the active turn |
+| 2 | **Queue** | Parent is mid-turn — deliver after current turn ends |
+| 3 | **Direct** | Parent is idle — start a new agent turn with the result |
+| 4 | **Pending** | Everything failed — buffer in `_pending_queue` |
+
+Pending messages are drained when the parent starts its next turn via `get_pending(requester_key)`.
+
+**Message format examples:**
 
 ```
 ✅ mtAgent `agent-abc12345:mtagent:def678901234` finished
-<output content>
+<output>
 
 ❌ mpAgent `agent-xyz:mpagent:abc123456789` failed
-**Error:** OOM killed by SIGKILL
+**Error:** Child process killed by SIGKILL (likely OOM)
 
 ⏱️ mpAgent `agent-xyz:mpagent:abc123456789` timed out
 **Error:** No heartbeat for 300s (timeout: 300s)
@@ -387,104 +322,88 @@ class RunOutcome:
 **Error:** killed by user
 ```
 
-**Pending 恢复：**
-当父 session 开始新的 turn 时，调用 `announcer.get_pending(requester_key)` 获取并清空积压的通知。
+**Important:** Agent sessions are NOT deleted after completion. They persist until the parent does `/reset`, so the parent can reference child context and history. The `cleanup_done` flag only tracks whether the announcement was delivered.
 
-**关键设计：**
-- Announcer 通过回调函数连接 session 基础设施，避免循环依赖
-- Agent session 在完成后**不会被删除**，持续存在直到父 session `/reset`
-- `cleanup_done` 标记仅表示 announce 已投递，不代表 session 被删除
+### 4.4 TaskQueue
 
-### 4.4 TaskQueue — Lane 并发控制
+**File:** `src/march/agents/task_queue.py`
 
-`TaskQueue` 提供基于 lane 的异步任务队列，每个 lane 有独立的并发限制。
+Lane-based async task queue. Each lane has its own concurrency limit and waiting queue.
 
-**文件：** `src/march/agents/task_queue.py`
+| Lane | Purpose | Default Max Concurrent |
+|------|---------|------------------------|
+| `main` | User sessions | `os.cpu_count()` |
+| `mt` | mtAgent runs | 8 |
+| `mp` | mpAgent runs | 8 |
+| `cron` | Scheduled jobs | 1 |
 
-**默认 Lane 配置：**
-
-| Lane | 用途 | 默认并发数 |
-|------|------|-----------|
-| `main` | 用户会话 | `os.cpu_count()` (auto) |
-| `mt` | mtAgent 运行 | 8 |
-| `mp` | mpAgent 运行 | 8 |
-| `cron` | 定时任务 | 1 |
-
-**工作原理：**
+Internally each lane has a `deque` (waiting) and a `set` (active task IDs). `_drain()` promotes queued tasks to active whenever a slot opens. Lanes are independent — mpAgents never compete with mtAgents for slots.
 
 ```python
-# 入队并等待完成
-result = await task_queue.enqueue("mt", my_async_fn)
+# Block until complete
+result = await task_queue.enqueue("mt", my_coroutine_fn)
 
-# Fire-and-forget（不等待）
-task_id = task_queue.enqueue_fire_and_forget("mp", my_async_fn)
+# Fire and forget
+task_id = task_queue.enqueue_fire_and_forget("mp", my_coroutine_fn)
+
+# Inspect
+task_queue.lane_stats("mt")   # {"name":"mt", "max_concurrent":8, "active":3, "queued":2}
+task_queue.all_stats()         # All lanes
+task_queue.total_active        # Sum across lanes
+task_queue.total_queued        # Sum across lanes
 ```
 
-内部使用 `deque` 作为等待队列，`set` 追踪活跃任务。`_drain()` 方法在每次任务完成或入队时被调用，将等待队列中的任务提升为活跃任务（直到达到 `max_concurrent`）。
+### 4.5 MpRunner
 
-**Introspection API：**
+**File:** `src/march/agents/mp_runner.py`
 
-```python
-task_queue.lane_stats("mt")
-# → {"name": "mt", "max_concurrent": 8, "active": 3, "queued": 2}
+Manages a single mpAgent child process from spawn to result collection.
 
-task_queue.all_stats()
-# → {"main": {...}, "mt": {...}, "mp": {...}, "cron": {...}}
+**Core guarantee:** `wait_result()` always returns a `RunOutcome`. It never hangs.
 
-task_queue.total_active   # 所有 lane 的活跃任务总数
-task_queue.total_queued   # 所有 lane 的排队任务总数
-```
-
-### 4.5 MpRunner — 进程生命周期管理
-
-`MpRunner` 管理单个 mpAgent 子进程的完整生命周期：spawn、heartbeat 监控、steering、kill、结果收集。
-
-**文件：** `src/march/agents/mp_runner.py`
-
-**核心保证：`wait_result()` 永远返回 `RunOutcome`，永远不会 hang。**
-
-所有故障模式（crash、OOM、timeout、IPC 断开）都会被捕获并产生对应的 `RunOutcome`。
-
-**内部组件：**
+**Internal structure:**
 
 ```
 MpRunner
-  ├── _recv_loop (asyncio.Task)     # 持续接收子进程 IPC 消息
-  ├── _monitor (asyncio.Task)       # 心跳超时检测 + 进程存活检查
-  ├── _parent_sock                  # Unix socket（非阻塞，asyncio 驱动）
+  ├── _recv_loop (asyncio.Task)     # Reads IPC messages from child
+  ├── _monitor (asyncio.Task)       # Watches heartbeat timing + process liveness
+  ├── _parent_sock                  # Non-blocking Unix socket, driven by asyncio
   ├── _result_future                # asyncio.Future[RunOutcome]
-  └── _latest_heartbeat             # 最新心跳数据
+  ├── _latest_heartbeat             # Most recent heartbeat dict
+  ├── _spawn_handler                # Callback: delegate grandchild spawns to AgentManager
+  ├── _steer_handler                # Callback: forward steer to grandchild
+  └── _kill_handler                 # Callback: forward kill to grandchild
 ```
 
-**Spawn 流程：**
+**Spawn sequence:**
 
-1. 创建 Unix socketpair（`create_socket_pair()`）
-2. 设置 parent socket 为非阻塞
-3. 通过 `multiprocessing.get_context("spawn").Process()` 创建子进程
-4. 关闭 parent 端的 child socket
-5. 记录 PID 和 PGID（`pgid == pid`，因为子进程调用 `os.setpgrp()`）
-6. 启动 `_recv_loop` 和 `_monitor` 两个 asyncio.Task
+1. `create_socket_pair()` → two connected AF_UNIX SOCK_STREAM sockets, both `set_inheritable(True)`
+2. Set parent socket to non-blocking
+3. `multiprocessing.get_context("spawn").Process(target=mp_child_main, args=(...))` — pass child socket fd, config path, task, session ID, log dir, heartbeat interval
+4. `process.start()` → record `pid`; set `pgid = pid` (child calls `setpgrp`)
+5. Close child socket on parent side
+6. Launch `_recv_loop` and `_monitor` as asyncio tasks
+7. Return `MpRunHandle(pid, session_id, runner)`
 
-**Kill 流程：**
+**Kill sequence:**
 
-1. 尝试通过 IPC 发送 `{type: "kill"}` 消息（优雅通知）
-2. 调用 `_kill_process_group(graceful=False)` → `os.killpg(pgid, SIGKILL)`
-3. 设置 `RunOutcome(status="cancelled", error="Killed by parent")`
+1. Try sending `{type: "kill"}` via IPC (graceful notification)
+2. `os.killpg(pgid, SIGKILL)` (immediate)
+3. Resolve `_result_future` with `RunOutcome(status="cancelled")`
 
-**Graceful Kill 流程：**
+**Graceful kill** (used by heartbeat timeout): SIGTERM → wait `kill_grace_seconds` → SIGKILL if still alive → `process.join(timeout=5.0)`.
 
-1. `os.killpg(pgid, SIGTERM)`
-2. 等待 `kill_grace_seconds`（默认 10s）
-3. 如果子进程仍然存活 → `os.killpg(pgid, SIGKILL)`
-4. `process.join(timeout=5.0)` 等待回收
+**`_resolve_result()`** is idempotent. Multiple code paths (recv loop, monitor, kill) may race to set the result; the `_done` flag ensures only the first caller wins.
 
-### 4.6 IPC 协议 — 消息类型和格式
+**`wait_result()`** wraps the future in `asyncio.wait_for()` with a safety timeout of `heartbeat_timeout + kill_grace + 60s`. If even that fires, it force-kills the process and returns a timeout outcome.
 
-父子进程通过 Unix socketpair 通信，使用 **msgpack 序列化 + 4 字节大端长度前缀** 的帧协议。
+**Spawn proxy handling:** When `_recv_loop` receives `MSG_SPAWN_REQUEST`, `MSG_SPAWN_STEER`, or `MSG_SPAWN_KILL`, it dispatches to the corresponding handler callback (provided by `AgentManager._execute_child_mp`). Results flow back via `_send_spawn_result()` or `notify_child_completed()`.
 
-**文件：** `src/march/agents/ipc.py`
+### 4.6 IPC Protocol
 
-**帧格式：**
+**File:** `src/march/agents/ipc.py`
+
+**Wire format:** 4-byte big-endian length prefix + msgpack payload (max 64 MB).
 
 ```
 ┌──────────────┬──────────────────────────┐
@@ -493,27 +412,35 @@ MpRunner
 └──────────────┴──────────────────────────┘
 ```
 
-**消息类型：**
+Falls back to JSON if msgpack is not installed (logs a warning).
 
-| 方向 | 类型 | 常量 | 说明 |
-|------|------|------|------|
-| Parent → Child | steer | `MSG_STEER` | 注入 steering 消息 |
-| Parent → Child | kill | `MSG_KILL` | 请求优雅退出 |
-| Child → Parent | heartbeat | `MSG_HEARTBEAT` | 周期性心跳 + 资源指标 |
-| Child → Parent | progress | `MSG_PROGRESS` | 工具执行进度 |
-| Child → Parent | result | `MSG_RESULT` | 最终运行结果 |
-| Child → Parent | log | `MSG_LOG` | 日志条目 |
+**Message types:**
 
-**消息 Schema：**
+| Direction | Type Constant | Purpose |
+|-----------|---------------|---------|
+| Parent → Child | `MSG_STEER` | Inject steering message |
+| Parent → Child | `MSG_KILL` | Request graceful shutdown |
+| Parent → Child | `MSG_SPAWN_RESULT` | Response to child's spawn request |
+| Parent → Child | `MSG_CHILD_COMPLETED` | Grandchild finished notification |
+| Child → Parent | `MSG_HEARTBEAT` | Periodic metrics |
+| Child → Parent | `MSG_PROGRESS` | Tool execution progress |
+| Child → Parent | `MSG_RESULT` | Final run result |
+| Child → Parent | `MSG_LOG` | Log entry |
+| Child → Parent | `MSG_SPAWN_REQUEST` | Request parent to spawn grandchild |
+| Child → Parent | `MSG_SPAWN_STEER` | Forward steer to grandchild |
+| Child → Parent | `MSG_SPAWN_KILL` | Request kill of grandchild |
+
+**Two API surfaces:**
+
+- **Async** (`send_message` / `recv_message`): Used by the parent process (MpRunner) on the asyncio event loop. Uses `loop.sock_sendall()` / `loop.sock_recv()`.
+- **Sync** (`send_message_sync` / `recv_message_sync`): Used by the child's `_HeartbeatThread` (a plain `threading.Thread`). Blocking socket I/O with optional timeout.
+
+**Socket inheritance:** Both ends are marked `set_inheritable(True)` so the fd survives `multiprocessing.Process(start_method="spawn")`.
+
+**Key message schemas:**
 
 ```python
-# Parent → Child: Steer
-{"type": "steer", "message": "请优先处理 API 部分"}
-
-# Parent → Child: Kill
-{"type": "kill"}
-
-# Child → Parent: Heartbeat
+# Heartbeat (child → parent)
 {
     "type": "heartbeat",
     "ts": 1709913600.0,
@@ -529,558 +456,495 @@ MpRunner
         "current_tool_detail": "{'command': 'pytest tests/'}",
         "recent_tools": [
             {"name": "read", "status": "done", "ms": 12, "summary": ""},
-            {"name": "edit", "status": "done", "ms": 45, "summary": ""},
-            {"name": "exec", "status": "done", "ms": 3200, "summary": ""}
+            {"name": "edit", "status": "done", "ms": 45, "summary": ""}
         ]
     }
 }
 
-# Child → Parent: Progress
-{
-    "type": "progress",
-    "tool_name": "exec",
-    "status": "running",
-    "summary": "Running pytest...",
-    "duration_ms": 1500.0
-}
-
-# Child → Parent: Result
+# Result (child → parent)
 {
     "type": "result",
-    "status": "ok",          # "ok" | "error"
-    "output": "任务完成：已创建 12 个测试文件...",
+    "status": "ok",
+    "output": "Task complete: created 12 test files...",
     "error": "",
     "tokens": 25000,
     "cost": 0.0768
 }
 
-# Child → Parent: Log
-{"type": "log", "level": "info", "message": "Starting task execution"}
-```
-
-**序列化后端：**
-- 优先使用 `msgpack`（高效二进制）
-- 如果 msgpack 未安装，自动降级为 JSON（带 warning 日志）
-
-**同步 vs 异步 API：**
-- 父进程（asyncio）使用 `send_message()` / `recv_message()`（async）
-- 子进程的 HeartbeatThread 使用 `send_message_sync()` / `recv_message_sync()`（blocking）
-
-**Socket 继承：**
-两个 socket 都设置 `set_inheritable(True)`，确保在 `multiprocessing.Process(start_method="spawn")` 跨进程时 fd 可继承。
-
----
-
-## 5. 生命周期
-
-### 5.1 通用生命周期
-
-```
-spawn → enqueue → execute → result → announce → cleanup
-  │        │         │         │         │          │
-  │        │         │         │         │          └── Registry 标记 cleanup_done
-  │        │         │         │         └── Announcer 推送到父 session
-  │        │         │         └── Registry.complete(outcome)
-  │        │         └── Agent 执行任务
-  │        └── TaskQueue 排队等待 lane slot
-  └── Registry.register(record)
-```
-
-### 5.2 mtAgent 生命周期
-
-```
-1. AgentManager.spawn(execution="mt")
-   ├── 验证 spawn depth
-   ├── 生成 run_id (UUID) 和 child_key
-   ├── 创建 RunRecord → Registry.register()
-   ├── 创建 steer Queue (asyncio.Queue)
-   └── TaskQueue.enqueue("mt", _execute_child)
-
-2. TaskQueue drain → asyncio.create_task()
-
-3. _execute_child()
-   ├── agent_factory(task, model, tools, child_key, parent_key)
-   │   └── 创建 Child Agent → Agent.run(task)
-   ├── 捕获所有异常 → RunOutcome
-   │   ├── CancelledError → status="cancelled"
-   │   ├── TimeoutError → status="timeout"
-   │   └── Exception → status="error"
-   └── 正常完成 → RunOutcome(status="ok", output=result)
-
-4. Registry.complete(run_id, outcome)
-
-5. 清理
-   ├── 移除 _active_tasks[run_id]
-   └── 移除 _steer_queues[child_key]
-
-6. AgentAnnouncer.announce_completion(record, outcome)
-   └── steer → queue → direct → pending
-```
-
-### 5.3 mpAgent 生命周期
-
-```
-1. AgentManager.spawn(execution="mp")
-   ├── 验证 spawn depth
-   ├── 生成 run_id 和 child_key
-   ├── 创建 RunRecord → Registry.register()
-   └── TaskQueue.enqueue("mp", _execute_child_mp)
-
-2. _execute_child_mp()
-   ├── 创建 MpRunner + MpConfig
-   ├── runner.spawn(task, session_id, config_path, mp_config)
-   │   ├── create_socket_pair()
-   │   ├── multiprocessing.Process.start()
-   │   │   └── 子进程: mp_child_main()
-   │   │       ├── os.setpgrp()  (新进程组)
-   │   │       ├── socket.fromfd(child_sock_fd)
-   │   │       ├── _setup_child_logging()
-   │   │       ├── load_config() + 初始化 Agent
-   │   │       ├── HeartbeatThread.start()
-   │   │       ├── steering_pump (asyncio.Task)
-   │   │       ├── Agent.run(task, session)
-   │   │       ├── HeartbeatThread.stop()
-   │   │       └── IPC 发送 result 消息
-   │   ├── 关闭 parent 端的 child_sock
-   │   ├── 启动 _recv_loop (asyncio.Task)
-   │   └── 启动 _monitor (asyncio.Task)
-   │
-   ├── 记录 PID 到 RunRecord
-   └── runner.wait_result()  ← 保证返回
-
-3. 父进程并行运行:
-   ├── _recv_loop: 接收 heartbeat/progress/log/result
-   └── _monitor: 检测心跳超时 + 进程存活
-
-4. 子进程完成 → IPC result 消息
-   └── _recv_loop 收到 → _resolve_result(outcome)
-
-5. wait_result() 返回 RunOutcome
-
-6. 清理
-   ├── 移除 _active_runners[run_id]
-   ├── Registry.complete(run_id, outcome)
-   ├── 移除 _active_tasks[run_id]
-   └── (可选) SessionStore 持久化子 agent 结果
-
-7. AgentAnnouncer.announce_completion(record, outcome)
-```
-
-**子进程内部生命周期：**
-
-```
-mp_child_main(child_sock_fd, config_path, task, session_id, log_dir, hb_interval)
-  │
-  ├── os.setpgrp()                    # 独立进程组
-  ├── socket.fromfd(child_sock_fd)    # 重建 IPC socket
-  ├── os.close(child_sock_fd)         # 关闭 dup 的 fd
-  │
-  └── asyncio.run(_async_child_main())
-        │
-        ├── load_config(config_path)
-        ├── 创建 LLM Router + Providers
-        ├── 创建 Tool Registry + Builtin Tools + Skills
-        ├── 创建 MemoryStore
-        ├── 创建 Agent（无 SessionStore）
-        ├── 创建 in-memory Session
-        │
-        ├── HeartbeatThread.start()
-        │   └── 循环: 发送心跳 → 接收 steer/kill
-        │
-        ├── steering_pump (asyncio.Task)
-        │   └── 循环: drain steer messages → Agent.steer()
-        │
-        ├── 包装 tools.execute 为 _tracked_execute
-        │   └── 追踪: current_tool, recent_tools, tool_calls_made
-        │
-        ├── Agent.run(task, session)
-        │   └── (正常执行或异常)
-        │
-        ├── steering_pump.cancel()
-        ├── HeartbeatThread.stop() + join()
-        │
-        └── IPC 发送 {type:"result", status, output, error, tokens, cost}
-```
-
----
-
-## 6. 故障处理
-
-### 6.1 故障矩阵
-
-| 故障场景 | 影响范围 | 检测方式 | 处理策略 | 最终 RunOutcome |
-|----------|----------|----------|----------|-----------------|
-| **mtAgent 异常** | 仅该 task | try/except | 捕获 → outcome | `error` + 异常信息 |
-| **mtAgent cancel** | 仅该 task | CancelledError | 捕获 → outcome | `cancelled` |
-| **mtAgent 超时** | 仅该 task | TimeoutError | 捕获 → outcome | `timeout` |
-| **mpAgent 正常退出** | 仅子进程 | IPC result 消息 | _recv_loop 处理 | `ok` + output |
-| **mpAgent 异常退出** | 仅子进程 | IPC result(error) | _recv_loop 处理 | `error` + 异常信息 |
-| **mpAgent OOM (SIGKILL)** | 仅子进程组 | process.is_alive()=False, exitcode=-9 | _monitor → _handle_process_exit | `error` + "killed by SIGKILL (likely OOM)" |
-| **mpAgent 信号杀死** | 仅子进程组 | exitcode < 0 | _handle_process_exit | `error` + 信号名 |
-| **mpAgent 心跳超时** | 仅子进程组 | _monitor 检测 elapsed > timeout | SIGTERM → grace → SIGKILL | `timeout` + 超时详情 |
-| **mpAgent IPC 断开** | 仅子进程 | ConnectionError in _recv_loop | _resolve_result | `error` + "IPC connection lost" |
-| **mpAgent 父进程消失** | 子进程变孤儿 | HeartbeatThread send 失败 | kill_requested → 子进程自行退出 | N/A（父已不在） |
-| **mpAgent 正常退出但无 result** | 仅子进程 | exitcode=0 但 _done=False | 等 0.5s → error | `error` + "no result received" |
-| **announce 投递失败** | 结果未送达 | 三级策略全部失败 | 存入 pending_queue | 下次 turn 时重试 |
-| **announce 超时** | 结果延迟 | wait_for timeout | 记录 warning | 结果仍在 registry |
-| **wait_result safety timeout** | 极端情况 | asyncio.wait_for | force kill → outcome | `timeout` + "safety timeout" |
-
-### 6.2 核心保证
-
-**父进程一定能拿到结果。** 这是通过多层防御实现的：
-
-1. **IPC result 消息**：正常路径，子进程主动发送结果
-2. **进程退出检测**：`_monitor` 定期检查 `process.is_alive()`，如果子进程已退出但没收到 result，根据 exitcode 生成 outcome
-3. **心跳超时**：如果子进程既不发心跳也不退出（hang），超时后 SIGTERM → SIGKILL
-4. **IPC 断开检测**：`_recv_loop` 捕获 `ConnectionError`，立即生成 error outcome
-5. **Safety timeout**：`wait_result()` 有最终安全超时（`heartbeat_timeout + kill_grace + 60s`），防止所有其他机制都失败时永远 hang
-6. **`_resolve_result()` 幂等**：多个路径可能同时尝试设置结果，`_done` flag 确保只有第一个生效
-
-```python
-# wait_result 的安全超时计算
-safety_timeout = (
-    heartbeat_timeout_seconds    # 300s (默认)
-    + kill_grace_seconds         # 10s
-    + 60                         # 额外缓冲
-)
-# = 370s，足够覆盖所有正常超时路径
-```
-
----
-
-## 7. 心跳与监控
-
-### 7.1 心跳格式和内容
-
-心跳由子进程的 `_HeartbeatThread`（daemon thread）周期性发送，包含丰富的运行时指标：
-
-```python
+# Spawn request (child → parent, for nested agents)
 {
-    "type": "heartbeat",
-    "ts": 1709913600.0,          # Unix 时间戳
-    "data": {
-        "memory_rss_mb": 256.3,           # 进程 RSS 内存 (MB)
-        "elapsed_seconds": 45.2,          # 已运行时间
-        "tokens_used": 12500,             # 已消耗 token 数
-        "total_cost": 0.0384,             # 已消耗费用 (USD)
-        "tool_calls_made": 7,             # 工具调用次数
-        "llm_calls_made": 3,              # LLM 调用次数
-        "summary": "Executing tool: exec",# 当前状态摘要
-        "current_tool": "exec",           # 正在执行的工具
-        "current_tool_detail": "{'command': 'pytest'}",  # 工具参数
-        "recent_tools": [                 # 最近 3 次工具调用
-            {"name": "read", "status": "done", "ms": 12, "summary": ""},
-            {"name": "edit", "status": "done", "ms": 45, "summary": ""}
-        ]
-    }
+    "type": "spawn_request",
+    "task": "Run the test suite",
+    "agent_id": "",
+    "model": "",
+    "timeout": 0,
+    "request_id": "a1b2c3d4e5f6g7h8"
+}
+
+# Spawn result (parent → child)
+{
+    "type": "spawn_result",
+    "request_id": "a1b2c3d4e5f6g7h8",
+    "status": "accepted",
+    "child_key": "agent-xyz:mpagent:abc123456789",
+    "run_id": "...",
+    "error": ""
+}
+
+# Grandchild completed (parent → child)
+{
+    "type": "child_completed",
+    "child_key": "agent-xyz:mpagent:abc123456789",
+    "status": "ok",
+    "output": "All tests passed.",
+    "error": ""
 }
 ```
 
-**内存计算：**
-- Linux：`resource.getrusage(RUSAGE_SELF).ru_maxrss` 返回 KB，除以 1024 得到 MB
-- macOS：返回 bytes，除以 1024² 得到 MB
+---
 
-**工具追踪：**
-子进程通过 monkey-patch `agent.tools.execute` 为 `_tracked_execute`，自动追踪每次工具调用的名称、状态、耗时，并更新 HeartbeatThread 的统计字段。
+## 5. Lifecycle
 
-### 7.2 进度查询
+### 5.1 mtAgent
 
-父 agent 通过 `AgentManager.logs(agent_id)` 查询 mpAgent 的实时状态：
+```
+1. AgentManager.spawn(execution="mt")
+   ├── Validate depth < max_spawn_depth
+   ├── Generate run_id (UUID) + child_key
+   ├── RunRecord → Registry.register()
+   ├── Create steer asyncio.Queue
+   └── TaskQueue.enqueue("mt", _execute_child)
+
+2. TaskQueue drains → asyncio.create_task()
+
+3. _execute_child()
+   ├── agent_factory() → Child Agent.run(task)
+   ├── Catches: CancelledError → "cancelled"
+   │            TimeoutError  → "timeout"
+   │            Exception     → "error"
+   └── Normal return         → "ok"
+
+4. Registry.complete(run_id, outcome)
+   Clean up _active_tasks, _steer_queues
+
+5. AgentAnnouncer.announce_completion()
+   steer → queue → direct → pending
+```
+
+### 5.2 mpAgent
+
+```
+1. AgentManager.spawn(execution="mp")
+   ├── Validate depth < max_spawn_depth
+   ├── Generate run_id + child_key
+   ├── RunRecord → Registry.register()
+   └── TaskQueue.enqueue("mp", _execute_child_mp)
+
+2. _execute_child_mp()
+   ├── Build MpRunner with spawn/steer/kill handler closures
+   ├── runner.spawn() → child process starts
+   │   └── mp_child_main():
+   │       ├── os.setpgrp()
+   │       ├── Reconstruct socket from fd
+   │       ├── _setup_child_logging()
+   │       ├── load_config() → init LLM, tools, memory
+   │       ├── Create in-memory Session
+   │       ├── Create _SpawnProxy
+   │       ├── Start _HeartbeatThread
+   │       ├── Register spawn_agent tool
+   │       ├── Wrap tools.execute → _tracked_execute
+   │       ├── Start _steering_pump task
+   │       ├── Agent.run(task, session)
+   │       ├── Stop steering pump + heartbeat thread
+   │       └── Send result via IPC
+   ├── Record PID in RunRecord
+   └── runner.wait_result() ← guaranteed to return
+
+3. Parent runs concurrently:
+   ├── _recv_loop: heartbeat / progress / log / result / spawn proxy
+   └── _monitor: heartbeat timeout + process liveness
+
+4. Result arrives → _resolve_result() → wait_result() returns
+
+5. Cleanup:
+   ├── Remove runner from _active_runners
+   ├── Registry.complete()
+   ├── Optionally persist to SessionStore
+   └── AgentAnnouncer.announce_completion()
+```
+
+---
+
+## 6. Failure Handling
+
+### 6.1 Failure Matrix
+
+| Scenario | Detection | Resolution | Outcome |
+|----------|-----------|------------|---------|
+| mtAgent exception | try/except in `_execute_child` | Catch, build outcome | `error` |
+| mtAgent cancelled | `CancelledError` | Catch | `cancelled` |
+| mtAgent timeout | `TimeoutError` | Catch | `timeout` |
+| mpAgent normal result | IPC `result` message | `_recv_loop` resolves future | `ok` or `error` |
+| mpAgent OOM (SIGKILL) | `process.is_alive()=False`, `exitcode=-9` | `_monitor` → `_handle_process_exit` | `error` + "killed by SIGKILL (likely OOM)" |
+| mpAgent killed by signal | `exitcode < 0` | `_handle_process_exit` | `error` + signal name |
+| mpAgent heartbeat timeout | `_monitor` sees elapsed > threshold | SIGTERM → grace → SIGKILL | `timeout` |
+| mpAgent IPC disconnect | `ConnectionError` in `_recv_loop` | `_resolve_result` immediately | `error` + "IPC connection lost" |
+| mpAgent parent disappears | `BrokenPipeError` in HeartbeatThread send | Child sets `kill_requested`, exits | N/A (parent gone) |
+| mpAgent exits cleanly but no result | `exitcode=0`, `_done=False` | Wait 0.5s, then error | `error` + "no result received" |
+| All announce methods fail | Steer/queue/direct all fail | Store in `_pending_queue` | Delivered on next parent turn |
+| Safety timeout in `wait_result` | `asyncio.wait_for` fires | Force kill process | `timeout` + "safety timeout" |
+
+### 6.2 The Five-Layer Guarantee
+
+`MpRunner.wait_result()` always returns because five independent mechanisms cover every failure mode:
+
+1. **IPC result message** — the happy path. Child sends `{type: "result"}`.
+2. **Process exit detection** — `_monitor` polls `process.is_alive()`. If the child is dead but no result arrived, it generates an outcome from the exit code.
+3. **Heartbeat timeout** — if the child is alive but silent (hung), `_monitor` kills it after `heartbeat_timeout_seconds`.
+4. **IPC disconnect** — `_recv_loop` catches `ConnectionError` and resolves immediately.
+5. **Safety timeout** — `wait_result()` wraps everything in `asyncio.wait_for(timeout=heartbeat_timeout + kill_grace + 60)`. Last resort.
+
+`_resolve_result()` is idempotent via the `_done` flag, so multiple layers racing to set the result is safe.
 
 ```python
-lines = await manager.logs("agent-abc12345")
-# 输出示例:
-# Run ID: 550e8400-e29b-41d4-a716-446655440000
-# Child Key: agent-abc12345:mpagent:def678901234
-# Execution: mp
-# Task: 重构数据库层
-# Started: Sun Mar  8 16:00:00 2026
-# Status: running
-# Duration: 45.2s
-# PID: 12345
-# Log Path: /home/user/.march/logs/agent-abc12345:mpagent:def678901234
-# --- Latest Heartbeat ---
-#   Memory RSS: 256.3 MB
-#   Elapsed: 45.2s
-#   Tokens: 12500
-#   Cost: $0.0384
-#   Tool Calls: 7
-#   Summary: Executing tool: exec
-#   Current Tool: exec
-#   Detail: {'command': 'pytest tests/'}
+safety_timeout = heartbeat_timeout_seconds + kill_grace_seconds + 60
+# Default: 300 + 10 + 60 = 370s
 ```
-
-也可以通过 `AgentManager.list()` 获取所有 agent 的状态，包含最新心跳数据。
-
-### 7.3 超时检测和 Kill 流程
-
-**心跳监控循环（`_monitor`）：**
-
-```
-每 min(timeout/4, 15s) 检查一次:
-  │
-  ├── process.is_alive() == False?
-  │   └── YES → _handle_process_exit()
-  │             根据 exitcode 生成 RunOutcome
-  │
-  └── elapsed since last heartbeat > heartbeat_timeout_seconds?
-      └── YES → 心跳超时
-          ├── os.killpg(pgid, SIGTERM)
-          ├── 等待 kill_grace_seconds (默认 10s)
-          ├── 如果仍然存活 → os.killpg(pgid, SIGKILL)
-          └── RunOutcome(status="timeout")
-```
-
-**孤儿检测（子进程侧）：**
-
-HeartbeatThread 在每次发送心跳时检测 `BrokenPipeError`。如果父进程已消失（socket 断开），子进程设置 `kill_requested = True` 并自行退出，防止成为孤儿进程。
 
 ---
 
-## 8. 配置参考
+## 7. Heartbeat & Monitoring
 
-### 8.1 完整 config.yaml 示例
+### 7.1 Heartbeat Content
+
+The child's `_HeartbeatThread` (a daemon thread) sends heartbeats at `heartbeat_interval_seconds` (default 60s). Each heartbeat includes:
+
+| Field | Source |
+|-------|--------|
+| `memory_rss_mb` | `resource.getrusage(RUSAGE_SELF).ru_maxrss` — KB on Linux, bytes on macOS |
+| `elapsed_seconds` | `time.time() - start_time` |
+| `tokens_used` | Updated by agent loop |
+| `total_cost` | Updated by agent loop |
+| `tool_calls_made` | Incremented by `_tracked_execute` wrapper |
+| `llm_calls_made` | Updated by agent loop |
+| `summary` | Current status text (e.g., "Executing tool: exec") |
+| `current_tool` | Name of the tool currently running |
+| `current_tool_detail` | First 200 chars of tool args |
+| `recent_tools` | Last 3 tool calls: name, status, duration_ms, summary |
+
+Tool tracking works by monkey-patching `agent.tools.execute` with `_tracked_execute`, which wraps every tool call to record timing and status.
+
+### 7.2 Heartbeat Thread Internals
+
+The thread alternates between sending a heartbeat and listening for incoming messages in short recv windows (1s timeout per iteration). This lets it pick up `steer`, `kill`, `spawn_result`, and `child_completed` messages between heartbeats.
+
+**Orphan detection:** If `send_message_sync()` raises `BrokenPipeError` or `ConnectionError`, the parent is gone. The thread sets `kill_requested = True` and stops, causing the child process to exit cleanly.
+
+**Steering flow:** Incoming `steer` messages are appended to `_steer_messages` (protected by a lock). The `_steering_pump` asyncio task in the child's event loop calls `drain_steer_messages()` every 0.5s and injects them into the agent via `agent.steer(session_id, msg)`.
+
+### 7.3 Monitor Loop
+
+`_monitor` runs in the parent process as an asyncio task. Check interval: `min(heartbeat_timeout / 4, 15s)`.
+
+Each iteration:
+
+1. Is the process dead? → `_handle_process_exit()` (generate outcome from exit code)
+2. Has it been too long since the last heartbeat? → Kill the process group (SIGTERM → grace → SIGKILL) → `RunOutcome(status="timeout")`
+
+### 7.4 Querying Status
+
+```python
+# Detailed status for one agent
+lines = await manager.logs("agent-abc12345")
+
+# All agents with heartbeat data
+statuses = await manager.list()
+for s in statuses:
+    if s.heartbeat:
+        print(f"RSS: {s.heartbeat['memory_rss_mb']}MB, Tokens: {s.heartbeat['tokens_used']}")
+```
+
+---
+
+## 8. Configuration
+
+### 8.1 config.yaml
 
 ```yaml
-# ~/.march/config.yaml
-
 agents:
-  max_concurrent: 4              # (未使用，由各 lane 独立控制)
+  max_concurrent: 4              # Unused — each lane has its own limit
 
   mt:
-    max_concurrent: 8            # mt lane 最大并发 mtAgent 数
+    max_concurrent: 8            # mtAgent lane concurrency
 
   mp:
-    max_concurrent: 8            # mp lane 最大并发 mpAgent 数
-    heartbeat_interval_seconds: 60   # 心跳发送间隔（秒）
-    heartbeat_timeout_seconds: 300   # 心跳超时阈值（秒）
-    kill_grace_seconds: 10           # SIGTERM → SIGKILL 等待时间（秒）
-    spawn_method: spawn              # "spawn" | "forkserver"
+    max_concurrent: 8            # mpAgent lane concurrency
+    heartbeat_interval_seconds: 60
+    heartbeat_timeout_seconds: 300
+    kill_grace_seconds: 10
+    spawn_method: spawn          # "spawn" or "forkserver"
 
   subagents:
-    max_spawn_depth: 1           # 最大 spawn 嵌套深度
+    max_spawn_depth: 1           # Max nesting depth (default: 1)
 ```
 
-### 8.2 参数说明
+### 8.2 Parameter Reference
 
-#### MtConfig
+**MtConfig** (`agents.mt`):
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `max_concurrent` | int | 8 | mt lane 最大并发 mtAgent 数量。超出的任务排队等待。 |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_concurrent` | int | 8 | Max simultaneous mtAgents |
 
-#### MpConfig
+**MpConfig** (`agents.mp`):
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `max_concurrent` | int | 8 | mp lane 最大并发 mpAgent 数量。超出的任务排队等待。 |
-| `heartbeat_interval_seconds` | int | 60 | 子进程发送心跳的间隔（秒）。较小的值提高监控精度但增加 IPC 开销。 |
-| `heartbeat_timeout_seconds` | int | 300 | 无心跳超时阈值（秒）。超过此时间未收到心跳，父进程将 kill 子进程。 |
-| `kill_grace_seconds` | int | 10 | 发送 SIGTERM 后等待子进程优雅退出的时间（秒）。超时后发送 SIGKILL。 |
-| `spawn_method` | str | "spawn" | multiprocessing 的 start method。`"spawn"` 最安全（完全重新初始化），`"forkserver"` 启动更快但可能继承父进程状态。 |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_concurrent` | int | 8 | Max simultaneous mpAgents |
+| `heartbeat_interval_seconds` | int | 60 | How often the child sends heartbeats |
+| `heartbeat_timeout_seconds` | int | 300 | How long the parent waits before declaring the child dead |
+| `kill_grace_seconds` | int | 10 | SIGTERM → SIGKILL grace period |
+| `spawn_method` | str | `"spawn"` | `multiprocessing` start method. `"spawn"` is safest (clean re-init). `"forkserver"` is faster but may inherit parent state. |
 
-#### SubagentsCommonConfig
+**SubagentsCommonConfig** (`agents.subagents`):
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `max_spawn_depth` | int | 1 | 最大 spawn 嵌套深度。防止 agent 无限递归 spawn 子 agent。值为 1 表示只允许一层子 agent。 |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_spawn_depth` | int | 1 | Max nesting depth. `1` = sub-agents only, no grandchildren. Increase to enable nested spawning. |
 
-#### AgentManagerConfig（代码内部）
+**AgentManagerConfig** (code-internal):
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `max_spawn_depth` | int | 1 | 同上，从 SubagentsCommonConfig 映射。 |
-| `reset_after_complete_minutes` | int | 60 | 已完成记录的最大保留时间（分钟）。仅清理 `cleanup_done=True` 的记录。 |
-| `announce_timeout_seconds` | int | 60 | announce 投递的超时时间（秒）。 |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_spawn_depth` | int | 1 | Mapped from `SubagentsCommonConfig` |
+| `reset_after_complete_minutes` | int | 60 | Safety-net TTL for orphaned completed records |
+| `announce_timeout_seconds` | int | 60 | Max time to wait for announce delivery |
 
 ---
 
-## 9. Session ID 和日志
+## 9. Session IDs & Logging
 
-### 9.1 命名格式
+### 9.1 Naming
 
-**Session ID（child_key）格式：**
+Session keys follow the pattern:
 
 ```
 {agent_id}:{execution_suffix}:{uuid_hex[:12]}
 ```
 
-- `agent_id`：由调用方指定或自动生成为 `agent-{uuid[:8]}`
-- `execution_suffix`：`mtagent`（mtAgent）或 `mpagent`（mpAgent）
-- `uuid_hex[:12]`：12 位十六进制随机字符串
+- `agent_id`: Caller-specified or auto-generated as `agent-{uuid[:8]}`
+- `execution_suffix`: `mtagent` or `mpagent`
+- `uuid_hex[:12]`: 12 random hex characters
 
-**示例：**
-
-```
-agent-a1b2c3d4:mtagent:e5f6a7b8c9d0     # mtAgent
-agent-a1b2c3d4:mpagent:e5f6a7b8c9d0     # mpAgent
-refactor-db:mtagent:abc123def456          # 自定义 agent_id
-```
-
-**Run ID：** 完整 UUID v4，用于内部追踪（不暴露给用户）。
-
-### 9.2 日志目录结构
+Examples:
 
 ```
-~/.march/
-  ├── config.yaml
-  ├── AGENT.md
-  └── logs/
-      ├── {session_id}/                    # 每个 session 一个目录
-      │   ├── 2026-03-08.log              # 按日期分割的日志文件
-      │   ├── 2026-03-09.log
-      │   └── heartbeats.jsonl            # mpAgent 心跳记录
-      │
-      ├── agent-abc:mtagent:def123/       # mtAgent 日志
-      │   └── 2026-03-08.log
-      │
-      └── agent-xyz:mpagent:abc456/       # mpAgent 日志
-          ├── 2026-03-08.log              # 子进程文件日志
-          └── heartbeats.jsonl
+agent-a1b2c3d4:mtagent:e5f6a7b8c9d0
+agent-a1b2c3d4:mpagent:e5f6a7b8c9d0
+refactor-db:mtagent:abc123def456
 ```
 
-**mpAgent 子进程日志：**
-子进程通过 `_setup_child_logging()` 配置独立的文件日志，写入 `{log_dir}/{date}.log`。日志格式：
+Run IDs are full UUID v4 strings, used internally only.
+
+### 9.2 Log Structure
+
+```
+~/.march/logs/
+  ├── {session_id}/
+  │   ├── 2026-03-08.log          # Date-partitioned log file
+  │   └── heartbeats.jsonl        # mpAgent heartbeat records
+  └── ...
+```
+
+The child process configures its own file logger via `_setup_child_logging()`. Format:
 
 ```
 2026-03-08T16:00:00 [INFO] march.mpchild.agent-xyz:mpagent:abc456 — mpAgent child started: pid=12345 pgid=12345 session=agent-xyz:mpagent:abc456
-2026-03-08T16:00:01 [INFO] march.mpchild.agent-xyz:mpagent:abc456 — Loading config from /home/user/.march/config.yaml
-2026-03-08T16:00:02 [INFO] march.mpchild.agent-xyz:mpagent:abc456 — Agent initialized, starting task execution
-2026-03-08T16:00:45 [INFO] march.mpchild.agent-xyz:mpagent:abc456 — Task completed: tokens=25000 cost=0.0768 tool_calls=12 duration_ms=43000
-2026-03-08T16:00:45 [INFO] march.mpchild.agent-xyz:mpagent:abc456 — Result sent via IPC: status=ok
-2026-03-08T16:00:45 [INFO] march.mpchild.agent-xyz:mpagent:abc456 — mpAgent child exiting: pid=12345
 ```
 
-**查询日志：**
-
-```bash
-# 查看某个 agent 的日志
-cat ~/.march/logs/agent-xyz:mpagent:abc456/2026-03-08.log
-
-# 搜索错误
-grep -r "ERROR" ~/.march/logs/agent-xyz:mpagent:abc456/
-
-# 查看心跳
-jq . ~/.march/logs/agent-xyz:mpagent:abc456/heartbeats.jsonl | tail
-```
+The child also captures all `march.*` logger output to the same file, so LLM calls, tool executions, and other framework logs are preserved.
 
 ---
 
-## 10. 与其他框架的不同
+## 10. Nested Agents (Depth > 1)
 
-### 10.1 对比 OpenClaw 的 sessions_spawn
+### 10.1 The Default: Depth 1
 
-| 维度 | March Agent System | OpenClaw sessions_spawn |
-|------|-------------------|------------------------|
-| **执行模式** | 双模式：mtAgent (asyncio) + mpAgent (进程) | 单一模式：sub-agent session |
-| **进程隔离** | mpAgent 有完整进程级隔离（独立 process group） | 无进程隔离，共享 gateway 进程 |
-| **心跳监控** | mpAgent 内置心跳 + 资源指标（RSS、tokens、cost） | 依赖外部 claw-guard 监控 PID |
-| **IPC** | 内置 Unix socketpair + msgpack 协议 | 无内置 IPC，通过 session 消息传递 |
-| **Steering** | 内置 steer 支持（mt: Queue, mp: IPC） | 通过 steer API 注入消息 |
-| **结果推送** | 三级降级策略（steer → queue → direct） | 自动 announce 到 requester session |
-| **故障恢复** | 多层防御保证 `wait_result()` 必返回 | 依赖 claw-guard 通知 + 手动检查 |
-| **并发控制** | Lane-based TaskQueue（独立并发限制） | 无内置并发限制 |
+By default, `max_spawn_depth` is **1**. Sub-agents cannot spawn their own children. This is the safe default — it prevents runaway recursive spawning and keeps the system simple.
 
-### 10.2 对比 LangGraph 的 Agent 模型
+### 10.2 Enabling Deeper Nesting
 
-| 维度 | March Agent System | LangGraph |
-|------|-------------------|-----------|
-| **执行模型** | 独立 agent 实例（mt 或 mp） | Graph node 执行 |
-| **隔离** | 进程级隔离（mpAgent） | 无隔离，同一进程内 |
-| **通信** | IPC 协议（msgpack over Unix socket） | Graph state 传递 |
-| **监控** | 实时心跳 + 资源指标 | 无内置监控 |
-| **故障处理** | 多层防御 + 保证结果交付 | 依赖 Graph 的 error handling |
-| **Steering** | 运行时动态注入消息 | 无运行时 steering |
-| **并发** | Lane-based 并发控制 | 依赖外部编排 |
+Set `max_spawn_depth` higher in config:
 
-### 10.3 March 的独特之处
+```yaml
+agents:
+  subagents:
+    max_spawn_depth: 3
+```
 
-**1. 进程级隔离（Process-Level Isolation）**
+This allows:
 
-mpAgent 通过 `os.setpgrp()` 创建独立进程组，`os.killpg()` 可以一次性杀死子进程及其所有子孙进程。OOM killer 只影响子进程组，主进程安全。
+```
+Root Agent (depth 0)
+  ├── Sub-agent A (depth 1)
+  │   ├── Grandchild A1 (depth 2)
+  │   │   └── Great-grandchild A1a (depth 3)  ← max reached
+  │   └── Grandchild A2 (depth 2)
+  └── Sub-agent B (depth 1)
+```
 
-**2. 心跳监控（Heartbeat Monitoring）**
+Each `spawn()` checks `caller_depth >= max_spawn_depth` and rejects if the limit is hit.
 
-不是简单的"进程还活着吗"检查，而是包含丰富运行时指标的结构化心跳：内存使用、token 消耗、费用、工具调用历史、当前执行状态。父进程可以实时了解子 agent 在做什么。
+### 10.3 How It Works: _SpawnProxy
 
-**3. IPC Steering**
+An mpAgent child process has no access to the parent's `AgentManager`. It runs in a separate process with its own Python interpreter. The `_SpawnProxy` class bridges this gap by proxying spawn operations over the existing IPC channel.
 
-父 agent 可以在子 agent 运行过程中注入新的指令（steering message），改变子 agent 的行为方向。这通过 HeartbeatThread 接收 steer 消息，再通过 steering pump 注入到 Agent 的 steering queue 实现。
+**Child side (`_SpawnProxy` in `mp_child.py`):**
 
-**4. 保证结果交付（Guaranteed Result Delivery）**
+```
+Child agent calls spawn_agent tool
+  → _SpawnProxy.spawn(task, agent_id, model, timeout)
+    → IPC send: {type: "spawn_request", ..., request_id: "abc123"}
+    → Block on asyncio.Future keyed by request_id
+    ← IPC recv: {type: "spawn_result", request_id: "abc123", child_key: "...", ...}
+    → Future resolves → return (child_key, run_id)
+```
 
-`MpRunner.wait_result()` 通过五层防御机制保证**永远返回** `RunOutcome`：
-- IPC result 消息（正常路径）
-- 进程退出检测（异常退出）
-- 心跳超时（hang 检测）
-- IPC 断开检测（连接丢失）
-- Safety timeout（最终兜底）
+**Parent side (`MpRunner._recv_loop`):**
 
-**5. 孤儿保护（Orphan Protection）**
+```
+_recv_loop receives MSG_SPAWN_REQUEST
+  → _handle_spawn_request(msg)
+    → Calls _spawn_handler callback (closure from AgentManager._execute_child_mp)
+      → AgentManager.spawn(params, ctx) with caller_depth + 1
+    → Sends MSG_SPAWN_RESULT back to child
+```
 
-如果父进程意外消失，子进程的 HeartbeatThread 会在下一次心跳发送时检测到 `BrokenPipeError`，自动设置 `kill_requested` 并退出，防止成为僵尸进程。
+The child process also gets a `spawn_agent` tool registered in its tool registry, so the child's LLM can naturally decide to spawn grandchildren.
 
-**6. Lane-Based 并发控制**
+**Waiting for grandchild completion:**
 
-四条独立 lane（main、mt、mp、cron）各有独立的并发限制和排队机制，互不干扰。mpAgent 不会抢占 mtAgent 的 slot，反之亦然。
+```
+Child calls _SpawnProxy.wait_child(child_key)
+  → Creates asyncio.Future keyed by child_key
+  ← Parent sends MSG_CHILD_COMPLETED when grandchild finishes
+  → _HeartbeatThread receives it → calls spawn_proxy.handle_child_completed()
+    → Resolves the Future from the event loop thread
+  → wait_child() returns (status, output)
+```
+
+The `spawn_agent` tool supports `wait=True` (default) to block until the grandchild completes, or `wait=False` to get back the `child_key` immediately for manual management.
+
+### 10.4 Execution Consistency
+
+When a sub-agent spawns a grandchild, the manager enforces that the grandchild uses the **same execution mode** as its parent. If the parent is an mpAgent, the grandchild must also be mp. The code detects this by looking up the parent's `RunRecord` via `registry.get_by_child_key()` and overriding the requested execution mode if it differs (with a warning log).
+
+This prevents mixed mt/mp hierarchies, which would complicate IPC routing and lifecycle management.
+
+### 10.5 Tree Operations
+
+**`registry.get_subtree(root_key)`** — Returns all descendants of a session in depth-first order. Used by `kill_recursive()` and `reset_children()`.
+
+**`manager.kill_recursive(agent_id)`** — Gets the subtree, reverses it (deepest first), and kills each active agent. Returns total count killed. Bottom-up order prevents orphans.
+
+**`manager.reset_children(parent_key)`** — For each direct child: recursively kill if active, delete session memory files, delete session from store, remove from registry.
+
+### 10.6 Announce Routing for Nested Agents
+
+Results from nested agents are announced to their **immediate parent**, not the root. The `_announce()` method in `AgentManager` has special handling: if the parent is an active mpAgent, it sends a `MSG_CHILD_COMPLETED` IPC message directly to the parent's child process via `runner.notify_child_completed()`. This lets the mpAgent's `_SpawnProxy` resolve its `wait_child()` future.
+
+The root agent only sees results from its direct children. If a child summarizes its grandchildren's work in its own output, that summary flows up naturally.
+
+### 10.7 Practical Guidance
+
+**When depth > 1 makes sense:**
+- A coordinator agent that spawns specialists, each needing their own helpers
+- Multi-stage pipelines where each stage may dynamically fork
+- Research tasks that discover they need to explore multiple branches
+
+**When to stay at depth 1:**
+- Most task delegation scenarios (the vast majority)
+- Resource-constrained environments
+- When you can't predict the maximum depth
+
+Start with the default (`max_spawn_depth: 1`) and increase only when you have a concrete need. Depth 2–3 covers nearly all hierarchical decomposition patterns.
 
 ---
 
-## 附录：快速参考
+## 11. Comparison with Other Systems
 
-### Spawn 一个 mtAgent
+### vs. OpenClaw sessions_spawn
+
+| | March | OpenClaw |
+|---|-------|----------|
+| Execution modes | Dual: mt (asyncio) + mp (process) | Single: sub-agent session |
+| Process isolation | mpAgent: full (own process group) | None (shares gateway process) |
+| Heartbeat | Built-in: RSS, tokens, cost, tool history | External: claw-guard monitors PIDs |
+| IPC | Unix socketpair + msgpack | Session messages |
+| Steering | Native (mt: Queue, mp: IPC) | Steer API injection |
+| Result delivery | 3-tier cascade (steer → queue → direct) | Auto-announce to requester |
+| Failure recovery | 5-layer guarantee in wait_result() | claw-guard notifications + manual checks |
+| Concurrency | Lane-based TaskQueue | No built-in limits |
+
+### vs. LangGraph
+
+| | March | LangGraph |
+|---|-------|-----------|
+| Execution | Independent agent instances | Graph node execution |
+| Isolation | Process-level (mpAgent) | None (same process) |
+| Communication | Binary IPC (msgpack over Unix socket) | Graph state passing |
+| Monitoring | Real-time heartbeat with resource metrics | None built-in |
+| Failure handling | Guaranteed result delivery | Graph error handling |
+| Runtime steering | Dynamic message injection | Not supported |
+| Concurrency | Independent lane-based control | External orchestration |
+
+### What's Distinctive About March
+
+1. **Process-group isolation.** `os.setpgrp()` + `os.killpg()` means the parent can cleanly kill a child and all its descendants. OOM only hits the child group.
+
+2. **Structured heartbeats.** Not just "alive/dead" — each heartbeat carries memory usage, token consumption, cost, current tool, and recent tool history. The parent knows what the child is doing at all times.
+
+3. **IPC steering.** The parent can redirect a running child mid-task by injecting steering messages through the HeartbeatThread → steering pump → Agent pipeline.
+
+4. **Guaranteed result delivery.** Five independent detection mechanisms ensure `wait_result()` always returns, covering every failure mode from clean exit to OOM to hung process to broken pipe.
+
+5. **Orphan protection.** If the parent dies, the child's HeartbeatThread detects `BrokenPipeError` on the next send and exits cleanly. No zombies.
+
+6. **Nested agent support.** `_SpawnProxy` transparently proxies spawn/steer/kill/wait operations over IPC, letting mpAgent children spawn their own children without direct access to `AgentManager`. All agents register in the same central `AgentRegistry`.
+
+---
+
+## Appendix: Quick Reference
 
 ```python
+# Spawn an mtAgent
 result = await manager.spawn(
-    SpawnParams(
-        task="搜索最新的 Python 3.13 变更日志并总结",
-        execution="mt",
-        label="changelog-search",
-    ),
-    SpawnContext(
-        requester_session="main-session-key",
-        origin="terminal",
-    ),
+    SpawnParams(task="Summarize the Python 3.13 changelog", execution="mt", label="changelog"),
+    SpawnContext(requester_session="main-session", origin="terminal"),
 )
-# result.child_key = "agent-a1b2c3d4:mtagent:e5f6a7b8c9d0"
-```
 
-### Spawn 一个 mpAgent
-
-```python
+# Spawn an mpAgent
 result = await manager.spawn(
-    SpawnParams(
-        task="处理 500MB 的 CSV 数据集，生成统计报告",
-        execution="mp",
-        model="litellm/claude-sonnet-4-20250514",
-        label="data-processing",
-    ),
-    SpawnContext(
-        requester_session="main-session-key",
-        origin="terminal",
-    ),
+    SpawnParams(task="Process 500MB CSV dataset", execution="mp", model="litellm/claude-sonnet-4-20250514"),
+    SpawnContext(requester_session="main-session", origin="terminal"),
 )
-# result.child_key = "agent-a1b2c3d4:mpagent:e5f6a7b8c9d0"
-```
 
-### Steer 一个运行中的 agent
+# Steer a running agent
+await manager.send("agent-abc:mpagent:def123", "Focus on the revenue column outliers")
 
-```python
-await manager.send("agent-a1b2c3d4:mpagent:e5f6a7b8c9d0", "优先处理 revenue 列的异常值")
-```
+# Kill one agent
+await manager.kill("agent-abc:mpagent:def123")
 
-### Kill 一个 agent
+# Kill an agent and all its descendants
+count = await manager.kill_recursive("agent-abc:mpagent:def123")
 
-```python
-await manager.kill("agent-a1b2c3d4:mpagent:e5f6a7b8c9d0")
-```
-
-### 查看所有 agent 状态
-
-```python
-statuses = await manager.list()
-for s in statuses:
+# List all agents
+for s in await manager.list():
     print(f"{s.child_key}: {s.status} ({s.duration_seconds:.1f}s)")
     if s.heartbeat:
-        print(f"  RSS: {s.heartbeat['memory_rss_mb']}MB, Tokens: {s.heartbeat['tokens_used']}")
+        print(f"  RSS={s.heartbeat['memory_rss_mb']}MB tokens={s.heartbeat['tokens_used']}")
+
+# Get full descendant tree
+for depth, record in manager.registry.get_tree_with_depth("main-session"):
+    print(f"{'  ' * depth}{record.child_key}: {record.task[:50]}")
 ```
