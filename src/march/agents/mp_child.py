@@ -19,7 +19,6 @@ import asyncio
 import logging
 import os
 import resource
-import signal
 import socket
 import sys
 import threading

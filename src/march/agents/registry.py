@@ -6,7 +6,6 @@ No disk persistence — crash recovery is handled via logs.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -116,7 +115,6 @@ class AgentRegistry:
 
     def __init__(self) -> None:
         self._runs: dict[str, RunRecord] = {}
-        self._lock = asyncio.Lock()
 
     def register(self, record: RunRecord) -> None:
         """Register a new agent run."""
