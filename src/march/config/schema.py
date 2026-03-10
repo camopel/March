@@ -244,16 +244,6 @@ class AgentsConfig(BaseModel):
     subagents: SubagentsCommonConfig = Field(default_factory=SubagentsCommonConfig)
 
 
-# ─── Dashboard Config ───
-
-
-class DashboardConfig(BaseModel):
-    """Dashboard configuration."""
-
-    enabled: bool = True
-    port: int | str = "auto"
-
-
 # ─── Root Config ───
 
 
@@ -270,6 +260,5 @@ class MarchConfig(BaseModel):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
-    dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
 
     model_config = {"extra": "ignore"}

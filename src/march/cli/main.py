@@ -59,11 +59,11 @@ USAGE
   march <command> [options]
 
 LIFECYCLE
-  march start                  Init (if needed) + start agent + dashboard
+  march start                  Init (if needed) + start agent
   march start --channel matrix Start with Matrix channel
   march start --all            Start all enabled channels
   march start --headless       WS proxy channel only (no interactive channels)
-  march stop                   Stop March and all services
+  march stop                   Stop March
   march restart                Stop + start
   march enable                 Install as systemd service (auto-start on boot)
   march disable                Remove systemd service
@@ -138,21 +138,7 @@ def status() -> None:
     from march.cli.start import _find_march_pids
     pids = _find_march_pids()
     if pids:
-        labels = []
-        dashboard_url = None
-        for _, cmd in pids:
-            if "dashboard" in cmd:
-                labels.append("dashboard")
-                # Extract port from cmdline if present
-                import re
-                port_match = re.search(r"--port\s+(\d+)", cmd)
-                port = port_match.group(1) if port_match else "8200"
-                dashboard_url = f"http://localhost:{port}"
-            else:
-                labels.append("agent")
-        click.echo(f"  Running:   {', '.join(labels)} ({len(pids)} processes)")
-        if dashboard_url:
-            click.echo(f"  Dashboard: {dashboard_url}")
+        click.echo(f"  Running:   agent ({len(pids)} processes)")
     else:
         click.echo("  Running:   not running")
 

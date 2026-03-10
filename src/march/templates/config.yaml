@@ -202,8 +202,3 @@ plugins:
   enabled: []                          # List of plugin names to load
   directory: "plugins"                 # Plugin directory (relative to ~/.march/)
 
-# ─── Dashboard ───
-
-dashboard:
-  enabled: true
-  port: "auto"                         # Port number or "auto" for automatic assignment

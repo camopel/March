@@ -409,7 +409,7 @@ class ChatDB:
                     m["tool_calls"] = json.loads(tc)
                 except (json.JSONDecodeError, TypeError):
                     m["tool_calls"] = []
-            # Map attachments to image_data for dashboard compatibility
+            # Map attachments to image_data for frontend compatibility
             m["image_data"] = None
             att = m.get("attachments", "[]")
             if isinstance(att, str):

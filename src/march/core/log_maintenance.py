@@ -2,7 +2,7 @@
 
 Provides:
   - ``cleanup_old_logs()`` — delete log files older than ``LOG_TTL_DAYS``
-  - ``ensure_log_subdirectories()`` — create the shared log layout (metrics, dashboard)
+  - ``ensure_log_subdirectories()`` — create the shared log layout (metrics)
   - ``migrate_flat_logs()`` — move legacy flat files into the new structure
 """
 
@@ -20,7 +20,7 @@ LOG_TTL_DAYS: int = 30
 # Shared subdirectories that are NOT per-session.
 # Session directories (logs/{session_id}/) are created on demand by
 # TurnLogger and the logging handlers — no need to pre-create them.
-SHARED_SUBDIRS = ("metrics", "dashboard")
+SHARED_SUBDIRS = ("metrics",)
 
 # Legacy subdirectories that existed before the per-session layout.
 # Kept here so ``migrate_flat_logs`` knows where old files lived.
@@ -28,7 +28,7 @@ _LEGACY_SUBDIRS = ("agent", "turns")
 
 
 def ensure_log_subdirectories(log_dir: Path | None = None) -> Path:
-    """Create the shared log directory tree (metrics, dashboard).
+    """Create the shared log directory tree (metrics).
 
     Session-specific directories are created on demand by the loggers
     themselves — this function only ensures the shared infrastructure.
@@ -46,7 +46,7 @@ def cleanup_old_logs(log_dir: Path | None = None, ttl_days: int = LOG_TTL_DAYS) 
     """Delete log files older than *ttl_days*.
 
     Walks every immediate subdirectory of *log_dir* (session dirs, metrics,
-    dashboard, and any legacy dirs) and removes regular files whose **mtime**
+    and any legacy dirs) and removes regular files whose **mtime**
     is older than the cutoff.  Empty session directories are pruned after
     cleanup.
 
@@ -91,7 +91,6 @@ _MIGRATION_MAP = {
     "march.log": ("agent", ".log"),
     "turns.jsonl": ("turns", ".jsonl"),
     "metrics.jsonl": ("metrics", ".jsonl"),
-    "dashboard.log": ("dashboard", ".log"),
 }
 
 

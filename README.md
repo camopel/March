@@ -137,7 +137,7 @@ Want a mobile-friendly UI? **[March Deck](https://github.com/camopel/MarchDeck)*
 
 | App | What it does |
 |-----|-------------|
-| 🤖 **March** | Chat + dashboard (sessions, cost, providers, logs) |
+| 🤖 **March** | Chat + agent runtime (sessions, cost, providers, logs) |
 | 📰 **Finviz** | Financial news with 24h AI summaries |
 | 📄 **ArXiv** | Research paper semantic search |
 | 📊 **System** | Server monitoring (CPU, RAM, GPU, services) |

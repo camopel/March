@@ -10,18 +10,14 @@ import click
 @click.option("--all", "all_channels", is_flag=True, help="Start all enabled channels.")
 @click.option("--channel", multiple=True, help="Enable specific channel(s).")
 @click.option("--headless", is_flag=True, help="Plugins only, no channels.")
-@click.option("--no-dashboard", is_flag=True, help="Don't start dashboard (overrides config).")
-@click.option("--dashboard-port", default=None, type=int, help="Dashboard port (overrides config).")
-def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: bool,
-          no_dashboard: bool, dashboard_port: int | None) -> None:
+def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: bool) -> None:
     """Initialize (if needed) and start March.
 
     On first run, copies default templates to ~/.march/.
-    Then starts the agent and dashboard (if enabled in config).
 
     \b
     Examples:
-        march start                    # terminal + dashboard (if enabled)
+        march start                    # terminal mode
         march start --channel matrix   # matrix channel
         march start --all              # all enabled channels
         march start --headless         # ws_proxy channel only
@@ -47,23 +43,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
     config_path = config_dir / "config.yaml"
     app = MarchApp(config=config_path)
 
-    # ── Dashboard: respect config, CLI flags override ──
-    dashboard_enabled = getattr(app.config.dashboard, "enabled", True) and not no_dashboard
-    resolved_dashboard_port = dashboard_port or getattr(app.config.dashboard, "port", 8200)
-    # Handle "auto" port string from config
-    if isinstance(resolved_dashboard_port, str):
-        resolved_dashboard_port = 8200 if resolved_dashboard_port == "auto" else int(resolved_dashboard_port)
-
-    dashboard_pid = _start_subprocess("dashboard", "--port", str(resolved_dashboard_port), "--no-open") if dashboard_enabled else None
-
-    child_pids = [p for p in (dashboard_pid,) if p]
-
     def _cleanup(signum=None, frame=None):
-        for pid in child_pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
         if signum:
             raise SystemExit(0)
 
@@ -73,7 +53,6 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
     try:
         if headless:
             click.echo("Starting March (headless)")
-            _print_services(dashboard_pid, resolved_dashboard_port)
             asyncio.run(app._run_headless())
             return
 
@@ -95,7 +74,6 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
             channels = ["terminal"]
 
         click.echo(f"Starting March — channels: {', '.join(channels)}")
-        _print_services(dashboard_pid, resolved_dashboard_port)
         app.run(channels=channels)
     finally:
         _cleanup()
@@ -103,7 +81,7 @@ def start(port: int, all_channels: bool, channel: tuple[str, ...], headless: boo
 
 @click.command("stop")
 def stop() -> None:
-    """Stop March and all its services (dashboard)."""
+    """Stop March and all its services."""
     import os
     import signal
 
@@ -116,8 +94,7 @@ def stop() -> None:
     for pid, cmdline in pids:
         try:
             os.kill(pid, signal.SIGTERM)
-            label = "dashboard" if "dashboard" in cmdline else "agent"
-            stopped.append(f"{label} (PID {pid})")
+            stopped.append(f"agent (PID {pid})")
         except ProcessLookupError:
             pass
 
@@ -251,8 +228,7 @@ def _find_march_pids() -> list[tuple[int, str]]:
             # Must contain march and be a server-like process
             if "march" not in cmdline:
                 continue
-            if "march start" not in cmdline and "march.cli.main start" not in cmdline \
-               and "dashboard" not in cmdline:
+            if "march start" not in cmdline and "march.cli.main start" not in cmdline:
                 continue
             # Exclude management CLI commands
             if any(mc in cmdline for mc in mgmt_commands):
@@ -286,36 +262,3 @@ def _ensure_templates(config_dir) -> None:
 
     if any_created:
         click.echo("")
-
-
-def _print_services(dashboard_pid, dashboard_port) -> None:
-    if dashboard_pid:
-        click.echo(f"  ✅ Dashboard: http://localhost:{dashboard_port}")
-
-
-def _start_subprocess(*args) -> int | None:
-    """Start a march subcommand as a background process."""
-    import subprocess
-    import sys
-    from datetime import date
-    from pathlib import Path
-
-    log_dir = Path.home() / ".march" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_name = args[0] if args else "subprocess"
-
-    # Use categorised subdirectory with date-based log file
-    sub_log_dir = log_dir / log_name
-    sub_log_dir.mkdir(parents=True, exist_ok=True)
-    log_file_path = sub_log_dir / f"{date.today().isoformat()}.log"
-
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "march.cli.main", *args],
-            stdout=open(log_file_path, "a"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        return proc.pid
-    except Exception:
-        return None
