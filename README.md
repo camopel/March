@@ -69,7 +69,7 @@ One `march start` gives you:
 
 - **Terminal** — interactive or one-shot mode
 - **Matrix** — encrypted chat with E2EE support
-- **WebSocket** — connect any frontend
+- **WebSocket** — connect [March Deck](https://github.com/camopel/march-deck) or any custom frontend
 - **ACP** — IDE integration (VS Code, Cursor, any editor with agent protocol support)
 
 All channels share the same agent, same memory, same session state.
