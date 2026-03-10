@@ -540,6 +540,31 @@ class SessionStore:
         )
         await self._db.commit()
 
+    async def reactivate_session(self, session_id: str, source_type: str = "", source_id: str = "") -> Session | None:
+        """Reactivate a soft-deleted session, clearing its old data.
+
+        Returns the reactivated Session, or None if no inactive row exists.
+        """
+        assert self._db is not None
+
+        now = _now()
+        result = await self._db.execute(
+            """UPDATE sessions
+               SET is_active = 1, rolling_summary = '', last_processed_seq = 0,
+                   last_active = ?
+               WHERE id = ? AND is_active = 0""",
+            (now, session_id),
+        )
+        if result.rowcount == 0:
+            return None
+
+        # Also clear any leftover messages
+        await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        await self._db.commit()
+
+        # Load the freshly reactivated row
+        return await self.get_session(session_id)
+
     async def clear_session(self, session_id: str) -> None:
         """Clear all messages and summaries for a session (reset)."""
         assert self._db is not None

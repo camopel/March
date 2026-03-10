@@ -17,6 +17,10 @@
 - **web_fetch** — Fetch URL content as markdown
 - **browser** — Browser automation (navigate, click, type, screenshot, evaluate)
 
+## Developer
+- **github** — GitHub operations via `gh` CLI (issues, PRs, repos, releases, actions, API queries). Pass subcommand as string, optional `repo` param.
+- **huggingface** — Search models/datasets, get model info, download files from Hugging Face Hub. Actions: search_models, search_datasets, model_info, dataset_info, download.
+
 ## Media & Analysis
 - **pdf** — Analyze PDF documents
 - **screenshot** — Capture screen

@@ -507,7 +507,15 @@ class Orchestrator:
             )
             return session
 
-        # Brand-new session — create in DB and cache
+        # Brand-new session — but check for soft-deleted row first
+        reactivated = await self.session_store.reactivate_session(
+            session_id, source_type=source, source_id=session_id,
+        )
+        if reactivated is not None:
+            self._sessions[session_id] = reactivated
+            logger.info("session reactivated", session_id=session_id, source=source)
+            return reactivated
+
         session = await self.session_store.create_session(
             source_type=source,
             source_id=session_id,

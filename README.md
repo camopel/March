@@ -69,7 +69,7 @@ One `march start` gives you:
 
 - **Terminal** — interactive or one-shot mode
 - **Matrix** — encrypted chat with E2EE support
-- **WebSocket** — connect [March Deck](https://github.com/camopel/march-deck) or any custom frontend
+- **WebSocket** — connect [March Deck](https://github.com/camopel/MarchDeck) or any custom frontend
 - **ACP** — IDE integration (VS Code, Cursor, any editor with agent protocol support)
 
 All channels share the same agent, same memory, same session state.
@@ -133,7 +133,7 @@ Turn 100:  Still knows your project constraints from Turn 3
 
 ## March Deck — PWA App Platform
 
-Want a mobile-friendly UI? **[March Deck](https://github.com/camopel/march-deck)** is a PWA platform that turns your agent into a collection of mini-apps you can open on any device.
+Want a mobile-friendly UI? **[March Deck](https://github.com/camopel/MarchDeck)** is a PWA platform that turns your agent into a collection of mini-apps you can open on any device.
 
 | App | What it does |
 |-----|-------------|
