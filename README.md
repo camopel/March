@@ -266,8 +266,6 @@ All tools are registered via `@tool` decorator. Add custom tools by dropping a P
 - **Browser & device integration** — Multi-tab browser profiles, Chrome extension relay, mobile camera/location/notifications.
 - **Maturity** — Production-tested with an active community and skill marketplace.
 
-> Benchmark details: March achieves identical goal retention (100%) to OpenClaw across all test scenarios with a 6.2× smaller codebase. See [full benchmark report](docs/BENCHMARK.md).
-
 ---
 
 ## Supported LLM Providers

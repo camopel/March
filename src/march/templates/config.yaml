@@ -1,46 +1,209 @@
 # March Agent Configuration
 # https://github.com/camopel/March
 #
+# Copy to ~/.march/config.yaml and customize.
 # Environment variables: ${VAR} or ${VAR:default}
+# All sections are optional — sensible defaults are used for anything omitted.
+
+# ─── LLM Providers ───
 
 llm:
-  default: "openai"
+  default: "bedrock"                   # Which provider to use (key from providers below)
+  fallback_chain: []                   # Fallback order if default fails, e.g. ["ollama"]
   providers:
-    openai:
-      model: "gpt-4o"
-      api_key: "${OPENAI_API_KEY}"
+    bedrock:
+      model: "anthropic.claude-sonnet-4-20250514-v1:0"
+      name: "Claude Sonnet 4 (Bedrock)"
+      region: "us-west-2"             # AWS region
+      profile: ""                     # AWS CLI profile name (uses default chain if empty)
       max_tokens: 16384
-      context_window: 128000
+      context_window: 200000
       temperature: 0.3
       timeout: 300
       reasoning: false
       streaming: true
+      input_types: ["text", "image"]
+      cost:                            # Per-million-token cost in USD (for tracking)
+        input: 3.0
+        output: 15.0
+        cache_read: 0.3
+        cache_write: 3.75
+
+    # openai:
+    #   model: "gpt-4o"
+    #   name: "GPT-4o"
+    #   api_key: "${OPENAI_API_KEY}"
+    #   url: ""                        # Custom API base URL (leave empty for default)
+    #   organization: ""               # OpenAI organization ID
+    #   max_tokens: 16384
+    #   context_window: 128000
+    #   temperature: 0.3
+    #   timeout: 300
+    #   reasoning: false
+    #   streaming: true
+    #   input_types: ["text"]
+    #   cost:
+    #     input: 2.5
+    #     output: 10.0
+    #     cache_read: 0.0
+    #     cache_write: 0.0
 
     # anthropic:
     #   model: "claude-sonnet-4-20250514"
+    #   name: "Claude Sonnet 4"
     #   api_key: "${ANTHROPIC_API_KEY}"
+    #   url: ""
     #   max_tokens: 16384
     #   context_window: 200000
     #   temperature: 0.3
     #   timeout: 300
     #   reasoning: false
     #   streaming: true
+    #   input_types: ["text", "image"]
+    #   cost:
+    #     input: 3.0
+    #     output: 15.0
+    #     cache_read: 0.3
+    #     cache_write: 3.75
 
-    # bedrock:
-    #   model: "anthropic.claude-sonnet-4-20250514-v1:0"
-    #   region: "us-west-2"
+    # litellm:
+    #   model: "gpt-4o"                # Model name as configured in your LiteLLM proxy
+    #   name: "GPT-4o (LiteLLM)"
+    #   url: "http://localhost:4000"   # LiteLLM proxy URL
+    #   api_key: "${LITELLM_API_KEY}"  # Proxy API key (if auth enabled)
+    #   max_tokens: 16384
+    #   context_window: 128000
+    #   temperature: 0.3
+    #   timeout: 600
+    #   streaming: true
+    #   cost:
+    #     input: 0.0
+    #     output: 0.0
+
+    # openrouter:
+    #   model: "anthropic/claude-sonnet-4"
+    #   name: "Claude Sonnet 4 (OpenRouter)"
+    #   api_key: "${OPENROUTER_API_KEY}"
+    #   app_name: "march"              # Your app name (shown in OpenRouter dashboard)
+    #   app_url: ""                    # Your app URL (HTTP-Referer header)
     #   max_tokens: 16384
     #   context_window: 200000
     #   temperature: 0.3
     #   timeout: 300
     #   reasoning: false
     #   streaming: true
+    #   input_types: ["text", "image"]
+    #   cost:
+    #     input: 3.0
+    #     output: 15.0
 
     # ollama:
     #   model: "llama3.1"
+    #   name: "Llama 3.1 (Local)"
     #   url: "http://localhost:11434"
     #   max_tokens: 16384
     #   context_window: 128000
     #   temperature: 0.3
     #   timeout: 300
     #   streaming: true
+
+# ─── Memory ───
+
+memory:
+  system_rules: "SYSTEM.md"            # System prompt / rules file
+  agent_profile: "AGENT.md"            # Agent persona / profile
+  tool_rules: "TOOLS.md"              # Tool usage instructions
+  memory_path: "MEMORY.md"            # Long-term memory file
+  session:
+    auto_save: true                    # Auto-save session memory (facts.md, plan.md)
+  compaction:
+    threshold: 0.95                    # Trigger compaction at this % of context window
+    summary_budget_ratio: 0.15         # Fraction of context window for rolling summary
+    dedup_max_ratio: 0.30              # Max ratio of context window for dedup target
+
+# ─── Channels ───
+
+channels:
+  terminal:
+    enabled: true
+    theme: "dark"                      # "dark" or "light"
+
+  acp:
+    enabled: true
+    auto_register: true                # Auto-register with IDE agent protocol
+
+  matrix:
+    enabled: false
+    homeserver: "auto"                 # Matrix homeserver URL, or "auto" for well-known lookup
+    user: "@march:localhost"
+    password: ""                       # Use password OR access_token, not both
+    access_token: ""
+    auto_setup: true                   # Auto-join invited rooms
+    rooms: []                          # Room IDs or aliases to auto-join
+    e2ee: true                         # Enable end-to-end encryption
+
+  ws_proxy:
+    enabled: true
+    port: 8101
+    host: "0.0.0.0"
+    cors_origins: []                   # Allowed CORS origins, e.g. ["http://localhost:3000"]
+    db_path: "~/.march/ws_proxy.db"    # SQLite database for message persistence
+    max_image_dimension: 1200          # Resize images above this (px)
+    image_quality: 85                  # JPEG quality for resized images
+    message_buffer_seconds: 3.0        # Buffer streaming chunks before sending
+    max_message_size: 20971520         # 20MB max WebSocket message
+    max_upload_bytes: 20971520         # 20MB max file upload
+    stream_drain_timeout: 120          # Seconds to wait for stream to finish
+    summary_max_tokens: 500            # Max tokens for attachment summaries
+    summary_chunk_size: 4000           # Chars per chunk for large file summarization
+
+# ─── Tools ───
+
+tools:
+  exec:
+    timeout: 30                        # Shell command timeout (seconds)
+  web_search:
+    engine: "ddgs"                     # Search engine: "ddgs"
+    max_results: 10
+    backends: ["google"]               # ddgs backends: google, duckduckgo, brave, yandex, yahoo
+  voice_to_text:
+    model: "large-v3"                  # Whisper model size
+    device: "auto"                     # "auto", "cpu", or "cuda"
+    language: "auto"                   # ISO language code or "auto"
+  tts:
+    backend: "system"                  # "system" or custom TTS backend
+    voice: "default"
+  mcp_servers: {}                      # MCP server configs, e.g.:
+    # example_server:
+    #   command: ["npx", "-y", "@example/mcp-server"]
+    #   env:
+    #     API_KEY: "${EXAMPLE_API_KEY}"
+
+# ─── Agents (Sub-agents) ───
+
+agents:
+  max_concurrent: 4                    # Total concurrent agents (mt + mp combined)
+  mt:                                  # mtAgent — lightweight asyncio tasks
+    max_concurrent: 8
+  mp:                                  # mpAgent — isolated OS processes
+    max_concurrent: 8
+    heartbeat_interval_seconds: 60     # How often mp agents send heartbeats
+    heartbeat_timeout_seconds: 300     # Kill mp agent if no heartbeat for this long
+    kill_grace_seconds: 10             # Grace period before SIGKILL after SIGTERM
+    spawn_method: "spawn"              # "spawn" or "forkserver"
+  subagents:
+    max_spawn_depth: 1                 # Max nesting depth for sub-agent spawning
+    announce_timeout_seconds: 60       # Timeout for sub-agent completion announcements
+    reset_after_complete_minutes: 60   # Clean up completed sub-agents after this long
+
+# ─── Plugins ───
+
+plugins:
+  enabled: []                          # List of plugin names to load
+  directory: "plugins"                 # Plugin directory (relative to ~/.march/)
+
+# ─── Dashboard ───
+
+dashboard:
+  enabled: true
+  port: "auto"                         # Port number or "auto" for automatic assignment
