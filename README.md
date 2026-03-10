@@ -229,7 +229,7 @@ All tools are registered via `@tool` decorator. Add custom tools by dropping a P
 | Multi-channel | 4 (Matrix, Terminal, WS, ACP) | 10+ (Telegram, WhatsApp, Discord, Signal…) | ❌ | ❌ |
 | Plugin hooks | ✅ Lifecycle hooks | Skill-based | Via callbacks | ❌ |
 | Cost tracking | ✅ Built-in per-turn | Via LiteLLM | ❌ | ❌ |
-| Browser automation | Basic | ✅ Full Playwright | ❌ | ❌ |
+| Browser automation | ✅ Playwright (headless) | ✅ Playwright (multi-tab, profiles) | ❌ | ❌ |
 | Mobile device integration | ❌ | ✅ Node pairing | ❌ | ❌ |
 | Community ecosystem | New | ✅ Active + ClawHub | ✅ Large | Growing |
 | Codebase | **~23K lines** Python | ~145K lines TypeScript | ~300K+ | ~50K+ |
@@ -244,7 +244,7 @@ All tools are registered via `@tool` decorator. Add custom tools by dropping a P
 ### Where OpenClaw wins
 
 - **Channel breadth** — 10+ messaging platforms vs March's 4. If you need Telegram, WhatsApp, or Discord, OpenClaw has it.
-- **Browser & device integration** — Full Playwright automation, mobile camera/location/notifications.
+- **Browser & device integration** — Multi-tab browser profiles, Chrome extension relay, mobile camera/location/notifications.
 - **Maturity** — Production-tested with an active community and skill marketplace.
 
 > Benchmark details: March achieves identical goal retention (100%) to OpenClaw across all test scenarios with a 6.2× smaller codebase. See [full benchmark report](docs/BENCHMARK.md).
