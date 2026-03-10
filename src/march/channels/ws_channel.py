@@ -538,6 +538,9 @@ class WSChannel(Channel):
         self._site: Any = None
         self._runner: Any = None
         self._stream_buffers: dict[str, _StreamBuffer] = {}  # session_id → buffer
+        self._session_busy: dict[str, bool] = {}  # session_id → agent running
+        self._session_pending: dict[str, list] = {}  # session_id → queued messages
+        self._session_cancel: dict[str, asyncio.Event] = {}  # session_id → cancel event
         self._metrics = MetricsLogger.get()
         # Config values (populated in start from config or defaults)
         self._port: int = DEFAULTS["port"]
@@ -896,7 +899,7 @@ class WSChannel(Channel):
 
         ws = web.WebSocketResponse(
             max_msg_size=self._max_msg_size,
-            heartbeat=30.0,  # Send ping every 30s to keep connection alive
+            heartbeat=600.0,  # 10min server-side timeout (client sends its own 30s pings)
         )
         await ws.prepare(request)
         self._active_connections[session_id] = ws
@@ -962,6 +965,8 @@ class WSChannel(Channel):
             await self._ws_handle_voice(conn, data)
         elif msg_type == "resume":
             await self._ws_handle_resume(conn, data)
+        elif msg_type == "ping":
+            await _try_send(conn.ws, {"type": "pong"})
         else:
             await _try_send(conn.ws, {
                 "type": "error",
@@ -981,21 +986,24 @@ class WSChannel(Channel):
             await self._handle_reset(conn)
             return
 
-        if conn.busy:
+        if self._is_session_busy(conn.session_id):
             # Check for stop/interrupt commands
             if content.lower().strip() in _WSConn.STOP_COMMANDS:
                 logger.info("stop command received",
                             session_id=conn.session_id,
                             command=content.strip())
                 # Signal cancellation to the running stream
-                conn.cancel_event.set()
+                self._get_cancel_event(conn.session_id).set()
                 # Clear any queued messages — user wants to stop everything
-                conn.pending.clear()
+                self._get_session_pending(conn.session_id).clear()
                 # Notify the client immediately
-                await _try_send(conn.ws, {"type": "stream.cancelled"})
+                active_ws = self._active_connections.get(conn.session_id)
+                if active_ws and not active_ws.closed:
+                    await _try_send(active_ws, {"type": "stream.cancelled"})
                 return
 
-            if len(conn.pending) >= self._max_queue_size:
+            pending = self._get_session_pending(conn.session_id)
+            if len(pending) >= self._max_queue_size:
                 logger.warning("message queue full",
                                session_id=conn.session_id,
                                max_size=self._max_queue_size,
@@ -1005,11 +1013,11 @@ class WSChannel(Channel):
                     "message": f"Queue full ({self._max_queue_size} messages). Wait for current response to finish.",
                 })
                 return
-            conn.pending.append(content)
-            logger.info("message queued", session_id=conn.session_id, queue_size=len(conn.pending))
+            pending.append(content)
+            logger.info("message queued", session_id=conn.session_id, queue_size=len(pending))
             await _try_send(conn.ws, {
                 "type": "message.queued",
-                "count": len(conn.pending),
+                "count": len(pending),
             })
             return
 
@@ -1081,17 +1089,18 @@ class WSChannel(Channel):
                 "filename": filename,
             })
 
-        if conn.busy:
-            if len(conn.pending) >= self._max_queue_size:
+        if self._is_session_busy(conn.session_id):
+            pending = self._get_session_pending(conn.session_id)
+            if len(pending) >= self._max_queue_size:
                 await _try_send(conn.ws, {
                     "type": "error",
                     "message": f"Queue full ({self._max_queue_size} messages). Wait for current response to finish.",
                 })
                 return
-            conn.pending.append(user_content)
+            pending.append(user_content)
             await _try_send(conn.ws, {
                 "type": "message.queued",
-                "count": len(conn.pending),
+                "count": len(pending),
             })
             return
 
@@ -1215,17 +1224,18 @@ class WSChannel(Channel):
         await _try_send(conn.ws, {"type": "voice.transcribed", "text": transcription})
 
         # User message persistence is handled by the Orchestrator
-        if conn.busy:
-            if len(conn.pending) >= self._max_queue_size:
+        if self._is_session_busy(conn.session_id):
+            pending = self._get_session_pending(conn.session_id)
+            if len(pending) >= self._max_queue_size:
                 await _try_send(conn.ws, {
                     "type": "error",
                     "message": f"Queue full ({self._max_queue_size} messages). Wait for current response to finish.",
                 })
                 return
-            conn.pending.append(transcription)
+            pending.append(transcription)
             await _try_send(conn.ws, {
                 "type": "message.queued",
-                "count": len(conn.pending),
+                "count": len(pending),
             })
             return
 
@@ -1235,32 +1245,34 @@ class WSChannel(Channel):
 
     async def _run_agent(self, conn: "_WSConn", content: str | list) -> None:
         """Run the agent on a message via Orchestrator, then drain queued messages."""
-        conn.busy = True
-        conn.cancel_event.clear()  # Reset cancellation flag for new run
+        sid = conn.session_id
+        self._set_session_busy(sid, True)
+        self._get_cancel_event(sid).clear()  # Reset cancellation flag for new run
         _agent_t0 = time.monotonic()
         try:
             await self._stream_response(conn, content)
         finally:
             _agent_dur = (time.monotonic() - _agent_t0) * 1000
             logger.info("message complete",
-                        session_id=conn.session_id,
+                        session_id=sid,
                         duration_ms=round(_agent_dur, 1))
             self._metrics.message_complete(
-                session_id=conn.session_id,
+                session_id=sid,
                 duration_ms=_agent_dur,
             )
-            conn.busy = False
+            self._set_session_busy(sid, False)
         await self._drain_queue(conn)
 
     async def _drain_queue(self, conn: "_WSConn") -> None:
         """Drain pending messages after agent finishes."""
-        if not conn.pending:
+        pending = self._get_session_pending(conn.session_id)
+        if not pending:
             return
 
         await asyncio.sleep(self._buffer_seconds)
 
-        queued = list(conn.pending)
-        conn.pending.clear()
+        queued = list(pending)
+        pending.clear()
         if not queued:
             return
 
@@ -1291,18 +1303,17 @@ class WSChannel(Channel):
         buf.reset()
         buf.streaming = True
 
-        client_gone = False
 
         async def try_send(msg: dict) -> dict:
-            """Buffer the chunk and send to client. Returns the buffered chunk."""
-            nonlocal client_gone
+            """Buffer the chunk and send to the active client. Returns the buffered chunk."""
             chunk = buf.add_chunk(msg)
-            if client_gone:
-                return chunk
-            try:
-                await conn.ws.send_json(chunk)
-            except Exception:
-                client_gone = True
+            # Always send to the current active connection (may change on reconnect)
+            active_ws = self._active_connections.get(conn.session_id)
+            if active_ws is not None and not active_ws.closed:
+                try:
+                    await active_ws.send_json(chunk)
+                except Exception:
+                    pass  # Client gone — chunk is still buffered for catchup
             return chunk
 
         await try_send({"type": "stream.start"})
@@ -1312,7 +1323,7 @@ class WSChannel(Channel):
                 session_id=conn.session_id,
                 content=content,
                 source="ws",
-                cancel_event=conn.cancel_event,
+                cancel_event=self._get_cancel_event(conn.session_id),
             ):
                 if isinstance(event, TextDelta):
                     buf.collected += event.delta
@@ -1345,7 +1356,9 @@ class WSChannel(Channel):
                     buf.done = True
                     buf.collected = event.content or buf.collected
 
-                    if client_gone:
+                    # Check if client disconnected at any point during stream
+                    active_ws = self._active_connections.get(conn.session_id)
+                    if active_ws is None or active_ws.closed:
                         stream_log.info(
                             "client disconnected during stream",
                             session_id=conn.session_id,
@@ -1397,7 +1410,7 @@ class WSChannel(Channel):
 
         Only cleans data belonging to this session — other sessions are untouched.
         """
-        conn.pending.clear()
+        self._get_session_pending(conn.session_id).clear()
 
         # Clear stream buffer so reconnect doesn't replay old content
         if conn.session_id in self._stream_buffers:
@@ -1430,6 +1443,22 @@ class WSChannel(Channel):
         if session_id not in self._stream_buffers:
             self._stream_buffers[session_id] = _StreamBuffer()
         return self._stream_buffers[session_id]
+
+    def _is_session_busy(self, session_id: str) -> bool:
+        return self._session_busy.get(session_id, False)
+
+    def _set_session_busy(self, session_id: str, busy: bool) -> None:
+        self._session_busy[session_id] = busy
+
+    def _get_session_pending(self, session_id: str) -> list:
+        if session_id not in self._session_pending:
+            self._session_pending[session_id] = []
+        return self._session_pending[session_id]
+
+    def _get_cancel_event(self, session_id: str) -> asyncio.Event:
+        if session_id not in self._session_cancel:
+            self._session_cancel[session_id] = asyncio.Event()
+        return self._session_cancel[session_id]
 
 
 # ── Internal Helpers ──────────────────────────────────────────────────────────
