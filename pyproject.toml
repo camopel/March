@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "march"
+name = "march-ai"
 version = "0.1.0"
-description = "A framework-first agent runtime."
+description = "Most AI agents get dumber over time. March doesn't."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"

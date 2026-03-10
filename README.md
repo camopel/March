@@ -7,7 +7,7 @@ Agent frameworks love to dump everything into the LLM context window — your en
 March takes a different approach: **structured compression, isolated memory, and selective recall.** The result is an agent that stays sharp after hundreds of turns, not one that slowly forgets what you told it ten minutes ago.
 
 ```bash
-pip install git+https://github.com/camopel/March.git
+pip install march-ai
 march start
 ```
 
@@ -131,19 +131,38 @@ Turn 100:  Still knows your project constraints from Turn 3
 
 ---
 
+## March Deck — PWA App Platform
+
+Want a mobile-friendly UI? **[March Deck](https://github.com/camopel/march-deck)** is a PWA platform that turns your agent into a collection of mini-apps you can open on any device.
+
+| App | What it does |
+|-----|-------------|
+| 🤖 **March** | Chat + dashboard (sessions, cost, providers, logs) |
+| 📰 **Finviz** | Financial news with 24h AI summaries |
+| 📄 **ArXiv** | Research paper semantic search |
+| 📊 **System** | Server monitoring (CPU, RAM, GPU, services) |
+| 📁 **Files** | File browser |
+| 📝 **Notes** | Markdown notes |
+| 📺 **Cast** | Chromecast streaming |
+| 🦞 **OpenClaw** | OpenClaw agent management |
+
+No app store. Add to home screen and go. Works with any WebSocket-compatible agent.
+
+---
+
 ## Quick Start
 
 ```bash
 # Install
-pip install git+https://github.com/camopel/March.git
+pip install march-ai
 
 # Or with extras
-pip install "march[anthropic] @ git+https://github.com/camopel/March.git"
-pip install "march[bedrock] @ git+https://github.com/camopel/March.git"
-pip install "march[matrix] @ git+https://github.com/camopel/March.git"
-pip install "march[browser] @ git+https://github.com/camopel/March.git"
-pip install "march[voice] @ git+https://github.com/camopel/March.git"
-pip install "march[all] @ git+https://github.com/camopel/March.git"
+pip install "march-ai[anthropic]"     # Claude support
+pip install "march-ai[bedrock]"       # AWS Bedrock
+pip install "march-ai[matrix]"        # Matrix + E2EE
+pip install "march-ai[browser]"       # Playwright browser tools
+pip install "march-ai[voice]"         # Speech-to-text
+pip install "march-ai[all]"           # Everything
 
 # Run
 march start                           # Start agent
