@@ -22,7 +22,6 @@ from march.config.schema import (
     AgentsConfig,
     ChannelsConfig,
     CompactionConfig,
-    DashboardConfig,
     LLMConfig,
     LLMProviderConfig,
     MarchConfig,
@@ -174,11 +173,6 @@ class TestSchemaDefaults:
         assert config.mp.heartbeat_timeout_seconds == 300
         assert config.mp.kill_grace_seconds == 10
         assert config.subagents.max_spawn_depth == 1
-
-    def test_dashboard_config_defaults(self):
-        config = DashboardConfig()
-        assert config.enabled is True
-        assert config.port == "auto"
 
 
 class TestSchemaValidation:

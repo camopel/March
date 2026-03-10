@@ -2174,7 +2174,7 @@ class TestLogDirectoryStructure:
     """Verify the log subdirectory layout is created on startup."""
 
     def test_ensure_log_subdirectories(self, tmp_path: Path):
-        """ensure_log_subdirectories creates shared subdirs (metrics, dashboard)."""
+        """ensure_log_subdirectories creates shared subdirs (metrics)."""
         from march.core.log_maintenance import ensure_log_subdirectories, SHARED_SUBDIRS
 
         result = ensure_log_subdirectories(tmp_path)
@@ -2194,7 +2194,7 @@ class TestLogDirectoryStructure:
         """The shared subdirectory list includes all expected names."""
         from march.core.log_maintenance import SHARED_SUBDIRS
 
-        expected = {"metrics", "dashboard"}
+        expected = {"metrics"}
         assert set(SHARED_SUBDIRS) == expected
 
     def test_configure_logging_creates_session_dir(self, tmp_path: Path):
