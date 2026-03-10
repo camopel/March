@@ -1,4 +1,4 @@
-"""Browser automation via Playwright: snapshot, screenshot, click, type, navigate."""
+"""Browser automation via Playwright: navigate, snapshot, screenshot, click, type, hover, select, drag, pdf."""
 
 from __future__ import annotations
 
@@ -37,26 +37,30 @@ async def _ensure_browser():
     return _page
 
 
-@tool(name="browser", description="Browser automation: navigate, snapshot (accessibility tree), screenshot, click, type, evaluate JS.")
+@tool(name="browser", description="Browser automation: navigate, snapshot (accessibility tree), screenshot, click, type, hover, select, drag, pdf, evaluate JS.")
 async def browser_tool(
     action: str,
     url: str = "",
     selector: str = "",
+    target_selector: str = "",
     text: str = "",
     key: str = "",
     js: str = "",
     full_page: bool = False,
+    path: str = "",
 ) -> str:
     """Control a headless browser.
 
     Args:
-        action: Action: navigate, snapshot, screenshot, click, type, press, evaluate, close.
+        action: Action: navigate, snapshot, screenshot, click, type, press, hover, select, drag, pdf, evaluate, close.
         url: URL for navigate action.
-        selector: CSS selector for click/type/press actions.
-        text: Text to type (for type action).
+        selector: CSS selector for click/type/press/hover/select/drag (source) actions.
+        target_selector: CSS selector for drag target.
+        text: Text to type (for type action), or option value/label (for select action).
         key: Key to press (for press action, e.g. 'Enter', 'Tab').
         js: JavaScript to evaluate (for evaluate action).
         full_page: Take full page screenshot (for screenshot action).
+        path: File path to save PDF (for pdf action). Defaults to /tmp/page.pdf.
     """
     if action == "close":
         global _browser, _context, _page
@@ -119,8 +123,38 @@ async def browser_tool(
             result = await page.evaluate(js)
             return json.dumps(result, indent=2, default=str) if result is not None else "(undefined)"
 
+        elif action == "hover":
+            if not selector:
+                return "Error: selector required for hover"
+            await page.hover(selector, timeout=10000)
+            return f"Hovered: {selector}"
+
+        elif action == "select":
+            if not selector:
+                return "Error: selector required for select"
+            if not text:
+                return "Error: text (option value or label) required for select"
+            selected = await page.select_option(selector, label=text, timeout=10000)
+            return f"Selected '{text}' in {selector} → {selected}"
+
+        elif action == "drag":
+            if not selector:
+                return "Error: selector (source) required for drag"
+            target = target_selector or text
+            if not target:
+                return "Error: target_selector required for drag"
+            await page.drag_and_drop(selector, target, timeout=10000)
+            return f"Dragged {selector} → {target}"
+
+        elif action == "pdf":
+            pdf_path = path or "/tmp/page.pdf"
+            data = await page.pdf()
+            with open(pdf_path, "wb") as f:
+                f.write(data)
+            return f"PDF saved: {pdf_path} ({len(data)} bytes)"
+
         else:
-            return f"Error: Unknown action '{action}'. Use: navigate, snapshot, screenshot, click, type, press, evaluate, close"
+            return f"Error: Unknown action '{action}'. Use: navigate, snapshot, screenshot, click, type, press, hover, select, drag, pdf, evaluate, close"
 
     except Exception as e:
         return f"Browser error ({action}): {e}"
