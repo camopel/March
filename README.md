@@ -33,48 +33,6 @@ The result is a self-contained rolling summary that accumulates across compactio
 
 **Process-isolated sub-agents.** When March spawns a sub-agent, it gets its own OS process, its own memory, its own LLM connection. If it crashes, OOMs, or goes rogue, the parent agent is completely unaffected. Every other framework I've seen runs sub-agents in-process — one crash kills everything.
 
-## Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│              Channels (Pure I/O)                  │
-│  Terminal  ·  Matrix  ·  WebSocket  ·  ACP       │
-└──────────────────┬───────────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────────────────────────┐
-│              Orchestrator                         │
-│  LLM calls · Tool dispatch · Cancel/redirect     │
-│  Ephemeral turn state (never persisted)          │
-└──────────┬────────────────────┬──────────────────┘
-           │                    │
-           ▼                    ▼
-┌──────────────────┐  ┌────────────────────────────┐
-│   Sub-Agents     │  │     Memory System          │
-│  mtAgent (async) │  │  FileMemory (md files)     │
-│  mpAgent (proc)  │  │  SessionMemory (per-task)  │
-│  Nested (depth>1)│  │  Rolling Context           │
-│  IPC + heartbeat │  │  SQLite persistence        │
-└──────────────────┘  └────────────────────────────┘
-```
-
-**23,000 lines of Python.** No JavaScript. 6 native LLM providers. No proxy dependency.
-
-## March Deck — PWA app platform
-
-Want a mobile-friendly UI? **[March Deck](https://github.com/camopel/march-deck)** is a PWA platform that turns your agent into a collection of mini-apps:
-
-- 🤖 **March** — chat + agent dashboard (sessions, cost, providers, logs)
-- 📰 **Finviz** — financial news with 24h AI summaries
-- 📄 **ArXiv** — research paper semantic search
-- 📊 **System** — server monitoring (CPU, RAM, GPU, services)
-- 📁 **Files** — file browser
-- 📝 **Notes** — markdown notes
-- 📺 **Cast** — media casting and control
-- 🦞 **OpenClaw** — OpenClaw agent management
-
-No app store. Add to home screen and go.
-
 ## Design Philosophy
 
 1. **Memory is curation, not accumulation.** The value of memory isn't how much you store — it's how well you filter.
@@ -88,6 +46,7 @@ No app store. Add to home screen and go.
 |-----|-------------|
 | **[How to use March](docs/how_to.md)** | Installation, configuration, CLI, providers, tools, plugins |
 | **[Introduction](docs/introduction.md)** | The story behind March — why it exists and what it solves |
+| **[March Deck — Apps](docs/march_deck.md)** | PWA app platform — 8 mini-apps for your agent |
 | **[Rolling context](docs/rolling_context.md)** | Deep dive into the compaction algorithm |
 | **[Rolling summary](docs/rolling_summary.md)** | How summaries accumulate across cycles |
 | **[Session memory](docs/session_memory.md)** | Facts, plans, and checkpoints |
