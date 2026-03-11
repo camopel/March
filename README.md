@@ -1,6 +1,6 @@
 # March
 
-**Most AI agents get dumber the longer you use them. March doesn't.**
+**March remembers so you don't have to.**
 
 ```bash
 pip install march-ai
