@@ -4,7 +4,10 @@
 export MARCH_MATRIX_TOKEN="${MARCH_MATRIX_TOKEN:-}"
 source ~/.bashrc 2>/dev/null
 
-exec /home/ubuntu/Workspace/.venv/bin/python -c "
+# Use python3 from PATH, or override with MARCH_PYTHON env var
+PYTHON="${MARCH_PYTHON:-python3}"
+
+exec "$PYTHON" -c "
 import asyncio, sys
 from pathlib import Path
 

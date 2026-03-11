@@ -653,6 +653,7 @@ class WSChannel(Channel):
         webapp = web.Application()
         webapp["plugin"] = self
         webapp.router.add_get("/health", self._handle_health)
+        webapp.router.add_get("/status", self._handle_status)
         webapp.router.add_get("/sessions", self._handle_list_sessions)
         webapp.router.add_post("/sessions", self._handle_create_session)
         webapp.router.add_delete("/sessions/{session_id}", self._handle_delete_session)
@@ -727,6 +728,17 @@ class WSChannel(Channel):
         import aiohttp.web as web
 
         origins_set = set(allowed_origins)
+        # Auto-allow any port on hostnames found in configured origins
+        _auto_prefixes = set()
+        for _o in allowed_origins:
+            try:
+                _host = _o.split("://", 1)[1].rsplit(":", 1)[0]
+                if _host:
+                    _auto_prefixes.add(f"http://{_host}:")
+                    _auto_prefixes.add(f"https://{_host}:")
+            except (IndexError, ValueError):
+                pass
+        _auto_prefixes = tuple(_auto_prefixes)
 
         @web.middleware
         async def cors_middleware(
@@ -742,7 +754,8 @@ class WSChannel(Channel):
                 except web.HTTPException as e:
                     resp = e
 
-            if origin in origins_set:
+            is_auto = any(origin.startswith(p) for p in _auto_prefixes)
+            if is_auto or origin in origins_set:
                 resp.headers["Access-Control-Allow-Origin"] = origin
             elif allowed_origins:
                 # Fallback to first origin for non-browser requests
@@ -765,6 +778,67 @@ class WSChannel(Channel):
         import aiohttp.web as web
 
         return web.json_response({"status": "ok", "agent": self._agent is not None})
+
+    async def _handle_status(self, request: Any) -> Any:
+        """Full status info for the dashboard."""
+        import aiohttp.web as web
+        import yaml
+
+        from march import __version__
+
+        result: dict[str, Any] = {
+            "version": __version__,
+            "status": "ok",
+            "agent": self._agent is not None,
+        }
+
+        # Config info
+        config_path = Path.home() / ".march" / "config.yaml"
+        try:
+            raw = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        except Exception:
+            raw = {}
+
+        # Model
+        llm = raw.get("llm", {})
+        result["model"] = llm.get("default", "unknown")
+
+        # Channels
+        channels = raw.get("channels", {})
+        result["channels"] = [
+            ch for ch, v in channels.items()
+            if isinstance(v, dict) and v.get("enabled")
+        ]
+
+        # Plugins
+        result["plugins"] = raw.get("plugins", {}).get("enabled", [])
+
+        # Process info
+        try:
+            from march.cli.start import _find_march_pids
+            pids = _find_march_pids()
+            result["processes"] = len(pids)
+        except Exception:
+            result["processes"] = None
+
+        # Uptime (process start time)
+        try:
+            import os
+            import psutil
+            proc = psutil.Process(os.getpid())
+            result["uptime_seconds"] = int(time.time() - proc.create_time())
+        except Exception:
+            result["uptime_seconds"] = None
+
+        # Sessions count
+        try:
+            loop = asyncio.get_event_loop()
+            sessions = await loop.run_in_executor(None, self._list_sessions_sync)
+            result["session_count"] = len(sessions)
+        except Exception:
+            result["session_count"] = None
+
+        return web.json_response(result)
 
     async def _handle_list_sessions(self, request: Any) -> Any:
         import aiohttp.web as web
