@@ -102,6 +102,10 @@ class InMemorySessionStore:
         self._messages.pop(session_id, None)
         self._sessions.pop(session_id, None)
 
+    async def reactivate_session(self, session_id: str, source_type: str = "", source_id: str = "") -> Session | None:
+        """Reactivate a soft-deleted session (no-op for in-memory store)."""
+        return None
+
     async def update_session(self, session) -> None:
         self._sessions[session.id] = session
 

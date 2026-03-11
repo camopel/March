@@ -96,6 +96,10 @@ class InMemorySessionStore:
         # Also remove from sessions dict to mirror real DB clear
         self._sessions.pop(session_id, None)
 
+    async def reactivate_session(self, session_id: str, source_type: str = "", source_id: str = "") -> Session | None:
+        """Reactivate a soft-deleted session (no-op for in-memory store)."""
+        return None
+
 
 async def _collect_events(orch, session_id, content, **kwargs) -> list[OrchestratorEvent]:
     events = []

@@ -159,6 +159,10 @@ class InMemorySessionStore:
         self._messages.pop(session_id, None)
         self._sessions.pop(session_id, None)
 
+    async def reactivate_session(self, session_id: str, source_type: str = "", source_id: str = "") -> Session | None:
+        """Reactivate a soft-deleted session (no-op for in-memory store)."""
+        return None
+
     # ── Extended interface (used by ChatDB / WS proxy) ────────────────
 
     async def update_session(self, session: Session) -> None:
@@ -1010,6 +1014,8 @@ class TestWSProxy:
             agent=MockAgent([StreamChunk(delta="WS reply"), AgentResponse(content="WS reply")])
         )
         conn = self._make_ws_conn("ws-text")
+        # Register the ws connection so the plugin can send responses
+        plugin._active_connections[conn.session_id] = conn.ws
         await plugin._ws_handle_message(conn, {"type": "message", "content": "Hello"})
         calls = conn.ws.send_json.call_args_list
         types = [c.args[0].get("type") for c in calls]
@@ -1068,11 +1074,14 @@ class TestWSProxy:
             agent=SlowAgent([StreamChunk(delta="Slow..."), AgentResponse(content="Slow...")], delay=0.5)
         )
         conn = self._make_ws_conn("ws-stop")
-        conn.busy = True
-        conn.pending = ["queued msg 1", "queued msg 2"]
+        # Set busy/pending on the plugin (channel-level tracking), not on conn
+        plugin._set_session_busy(conn.session_id, True)
+        plugin._active_connections[conn.session_id] = conn.ws
+        pending = plugin._get_session_pending(conn.session_id)
+        pending.extend(["queued msg 1", "queued msg 2"])
         await plugin._ws_handle_message(conn, {"type": "message", "content": "/stop"})
-        assert conn.cancel_event.is_set()
-        assert len(conn.pending) == 0
+        assert plugin._get_cancel_event(conn.session_id).is_set()
+        assert len(plugin._get_session_pending(conn.session_id)) == 0
         calls = conn.ws.send_json.call_args_list
         types = [c.args[0].get("type") for c in calls]
         assert "stream.cancelled" in types
@@ -1112,10 +1121,12 @@ class TestWSProxy:
         """Messages are queued when agent is busy."""
         plugin = self._make_plugin()
         conn = self._make_ws_conn("ws-queue")
-        conn.busy = True
+        # Set busy on the plugin (channel-level tracking), not on conn
+        plugin._set_session_busy(conn.session_id, True)
         await plugin._ws_handle_message(conn, {"type": "message", "content": "Queued msg"})
-        assert len(conn.pending) == 1
-        assert conn.pending[0] == "Queued msg"
+        pending = plugin._get_session_pending(conn.session_id)
+        assert len(pending) == 1
+        assert pending[0] == "Queued msg"
         calls = conn.ws.send_json.call_args_list
         types = [c.args[0].get("type") for c in calls]
         assert "message.queued" in types
