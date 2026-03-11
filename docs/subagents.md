@@ -1,4 +1,4 @@
-# SUBAGENTS.md — March Agent System
+# subagents — March Agent System
 
 > Technical reference for March's agent orchestration layer: mtAgent (asyncio tasks) and mpAgent (isolated processes).
 
