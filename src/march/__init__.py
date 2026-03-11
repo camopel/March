@@ -1,6 +1,6 @@
 """March — A framework-first agent runtime."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from march.app import MarchApp
 from march.plugins._base import Plugin
